@@ -10315,6 +10315,113 @@ void gelu_fast_avx2(float* data, int size) {
 
 #endif  // x86 platform
 
+// ==================== ARM NEON Fallbacks for Session 27 ====================
+
+#if IS_ARM_PLATFORM
+
+// ARM NEON version of 4-bit matrix multiplication
+void matmul_4bit_neon(const unsigned char* A, const unsigned char* B,
+                      float* C, int M, int N, int K, float scale_a, float scale_b) {
+    constexpr int NEON_SIZE = 4;
+    constexpr float dequant_lut[16] = {
+        0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f,
+        2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f
+    };
+    
+    for (int i = 0; i < M; i++) {
+        const unsigned char* A_row = A + i * ((K + 1) / 2);
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned char* B_col = B + j * ((K + 1) / 2);
+            
+            int sum = 0;
+            
+            for (int kb = 0; kb < (K + 1) / 2; kb++) {
+                unsigned char a_byte = A_row[kb];
+                unsigned char b_byte = B_col[kb];
+                
+                // Extract 4-bit values
+                int a0 = a_byte & 0xF;
+                int a1 = a_byte >> 4;
+                int b0 = b_byte & 0xF;
+                int b1 = b_byte >> 4;
+                
+                sum += a0 * b0 + a1 * b1;
+            }
+            
+            C[i * N + j] = static_cast<float>(sum) * scale_a * scale_b;
+        }
+    }
+}
+
+// ARM NEON version of sparse matrix-vector multiplication
+void spmv_csr_neon(const SparseMatrix& A, const float* x, float* y) {
+    constexpr int NEON_SIZE = 4;
+    
+    for (int i = 0; i < A.rows; i++) {
+        int row_start = A.row_ptr[i];
+        int row_end = A.row_ptr[i + 1];
+        float sum = 0.0f;
+        
+        // Process non-zero elements
+        for (int j = row_start; j < row_end; j++) {
+            sum += A.values[j] * x[A.col_indices[j]];
+        }
+        
+        y[i] = sum;
+    }
+}
+
+// ARM NEON version of fused layer normalization
+void layernorm_fused_neon(const float* x, float* y, float* mean_out,
+                          float* var_out, int size, float eps = 1e-5f) {
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    
+    // First pass: compute sum and sum of squares
+    for (int i = 0; i < size; i++) {
+        sum += x[i];
+        sumsq += x[i] * x[i];
+    }
+    
+    float mean = sum / size;
+    float inv_std = 1.0f / std::sqrt(sumsq / size - mean * mean + eps);
+    
+    // Store mean and variance if requested
+    if (mean_out) *mean_out = mean;
+    if (var_out) *var_out = sumsq / size - mean * mean;
+    
+    // Second pass: normalize
+    for (int i = 0; i < size; i++) {
+        y[i] = (x[i] - mean) * inv_std;
+    }
+}
+
+// ARM NEON version of fast GELU
+void gelu_fast_neon(float* data, int size) {
+    constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
+    constexpr float GELU_COEF = 0.044715f;
+    
+    for (int i = 0; i < size; i++) {
+        float x = data[i];
+        float x2 = x * x;
+        float inner = SQRT_2_OVER_PI * x * (1.0f + GELU_COEF * x2);
+        data[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+}
+
+#endif  // ARM platform
+
+// ==================== Cross-Platform Function Aliasing ====================
+
+#if IS_ARM_PLATFORM
+// Map x86 functions to ARM equivalents for cross-platform compatibility
+#define matmul_4bit_avx2 matmul_4bit_neon
+#define spmv_csr_avx2 spmv_csr_neon
+#define layernorm_fused_avx2 layernorm_fused_neon
+#define gelu_fast_avx2 gelu_fast_neon
+#endif
+
 // ==================== End of Session 27 ====================
 
 /*
