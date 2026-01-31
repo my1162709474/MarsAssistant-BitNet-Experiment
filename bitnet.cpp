@@ -1639,7 +1639,7 @@ struct StealData {
     int num_threads;
 };
 
-void* matmul_steal_thread(void* arg) {
+void* matmul_stealing_thread(void* arg) {
     StealData* data = (StealData*)arg;
     constexpr int AVX_SIZE = 8;
     
@@ -1680,7 +1680,7 @@ void matmul_work_stealing(const float* A, const float* B, float* C,
     pthread_t threads[64];
     
     for (int t = 0; t < num_threads; t++) {
-        pthread_create(&threads[t], nullptr, matmul_steel_thread, &data);
+        pthread_create(&threads[t], nullptr, matmul_stealing_thread, &data);
     }
     
     for (int t = 0; t < num_threads; t++) {
