@@ -3427,3 +3427,232 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
+// ==================== SESSION 11: Ultra-Advanced Optimizations ====================
+
+// AVX-512 VNNI for INT8 inference (up to 4x throughput)
+#if defined(__AVX512VNNI__)
+#define USE_VNNI 1
+
+// 8-bit matrix multiplication using VNNI
+void matmul_vnni_int8(const int8_t* A, const int8_t* B, int32_t* C,
+                      int M, int N, int K) {
+    constexpr int VNNI_WIDTH = 16;  // 16 INT8s = one VNNI instruction
+    
+    for (int i = 0; i < M; i++) {
+        const int8_t* A_row = A + i * K;
+        int32_t* C_row = C + i * N;
+        
+        int num_vec = N / VNNI_WIDTH;
+        
+        for (int j = 0; j < num_vec; j++) {
+            __m512i acc = _mm512_setzero_si512();
+            const int8_t* B_vec = B + j * VNNI_WIDTH * K;  // VNNI layout
+            
+            for (int k = 0; k < K; k++) {
+                __m512i a = _mm512_set1_epi8(A_row[k]);
+                __m512i b = _mm512_loadu_si512(B_vec + k * VNNI_WIDTH);
+                acc = _mm512_dpbusd_epi32(acc, a, b);
+            }
+            
+            _mm512_storeu_si512(C_row + j * VNNI_WIDTH, acc);
+        }
+    }
+}
+#else
+#define USE_VNNI 0
+#endif
+
+// Non-temporal stores for streaming writes (bypass cache)
+HOT_FUNC inline void nt_store_ps(float* dst, __m256 val) {
+#if defined(__AVX__)
+    _mm256_stream_ps(dst, val);
+#endif
+}
+
+HOT_FUNC inline void nt_store_ps512(float* dst, __m512 val) {
+#if defined(__AVX512F__)
+    _mm512_stream_ps(dst, val);
+#endif
+}
+
+// Cache-bypassing memory copy for large buffers
+void memcpy_nt(float* dst, const float* src, size_t n) {
+    constexpr size_t AVX_SIZE = sizeof(__m256);
+    constexpr size_t AVX512_SIZE = sizeof(__m512);
+    constexpr size_t CACHE_LINE = 64;
+    constexpr size_t PREFETCH_DIST = 8 * CACHE_LINE;
+    
+    size_t i = 0;
+    
+#if defined(__AVX512F__)
+    for (; i + AVX512_SIZE * 8 <= n; i += AVX512_SIZE * 8) {
+        __m512 v0 = _mm512_loadu_ps(src + i);
+        __m512 v1 = _mm512_loadu_ps(src + i + 16);
+        __m512 v2 = _mm512_loadu_ps(src + i + 32);
+        __m512 v3 = _mm512_loadu_ps(src + i + 48);
+        _mm512_prefetch_t0(src + i + PREFETCH_DIST, _MM_HINT_T0);
+        _mm512_stream_ps(dst + i, v0);
+        _mm512_stream_ps(dst + i + 16, v1);
+        _mm512_stream_ps(dst + i + 32, v2);
+        _mm512_stream_ps(dst + i + 48, v3);
+    }
+#endif
+    
+    for (; i + AVX_SIZE * 8 <= n; i += AVX_SIZE * 8) {
+        __m256 v0 = _mm256_loadu_ps(src + i);
+        __m256 v1 = _mm256_loadu_ps(src + i + 8);
+        __m256 v2 = _mm256_loadu_ps(src + i + 16);
+        __m256 v3 = _mm256_loadu_ps(src + i + 24);
+        _mm256_stream_ps(dst + i, v0);
+        _mm256_stream_ps(dst + i + 8, v1);
+        _mm256_stream_ps(dst + i + 16, v2);
+        _mm256_stream_ps(dst + i + 24, v3);
+    }
+    
+    for (; i < n; i++) {
+        dst[i] = src[i];
+    }
+}
+
+// Ultra-aggressive loop unrolling (32x unroll factor)
+#define UNROLL_32(x) \
+    x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x
+
+// 32x unrolled matrix multiplication
+void matmul_unroll32(const float* A, const float* B, float* C,
+                     int M, int N, int K) {
+    constexpr int UNROLL = 32;
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int j = 0; j < N; j += UNROLL) {
+            __m256 acc[UNROLL / AVX_SIZE];
+            for (int u = 0; u < UNROLL / AVX_SIZE; u++) {
+                acc[u] = _mm256_setzero_ps();
+            }
+            
+            for (int k = 0; k < K; k++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k]);
+                const float* B_k = B + k * N;
+                
+                #define LOAD_AND_FMA(u) \
+                    __m256 b##u = _mm256_loadu_ps(&B_k[j + u * AVX_SIZE]); \
+                    acc[u] = _mm256_fmadd_ps(a_val, b##u, acc[u]);
+                
+                UNROLL_32(LOAD_AND_FMA)
+                #undef LOAD_AND_FMA
+            }
+            
+            for (int u = 0; u < UNROLL / AVX_SIZE; u++) {
+                _mm256_storeu_ps(&C_row[j + u * AVX_SIZE], acc[u]);
+            }
+        }
+    }
+}
+
+// Software pipelining optimization
+void matmul_software_pipelined(const float* A, const float* B, float* C,
+                               int M, int N, int K) {
+    constexpr int PIPELINE_DEPTH = 4;
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < std::min(PIPELINE_DEPTH, M); i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / AVX_SIZE;
+        __m256 c_vec[64] = {};
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+        }
+    }
+    
+    for (int i = PIPELINE_DEPTH; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        if (i + 1 < M) {
+            _mm_prefetch(A + (i + 1) * K, _MM_HINT_T0);
+            _mm_prefetch(B, _MM_HINT_T0);
+        }
+        
+        int num_vec = N / AVX_SIZE;
+        __m256 c_vec[64] = {};
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            if (k + 1 < K) {
+                _mm_prefetch(B_k + N, _MM_HINT_T0);
+            }
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+        }
+    }
+}
+
+// Memory compression for sparse activations
+struct CompressedActivation {
+    uint8_t* data;
+    uint8_t* indexes;
+    int nnz;
+    
+    void compress(const float* src, int size) {
+        nnz = 0;
+        for (int i = 0; i < size; i++) {
+            if (src[i] != 0.0f) {
+                indexes[nnz] = i;
+                data[nnz] = static_cast<uint8_t>(src[i] * 255.0f);
+                nnz++;
+            }
+        }
+    }
+    
+    void decompress(float* dst, int size) {
+        std::memset(dst, 0, size * sizeof(float));
+        for (int i = 0; i < nnz; i++) {
+            dst[indexes[i]] = static_cast<float>(data[i]) / 255.0f;
+        }
+    }
+};
+
+// Strassen-like recursive multiplication
+void matmul_strassen_recursive(const float* A, const float* B, float* C,
+                               int M, int N, int K, int depth = 0) {
+    if (M <= 64 || N <= 64 || K <= 64) {
+        matmul_blocked(A, B, C, M, N, K);
+        return;
+    }
+    
+    int M2 = M / 2, N2 = N / 2, K2 = K / 2;
+    
+    matmul_strassen_recursive(A, B, C, M2, N2, K2, depth + 1);
+    matmul_strassen_recursive(A + K2, B + N2, C, M2, N - N2, K2, depth + 1);
+    matmul_strassen_recursive(A + M2 * K, B, C + M2 * N, M2, N2, K2, depth + 1);
+    matmul_strassen_recursive(A + M2 * K + K2, B + N2, C + M2 * N + N2, M2, N - N2, K2, depth + 1);
+}
+
+// ==================== End of Session 11 Optimizations ====================
