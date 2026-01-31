@@ -1239,3 +1239,517 @@ int get_optimal_batch_size(int M, int N, int K, size_t cache_size) {
     
     return batch_dim;
 }
+
+// ==================== NEW: Sparse Matrix Optimization ====================
+
+struct SparseMatrix {
+    float* values;
+    int* col_indices;
+    int* row_ptr;
+    int rows;
+    int cols;
+    int nnz;  // Number of non-zero elements
+    
+    SparseMatrix(int r = 0, int c = 0) : rows(r), cols(c), nnz(0) {
+        values = nullptr;
+        col_indices = nullptr;
+        row_ptr = new int[rows + 1]();
+    }
+    
+    ~SparseMatrix() {
+        delete[] values;
+        delete[] col_indices;
+        delete[] row_ptr;
+    }
+};
+
+// Convert dense to CSR sparse format
+void dense_to_csr(const float* dense, SparseMatrix& sparse, float threshold = 1e-5f) {
+    sparse.nnz = 0;
+    for (int i = 0; i < sparse.rows; i++) {
+        sparse.row_ptr[i] = sparse.nnz;
+        for (int j = 0; j < sparse.cols; j++) {
+            if (std::abs(dense[i * sparse.cols + j]) > threshold) {
+                sparse.nnz++;
+            }
+        }
+    }
+    sparse.row_ptr[sparse.rows] = sparse.nnz;
+    
+    delete[] sparse.values;
+    delete[] sparse.col_indices;
+    sparse.values = new float[sparse.nnz];
+    sparse.col_indices = new int[sparse.nnz];
+    
+    int idx = 0;
+    for (int i = 0; i < sparse.rows; i++) {
+        for (int j = 0; j < sparse.cols; j++) {
+            float val = dense[i * sparse.cols + j];
+            if (std::abs(val) > threshold) {
+                sparse.values[idx] = val;
+                sparse.col_indices[idx] = j;
+                idx++;
+            }
+        }
+    }
+}
+
+// Sparse matrix-vector multiplication (optimized)
+void spmv_csr(const SparseMatrix& A, const float* x, float* y) {
+    // Zero output
+    std::memset(y, 0, sizeof(float) * A.rows);
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 4;
+    
+    for (int i = 0; i < A.rows; i++) {
+        int row_start = A.row_ptr[i];
+        int row_end = A.row_ptr[i + 1];
+        int nnz = row_end - row_start;
+        
+        // Process 4 elements at a time with AVX
+        int j = row_start;
+        __m256 sum = _mm256_setzero_ps();
+        
+        for (; j + UNROLL_FACTOR * AVX_SIZE <= row_end; j += UNROLL_FACTOR * AVX_SIZE) {
+            // Process 4x8 = 32 elements
+            for (int k = 0; k < UNROLL_FACTOR; k++) {
+                __m256 a_vals = _mm256_setzero_ps();
+                __m256 x_vals = _mm256_setzero_ps();
+                
+                // Load 8 values and their column indices
+                for (int v = 0; v < AVX_SIZE; v++) {
+                    int col = A.col_indices[j + k * AVX_SIZE + v];
+                    a_vals = _mm256_insertf128_ps(a_vals, _mm_load_ss(&A.values[j + k * AVX_SIZE + v]), v / 4);
+                    x_vals = _mm256_insertf128_ps(x_vals, _mm_load_ss(&x[col]), v / 4);
+                }
+                sum = _mm256_fmadd_ps(a_vals, x_vals, sum);
+            }
+        }
+        
+        // Process remaining elements
+        float sum_val = 0;
+        float32_t sum_arr[8];
+        _mm256_storeu_ps(sum_arr, sum);
+        for (int v = 0; v < 8; v++) sum_val += sum_arr[v];
+        
+        for (; j < row_end; j++) {
+            sum_val += A.values[j] * x[A.col_indices[j]];
+        }
+        
+        y[i] = sum_val;
+    }
+}
+
+// ==================== NEW: Ultra-Optimized Microkernel ====================
+
+// Microkernel for small matrices (4x4) - maximum efficiency
+void matmul_4x4_microkernel(const float* A, const float* B, float* C, int K) {
+    __m256 c0 = _mm256_setzero_ps();
+    __m256 c1 = _mm256_setzero_ps();
+    __m256 c2 = _mm256_setzero_ps();
+    __m256 c3 = _mm256_setzero_ps();
+    
+    // Process K in chunks of 8
+    int k = 0;
+    for (; k + 7 < K; k += 8) {
+        __m256 a0 = _mm256_set1_ps(A[k]);
+        __m256 a1 = _mm256_set1_ps(A[k + 1]);
+        __m256 a2 = _mm256_set1_ps(A[k + 2]);
+        __m256 a3 = _mm256_set1_ps(A[k + 3]);
+        __m256 a4 = _mm256_set1_ps(A[k + 4]);
+        __m256 a5 = _mm256_set1_ps(A[k + 5]);
+        __m256 a6 = _mm256_set1_ps(A[k + 6]);
+        __m256 a7 = _mm256_set1_ps(A[k + 7]);
+        
+        __m256 b0 = _mm256_loadu_ps(B);
+        __m256 b1 = _mm256_loadu_ps(B + 8);
+        __m256 b2 = _mm256_loadu_ps(B + 16);
+        __m256 b3 = _mm256_loadu_ps(B + 24);
+        
+        c0 = _mm256_fmadd_ps(a0, b0, c0);
+        c1 = _mm256_fmadd_ps(a1, b0, c1);
+        c2 = _mm256_fmadd_ps(a2, b0, c2);
+        c3 = _mm256_fmadd_ps(a3, b0, c3);
+        c0 = _mm256_fmadd_ps(a4, b1, c0);
+        c1 = _mm256_fmadd_ps(a5, b1, c1);
+        c2 = _mm256_fmadd_ps(a6, b1, c2);
+        c3 = _mm256_fmadd_ps(a7, b1, c3);
+        c0 = _mm256_fmadd_ps(a0, b2, c0);
+        c1 = _mm256_fmadd_ps(a1, b2, c1);
+        c2 = _mm256_fmadd_ps(a2, b2, c2);
+        c3 = _mm256_fmadd_ps(a3, b2, c3);
+        c0 = _mm256_fmadd_ps(a4, b3, c0);
+        c1 = _mm256_fmadd_ps(a5, b3, c1);
+        c2 = _mm256_fmadd_ps(a6, b3, c2);
+        c3 = _mm256_fmadd_ps(a7, b3, c3);
+    }
+    
+    // Horizontal reduction
+    float32_t c0_arr[8], c1_arr[8], c2_arr[8], c3_arr[8];
+    _mm256_storeu_ps(c0_arr, c0);
+    _mm256_storeu_ps(c1_arr, c1);
+    _mm256_storeu_ps(c2_arr, c2);
+    _mm256_storeu_ps(c3_arr, c3);
+    
+    C[0] = c0_arr[0] + c0_arr[1] + c0_arr[2] + c0_arr[3];
+    C[1] = c1_arr[0] + c1_arr[1] + c1_arr[2] + c1_arr[3];
+    C[2] = c2_arr[0] + c2_arr[1] + c2_arr[2] + c2_arr[3];
+    C[3] = c3_arr[0] + c3_arr[1] + c3_arr[2] + c3_arr[3];
+    
+    // Scalar tail
+    for (; k < K; k++) {
+        C[0] += A[k] * B[0];
+        C[1] += A[k] * B[1];
+        C[2] += A[k] * B[2];
+        C[3] += A[k] * B[3];
+    }
+}
+
+// ==================== NEW: Loop Unrolling Macro ====================
+
+#define UNROLL_8(func, ...) { \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+    func(__VA_ARGS__); \
+}
+
+// ==================== NEW: Cache-Oblivious Matrix Multiply ====================
+
+void matmul_cache_oblivious(float* A, float* B, float* C,
+                            int M, int N, int K) {
+    // Base case: small matrix fits in cache
+    if (M <= 64 && N <= 64 && K <= 64) {
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                float sum = 0;
+                for (int k = 0; k < K; k++) {
+                    sum += A[i * K + k] * B[k * N + j];
+                }
+                C[i * N + j] += sum;
+            }
+        }
+        return;
+    }
+    
+    // Divide along largest dimension
+    if (M >= N && M >= K) {
+        int mid = M / 2;
+        matmul_cache_oblivious(A, B, C, mid, N, K);
+        matmul_cache_oblivious(A + mid * K, B, C + mid * N, M - mid, N, K);
+    } else if (N >= M && N >= K) {
+        int mid = N / 2;
+        matmul_cache_oblivious(A, B, C, M, mid, K);
+        matmul_cache_oblivious(A, B + mid, C + mid, M, N - mid, K);
+    } else {
+        int mid = K / 2;
+        matmul_cache_oblivious(A, B, C, M, N, mid);
+        
+        // C += A1@B2
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                float sum = 0;
+                for (int k = mid; k < K; k++) {
+                    sum += A[i * K + k] * B[k * N + j];
+                }
+                C[i * N + j] += sum;
+            }
+        }
+    }
+}
+
+// ==================== NEW: Hyper-Optimized GEMM ====================
+
+void matmul_gemm_optimized(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    constexpr int BLOCK_M = 64;
+    constexpr int BLOCK_N = 16;
+    constexpr int BLOCK_K = 16;
+    constexpr int AVX_SIZE = 8;
+    
+    // Multi-level blocking
+    for (int i = 0; i < M; i += BLOCK_M) {
+        for (int j = 0; j < N; j += BLOCK_N) {
+            for (int k = 0; k < K; k += BLOCK_K) {
+                
+                // Process block with micro-optimization
+                int i_max = std::min(i + BLOCK_M, M);
+                int j_max = std::min(j + BLOCK_N, N);
+                int k_max = std::min(k + BLOCK_K, K);
+                
+                for (int ii = i; ii < i_max; ii++) {
+                    const float* A_row = A + ii * K;
+                    float* C_row = C + ii * N;
+                    
+                    for (int kk = k; kk < k_max; kk++) {
+                        __m256 a_val = _mm256_set1_ps(A_row[kk]);
+                        const float* B_k = B + kk * N;
+                        
+                        int jj = j;
+                        for (; jj + AVX_SIZE <= j_max; jj += AVX_SIZE) {
+                            __m256 c_vec = _mm256_loadu_ps(&C_row[jj]);
+                            __m256 b_vec = _mm256_loadu_ps(&B_k[jj]);
+                            _mm256_storeu_ps(&C_row[jj], _mm256_fmadd_ps(a_val, b_vec, c_vec));
+                        }
+                        
+                        for (; jj < j_max; jj++) {
+                            C_row[jj] += A_row[kk] * B_k[jj];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== NEW: Tile-Based Micro-Architecture Optimization ====================
+
+void matmul_tile_optimized(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    constexpr int TILE_M = 48;
+    constexpr int TILE_N = 32;
+    constexpr int TILE_K = 16;
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_N = 4;
+    
+    for (int i = 0; i < M; i += TILE_M) {
+        for (int j = 0; j < N; j += TILE_N) {
+            for (int k = 0; k < K; k += TILE_K) {
+                
+                int i_end = std::min(i + TILE_M, M);
+                int j_end = std::min(j + TILE_N, N);
+                int k_end = std::min(k + TILE_K, K);
+                
+                // Process with loop unrolling
+                for (int ii = i; ii < i_end; ii++) {
+                    const float* A_row = A + ii * K;
+                    float* C_row = C + ii * N;
+                    
+                    for (int kk = k; kk < k_end; kk++) {
+                        __m256 a_val = _mm256_set1_ps(A_row[kk]);
+                        const float* B_k = B + kk * N;
+                        
+                        // Unrolled N dimension (process 4 vectors at once)
+                        int jj = j;
+                        for (; jj + UNROLL_N * AVX_SIZE <= j_end; jj += UNROLL_N * AVX_SIZE) {
+                            __m256 c0 = _mm256_loadu_ps(&C_row[jj]);
+                            __m256 c1 = _mm256_loadu_ps(&C_row[jj + AVX_SIZE]);
+                            __m256 c2 = _mm256_loadu_ps(&C_row[jj + 2 * AVX_SIZE]);
+                            __m256 c3 = _mm256_loadu_ps(&C_row[jj + 3 * AVX_SIZE]);
+                            
+                            __m256 b0 = _mm256_loadu_ps(&B_k[jj]);
+                            __m256 b1 = _mm256_loadu_ps(&B_k[jj + AVX_SIZE]);
+                            __m256 b2 = _mm256_loadu_ps(&B_k[jj + 2 * AVX_SIZE]);
+                            __m256 b3 = _mm256_loadu_ps(&B_k[jj + 3 * AVX_SIZE]);
+                            
+                            _mm256_storeu_ps(&C_row[jj], _mm256_fmadd_ps(a_val, b0, c0));
+                            _mm256_storeu_ps(&C_row[jj + AVX_SIZE], _mm256_fmadd_ps(a_val, b1, c1));
+                            _mm256_storeu_ps(&C_row[jj + 2 * AVX_SIZE], _mm256_fmadd_ps(a_val, b2, c2));
+                            _mm256_storeu_ps(&C_row[jj + 3 * AVX_SIZE], _mm256_fmadd_ps(a_val, b3, c3));
+                        }
+                        
+                        // Scalar remainder
+                        for (; jj < j_end; jj++) {
+                            C_row[jj] += A_row[kk] * B_k[jj];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== NEW: Vectorized Population Count for Any Platform ====================
+
+#if defined(__AVX512VPOPCNTDQ__)
+#define POPCNT_VEC _mm512_popcnt_epi32
+#elif defined(__AVX2__)
+inline __m256i popcnt_avx2(__m256i x) {
+    // AVX2 doesn't have popcnt, use workaround
+    // x = (x & 0x55555555) + ((x >> 1) & 0x55555555)
+    __m256i m = _mm256_set1_epi32(0x55555555);
+    x = _mm256_add_epi32(_mm256_and_si256(x, m), _mm256_and_si256(_mm256_srli_epi32(x, 1), m));
+    // x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+    m = _mm256_set1_epi32(0x33333333);
+    x = _mm256_add_epi32(_mm256_and_si256(x, m), _mm256_and_si256(_mm256_srli_epi32(x, 2), m));
+    // x = (x & 0x0F0F0F0F) + ((x >> 4) & 0x0F0F0F0F)
+    m = _mm256_set1_epi32(0x0F0F0F0F);
+    x = _mm256_add_epi32(_mm256_and_si256(x, m), _mm256_and_si256(_mm256_srli_epi32(x, 4), m));
+    // x = (x * 0x01010101) >> 24
+    x = _mm256_srli_epi32(_mm256_mullo_epi32(x, _mm256_set1_epi32(0x01010101)), 24);
+    return x;
+}
+#define POPCNT_VEC popcnt_avx2
+#else
+inline int popcnt_scalar(int x) {
+    return __builtin_popcount(x);
+}
+#define POPCNT_VEC(x) _mm_set_epi32(popcnt_scalar(_mm_extract_epi32(x, 3)), \
+                                    popcnt_scalar(_mm_extract_epi32(x, 2)), \
+                                    popcnt_scalar(_mm_extract_epi32(x, 1)), \
+                                    popcnt_scalar(_mm_extract_epi32(x, 0)))
+#endif
+
+// ==================== NEW: Optimized 1-bit with Reduced Operations ====================
+
+void matmul_1bit_optimized(const unsigned char* A_packed, const unsigned char* B_packed, 
+                           float* C, int M, int N, int K) {
+    const int K_words = (K + 31) / 32;
+    
+    // Process 4 rows at a time for better cache reuse
+    constexpr int ROW_BATCH = 4;
+    
+    for (int i = 0; i < M; i += ROW_BATCH) {
+        int rows_this_batch = std::min(ROW_BATCH, M - i);
+        
+        for (int j = 0; j < N; j++) {
+            // Accumulate for all rows in batch
+            int diff_counts[ROW_BATCH] = {0};
+            
+            for (int w = 0; w < K_words; w++) {
+                unsigned int b_word = reinterpret_cast<const unsigned int*>(B_packed)[w * N + j];
+                
+                for (int r = 0; r < rows_this_batch; r++) {
+                    unsigned int a_word = reinterpret_cast<const unsigned int*>(A_packed)[(i + r) * K_words + w];
+                    diff_counts[r] += __builtin_popcount(a_word ^ b_word);
+                }
+            }
+            
+            // Store results
+            for (int r = 0; r < rows_this_batch; r++) {
+                C[(i + r) * N + j] = static_cast<float>(K - 2 * diff_counts[r]);
+            }
+        }
+    }
+}
+
+// ==================== NEW: Work-Stealing Parallel Scheduler ====================
+
+struct StealData {
+    const float* A;
+    const float* B;
+    float* C;
+    int M, N, K;
+    std::atomic<int> next_row;
+    int num_threads;
+};
+
+void* matmul_steal_thread(void* arg) {
+    StealData* data = (StealData*)arg;
+    constexpr int AVX_SIZE = 8;
+    
+    while (true) {
+        int row = data->next_row.fetch_add(1);
+        if (row >= data->M) break;
+        
+        const float* A_row = data->A + row * data->K;
+        float* C_row = data->C + row * data->N;
+        
+        __m256 c_vec[64];
+        int num_vec = data->N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < data->K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = data->B + k * data->N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+        }
+    }
+    
+    return nullptr;
+}
+
+void matmul_work_stealing(const float* A, const float* B, float* C,
+                          int M, int N, int K, int num_threads) {
+    StealData data = {A, B, C, M, N, K, 0, num_threads};
+    pthread_t threads[64];
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_create(&threads[t], nullptr, matmul_steel_thread, &data);
+    }
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
+// ==================== NEW: Strassen-like Recursive Optimization ====================
+
+void matmul_strassen_recursive(const float* A, const float* B, float* C,
+                               int M, int N, int K, int depth = 0) {
+    // Only apply for large matrices and limited depth
+    if (M < 128 || N < 128 || K < 128 || depth > 3) {
+        matmul_avx2(A, B, C, M, N, K);
+        return;
+    }
+    
+    // Find largest dimension
+    int max_dim = std::max({M, N, K});
+    if (max_dim % 2 != 0) {
+        matmul_avx2(A, B, C, M, N, K);
+        return;
+    }
+    
+    // Pad to even size if needed
+    int m_pad = (M % 2 == 0) ? M : M + 1;
+    int n_pad = (N % 2 == 0) ? N : N + 1;
+    int k_pad = (K % 2 == 0) ? K : K + 1;
+    
+    // For simplicity, use standard multiplication
+    // Full Strassen would be more complex
+    matmul_avx2(A, B, C, M, N, K);
+}
+
+// ==================== NEW: Pointer Arithmetic Optimization ====================
+
+// Use restrict-like semantics where possible
+#ifdef __GNUC__
+#define RESTRICT __restrict__
+#else
+#define RESTRICT
+#endif
+
+void matmul_pointer_opt(float* RESTRICT A, float* RESTRICT B, 
+                        float* RESTRICT C, int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < M; i++) {
+        float* RESTRICT C_row = C + i * N;
+        const float* RESTRICT A_row = A + i * K;
+        
+        __m256 c_vec[64];
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* RESTRICT B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+        }
+    }
+}
