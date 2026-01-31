@@ -10,8 +10,14 @@
 
 #include <cmath>
 #include <cstring>
+
+// Platform-specific SIMD headers
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
-#include <arm_neon.h>  // ARM NEON for Apple Silicon
+#elif defined(__aarch64__) || defined(__arm__)
+#include <arm_neon.h>
+#endif
+
 #include <pthread.h>
 #include <iostream>
 #include <vector>
@@ -96,6 +102,14 @@ struct BitNetConfig {
 #define UNLIKELY(x) (x)
 #endif
 
+// ==================== Forward Declarations ====================
+
+// ARM NEON functions (declared early for fallback use)
+#if defined(__aarch64__) || defined(__arm__)
+void matmul_neon(const float* A, const float* B, float* C, int M, int N, int K);
+void relu_neon(float* data, int size);
+#endif
+
 // ==================== AVX-512 Support (Conditional) ====================
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -133,8 +147,12 @@ void matmul_avx512(const float* A, const float* B, float* C,
 #define USE_AVX512 0
 void matmul_avx512(const float* A, const float* B, float* C,
                    int M, int N, int K) {
-    // Fallback to AVX2 if AVX-512 not available
-    matmul_avx2(A, B, C, M, N, K);
+    // Fallback to NEON on ARM, or naive on other platforms
+#if defined(__aarch64__) || defined(__arm__)
+    matmul_neon(A, B, C, M, N, K);
+#else
+    matmul_naive(A, B, C, M, N, K);
+#endif
 }
 #endif
 
@@ -176,43 +194,81 @@ void matmul_blocked(const float* A, const float* B, float* C,
     }
 }
 
-// ==================== Optimized 2: SIMD AVX2 Vectorization ====================
+// ==================== Optimized 2: SIMD Vectorization (AVX2/NEON) ====================
 
+#if defined(__x86_64__) || defined(__i386__)
+
+// AVX2 implementation for x86
 void matmul_avx2(const float* A, const float* B, float* C,
                  int M, int N, int K) {
     constexpr int AVX_SIZE = 8;  // 256-bit / 32-bit
     
-    // Optimized: i-k-j ordering for better cache locality
-    // Process K dimension first, then broadcast A row
     for (int i = 0; i < M; i++) {
         const float* A_row = A + i * K;
         float* C_row = C + i * N;
         
-        // Initialize output vector
-        __m256 c_vec[64];  // Support up to 512 columns
+        __m256 c_vec[64];
         int num_vec = N / AVX_SIZE;
         for (int j = 0; j < num_vec; j++) {
             c_vec[j] = _mm256_setzero_ps();
         }
         
-        // k loop outside for cache-friendly access
         for (int k = 0; k < K; k++) {
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* B_k = B + k * N;
             
-            // Process multiple columns per iteration
             for (int j = 0; j < num_vec; j++) {
                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
-                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);  // FMA: a*b + c
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
             }
         }
         
-        // Store results
         for (int j = 0; j < num_vec; j++) {
             _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
     }
 }
+
+#elif defined(__aarch64__) || defined(__arm__)
+
+// NEON implementation for ARM
+void matmul_neon(const float* A, const float* B, float* C,
+                 int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;  // 128-bit / 32-bit
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        float32x4_t c_vec[64];
+        int num_vec = N / NEON_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+        }
+    }
+}
+
+// Alias for compatibility
+void matmul_avx2(const float* A, const float* B, float* C,
+                 int M, int N, int K) {
+    matmul_neon(A, B, C, M, N, K);
+}
+
+#endif
 
 // ==================== Optimized 3: 1-bit Quantization ====================
 
@@ -395,6 +451,8 @@ struct ThreadData {
     int start_row, end_row;
 };
 
+#if defined(__x86_64__) || defined(__i386__)
+
 void* matmul_thread(void* arg) {
     ThreadData* data = (ThreadData*)arg;
     const float* A = data->A;
@@ -407,13 +465,12 @@ void* matmul_thread(void* arg) {
     int end = data->end_row;
     
     constexpr int AVX_SIZE = 8;
-    constexpr int PREFETCH_DIST = 3;  // Prefetch 3 iterations ahead
+    constexpr int PREFETCH_DIST = 3;
     
     for (int i = start; i < end; i++) {
         const float* A_row = A + i * K;
         float* C_row = C + i * N;
         
-        // Initialize output vector
         __m256 c_vec[64];
         int num_vec = N / AVX_SIZE;
         for (int j = 0; j < num_vec; j++) {
@@ -424,7 +481,6 @@ void* matmul_thread(void* arg) {
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* B_k = B + k * N;
             
-            // Prefetch next row of B for better cache utilization
             if (k + PREFETCH_DIST < K) {
                 _mm_prefetch(reinterpret_cast<const char*>(&B[(k + PREFETCH_DIST) * N]), _MM_HINT_T0);
             }
@@ -442,6 +498,51 @@ void* matmul_thread(void* arg) {
     
     return nullptr;
 }
+
+#elif defined(__aarch64__) || defined(__arm__)
+
+void* matmul_thread(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    const float* A = data->A;
+    const float* B = data->B;
+    float* C = data->C;
+    int M = data->M;
+    int N = data->N;
+    int K = data->K;
+    int start = data->start_row;
+    int end = data->end_row;
+    
+    constexpr int NEON_SIZE = 4;
+    
+    for (int i = start; i < end; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        float32x4_t c_vec[64];
+        int num_vec = N / NEON_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+        }
+    }
+    
+    return nullptr;
+}
+
+#endif
 
 void matmul_parallel(const float* A, const float* B, float* C,
                      int M, int N, int K, int num_threads) {
@@ -469,6 +570,8 @@ void relu_naive(float* data, int size) {
     }
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+
 void relu_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 zero = _mm256_setzero_ps();
@@ -479,6 +582,26 @@ void relu_avx2(float* data, int size) {
         _mm256_storeu_ps(&data[i], vals);
     }
 }
+
+#elif defined(__aarch64__) || defined(__arm__)
+
+void relu_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    for (int i = 0; i < size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        vals = vmaxq_f32(vals, zero);
+        vst1q_f32(&data[i], vals);
+    }
+}
+
+// Alias for compatibility
+void relu_avx2(float* data, int size) {
+    relu_neon(data, size);
+}
+
+#endif
 
 // ==================== Benchmarking ====================
 
@@ -521,7 +644,16 @@ int main() {
     benchmark("Naive", matmul_naive, A.data, B.data, C.data, M, N, K, 10);
     benchmark("Blocked", matmul_blocked, A.data, B.data, C.data, M, N, K, 10);
     benchmark("AVX2", matmul_avx2, A.data, B.data, C.data, M, N, K, 10);
-    benchmark("Parallel (4 threads)", matmul_parallel, A.data, B.data, C.data, M, N, K, 10, 4);
+    // Parallel benchmark - call directly without benchmark wrapper
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        matmul_parallel(A.data, B.data, C.data, M, N, K, 4);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        double avg_time = duration.count();
+        double gflops = (2.0 * M * N * K) / (avg_time * 1000.0);
+        std::cout << "Parallel (4 threads): " << avg_time << " us, " << gflops << " GFLOPS" << std::endl;
+    }
     
     std::cout << "\n=== Activation Function Benchmarks ===" << std::endl;
     constexpr int SIZE = 256 * 1024;
@@ -575,7 +707,14 @@ struct AttentionCache {
 void attention_blocked(const float* Q, const float* K, const float* V,
                        float* output, int B, int T, int d, float scale) {
     constexpr int BLOCK = 64;
-    constexpr int AVX_SIZE = 8;
+    // Platform-specific vector size
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr int VEC_SIZE = 8;  // AVX2: 256-bit
+#elif defined(__aarch64__) || defined(__arm__)
+    constexpr int VEC_SIZE = 4;  // NEON: 128-bit
+#else
+    constexpr int VEC_SIZE = 4;  // Default
+#endif
     
     // Temporary buffer for softmax computation (block x block)
     float softmax_buf[BLOCK * BLOCK];
@@ -602,14 +741,14 @@ void attention_blocked(const float* Q, const float* K, const float* V,
                     const float* Q_ptr = Q_b + qi * d + h;
                     const float* K_ptr = K_b + ki * d + h;
                     
-                    // Unrolled dot product with AVX
+#if defined(__x86_64__) || defined(__i386__)
+                    // AVX2 dot product
                     int j = 0;
-                    for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
+                    for (; j + VEC_SIZE <= block_h; j += VEC_SIZE) {
                         __m256 qv = _mm256_loadu_ps(Q_ptr + j);
                         __m256 kv = _mm256_loadu_ps(K_ptr + j);
                         __m256 prod = _mm256_mul_ps(qv, kv);
                         
-                        // Horizontal sum
                         __m128 high = _mm256_extractf128_ps(prod, 1);
                         __m128 low = _mm256_castps256_ps128(prod);
                         __m128 sum = _mm_add_ps(low, high);
@@ -617,9 +756,22 @@ void attention_blocked(const float* Q, const float* K, const float* V,
                         sum = _mm_hadd_ps(sum, sum);
                         dot += _mm_cvtss_f32(sum);
                     }
+#elif defined(__aarch64__) || defined(__arm__)
+                    // NEON dot product
+                    int j = 0;
+                    for (; j + VEC_SIZE <= block_h; j += VEC_SIZE) {
+                        float32x4_t qv = vld1q_f32(Q_ptr + j);
+                        float32x4_t kv = vld1q_f32(K_ptr + j);
+                        float32x4_t prod = vmulq_f32(qv, kv);
+                        
+                        float arr[4];
+                        vst1q_f32(arr, prod);
+                        for (int k = 0; k < 4; k++) dot += arr[k];
+                    }
+#endif
                     
                     // Scalar tail
-                    for (; j < block_h; j++) {
+                    for (int j = (block_h / VEC_SIZE) * VEC_SIZE; j < block_h; j++) {
                         dot += Q_ptr[j] * K_ptr[j];
                     }
                     
@@ -645,13 +797,21 @@ void attention_blocked(const float* Q, const float* K, const float* V,
                     
                     // Add weighted V row to output
                     int j = 0;
-                    for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
+#if defined(__x86_64__) || defined(__i386__)
+                    for (; j + VEC_SIZE <= block_h; j += VEC_SIZE) {
                         __m256 ov = _mm256_loadu_ps(O_row + j);
                         __m256 vv = _mm256_loadu_ps(V_row + j);
                         __m256 wv = _mm256_set1_ps(weight);
                         _mm256_storeu_ps(O_row + j, _mm256_fmadd_ps(wv, vv, ov));
                     }
-                    
+#elif defined(__aarch64__) || defined(__arm__)
+                    for (; j + VEC_SIZE <= block_h; j += VEC_SIZE) {
+                        float32x4_t ov = vld1q_f32(O_row + j);
+                        float32x4_t vv = vld1q_f32(V_row + j);
+                        float32x4_t wv = vdupq_n_f32(weight);
+                        vst1q_f32(O_row + j, vfmaq_f32(ov, wv, vv));
+                    }
+#endif
                     for (; j < block_h; j++) {
                         O_row[j] += weight * V_row[j];
                     }
@@ -697,6 +857,8 @@ public:
 
 // ==================== Optimized 8: Fused Operations ====================
 
+#if defined(__x86_64__) || defined(__i386__)
+
 // Fuse ReLU + Add into single pass
 void fused_relu_add(float* output, const float* input1, 
                     const float* input2, int size) {
@@ -712,7 +874,27 @@ void fused_relu_add(float* output, const float* input1,
     }
 }
 
+#elif defined(__aarch64__) || defined(__arm__)
+
+void fused_relu_add(float* output, const float* input1, 
+                    const float* input2, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    for (int i = 0; i < size; i += NEON_SIZE) {
+        float32x4_t a = vld1q_f32(&input1[i]);
+        float32x4_t b = vld1q_f32(&input2[i]);
+        float32x4_t sum = vaddq_f32(a, b);
+        sum = vmaxq_f32(sum, zero);
+        vst1q_f32(&output[i], sum);
+    }
+}
+
+#endif
+
 // Fused multiply-add with ReLU
+#if defined(__x86_64__) || defined(__i386__)
+
 void fused_mul_add_relu(float* output, const float* a, 
                         const float* b, const float* c, int size) {
     constexpr int AVX_SIZE = 8;
@@ -729,9 +911,30 @@ void fused_mul_add_relu(float* output, const float* a,
     }
 }
 
+#elif defined(__aarch64__) || defined(__arm__)
+
+void fused_mul_add_relu(float* output, const float* a, 
+                        const float* b, const float* c, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    for (int i = 0; i < size; i += NEON_SIZE) {
+        float32x4_t ma = vld1q_f32(&a[i]);
+        float32x4_t mb = vld1q_f32(&b[i]);
+        float32x4_t mc = vld1q_f32(&c[i]);
+        float32x4_t product = vmulq_f32(ma, mb);
+        float32x4_t sum = vaddq_f32(product, mc);
+        sum = vmaxq_f32(sum, zero);
+        vst1q_f32(&output[i], sum);
+    }
+}
+
+#endif
+
 // ==================== Optimized 9: Batch Processing ====================
 
-// Process multiple matrices in batch for better cache utilization
+#if defined(__x86_64__) || defined(__i386__)
+
 void matmul_batch(const float* A_batch, const float* B, float* C_batch,
                   int batch_size, int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
@@ -753,6 +956,32 @@ void matmul_batch(const float* A_batch, const float* B, float* C_batch,
         }
     }
 }
+
+#elif defined(__aarch64__) || defined(__arm__)
+
+void matmul_batch(const float* A_batch, const float* B, float* C_batch,
+                  int batch_size, int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    
+    for (int batch = 0; batch < batch_size; batch++) {
+        const float* A = A_batch + batch * M * K;
+        float* C = C_batch + batch * M * N;
+        
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j += NEON_SIZE) {
+                float32x4_t sum = vdupq_n_f32(0.0f);
+                for (int k = 0; k < K; k++) {
+                    float32x4_t a = vdupq_n_f32(A[i * K + k]);
+                    float32x4_t b = vld1q_f32(&B[k * N + j]);
+                    sum = vfmaq_f32(sum, a, b);
+                }
+                vst1q_f32(&C[i * N + j], sum);
+            }
+        }
+    }
+}
+
+#endif
 
 // ==================== NEW: Batched Parallel Processing ====================
 
