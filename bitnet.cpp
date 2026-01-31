@@ -4121,6 +4121,29 @@ inline float parallel_sum_avx2(const float* data, int size) {
 
 #endif  // IS_X86_PLATFORM
 
+#if IS_ARM_PLATFORM
+// ARM NEON version of parallel sum
+float parallel_sum_neon(const float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t data_vec = vld1q_f32(&data[i]);
+        sum_vec = vaddq_f32(sum_vec, data_vec);
+    }
+    
+    // Horizontal sum of NEON vector
+    float32_t sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    float sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    
+    for (; i < size; i++) sum += data[i];
+    
+    return sum;
+}
+#endif
+
 float parallel_sum(const float* data, int size) {
 #ifdef _OPENMP
     int num_threads = omp_get_max_threads();
@@ -4131,14 +4154,22 @@ float parallel_sum(const float* data, int size) {
         int chunk = size / num_threads;
         int start = t * chunk;
         int end = (t == num_threads - 1) ? size : start + chunk;
+#if IS_X86_PLATFORM
         partial_sums[t] = parallel_sum_avx2(data + start, end - start);
+#else
+        partial_sums[t] = parallel_sum_neon(data + start, end - start);
+#endif
     }
     
     float total = 0;
     for (float s : partial_sums) total += s;
     return total;
 #else
+#if IS_X86_PLATFORM
     return parallel_sum_avx2(data, size);
+#else
+    return parallel_sum_neon(data, size);
+#endif
 #endif
 }
 
@@ -4414,6 +4445,7 @@ void quantize_with_scale(const float* input, int8_t* output, int size,
 
 // ==================== 11. Cache-Oblivious Recursive MatMul ====================
 
+#if IS_X86_PLATFORM
 void matmul_cache_oblivious_recursive(float* A, float* B, float* C,
                                        int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
@@ -4462,6 +4494,57 @@ void matmul_cache_oblivious_recursive(float* A, float* B, float* C,
         }
     }
 }
+#else
+// ARM NEON version of cache-oblivious recursive matmul
+void matmul_cache_oblivious_recursive(float* A, float* B, float* C,
+                                       int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int BASE_SIZE = 32;  // Fits in L1 cache
+    
+    if (M <= BASE_SIZE && N <= BASE_SIZE && K <= BASE_SIZE) {
+        // Base case: fits in cache, use NEON
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j += NEON_SIZE) {
+                float32x4_t sum = vdupq_n_f32(0.0f);
+                for (int k = 0; k < K; k++) {
+                    float32x4_t a = vdupq_n_f32(A[i * K + k]);
+                    float32x4_t b = vld1q_f32(&B[k * N + j]);
+                    sum = vfmaq_f32(sum, a, b);
+                }
+                vst1q_f32(&C[i * N + j], sum);
+            }
+        }
+        return;
+    }
+    
+    // Recursive division along largest dimension
+    if (M >= N && M >= K) {
+        int mid = M / 2;
+        matmul_cache_oblivious_recursive(A, B, C, mid, N, K);
+        matmul_cache_oblivious_recursive(A + mid * K, B, C + mid * N, M - mid, N, K);
+    } else if (N >= M && N >= K) {
+        int mid = N / 2;
+        matmul_cache_oblivious_recursive(A, B, C, M, mid, K);
+        matmul_cache_oblivious_recursive(A, B + mid, C + mid, M, N - mid, K);
+    } else {
+        int mid = K / 2;
+        matmul_cache_oblivious_recursive(A, B, C, M, N, mid);
+        
+        // C += A2@B2
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j += NEON_SIZE) {
+                float32x4_t sum = vld1q_f32(&C[i * N + j]);
+                for (int k = mid; k < K; k++) {
+                    float32x4_t a = vdupq_n_f32(A[i * K + k]);
+                    float32x4_t b = vld1q_f32(&B[k * N + j]);
+                    sum = vfmaq_f32(sum, a, b);
+                }
+                vst1q_f32(&C[i * N + j], sum);
+            }
+        }
+    }
+}
+#endif
 
 // ==================== Initialize LUTs ====================
 
@@ -4488,8 +4571,8 @@ struct Bit4Matrix {
     void pack_from_float(const float* src, float scale) {
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
-                unsigned char val = static_cast<unsigned char>(std::max(0, std::min(15, 
-                    static_cast<int>(src[i * cols + j] / scale)));
+                int val_int = static_cast<int>(src[i * cols + j] / scale);
+                unsigned char val = static_cast<unsigned char>(std::max(0, std::min(15, val_int)));
                 if (j % 2 == 0) {
                     data[i * stride_bytes + j / 2] = val;
                 } else {
@@ -4535,6 +4618,7 @@ void matmul_4bit(const unsigned char* A, const unsigned char* B,
 
 // ==================== 2. Loop Reordering Optimization (ikj ordering) ====================
 
+#if IS_X86_PLATFORM
 // Optimized ordering: i-k-j gives better cache locality for A row reuse
 void matmul_ikj_order(const float* A, const float* B, float* C,
                       int M, int N, int K) {
@@ -4564,9 +4648,41 @@ void matmul_ikj_order(const float* A, const float* B, float* C,
         }
     }
 }
+#else
+// ARM NEON version
+void matmul_ikj_order(const float* A, const float* B, float* C,
+                      int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    
+    // Zero initialize C
+    for (int i = 0; i < M * N; i++) C[i] = 0.0f;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            int j = 0;
+            for (; j + NEON_SIZE <= N; j += NEON_SIZE) {
+                float32x4_t c_vec = vld1q_f32(&C_row[j]);
+                float32x4_t b_vec = vld1q_f32(&B_k[j]);
+                c_vec = vfmaq_f32(c_vec, a_val, b_vec);
+                vst1q_f32(&C_row[j], c_vec);
+            }
+            for (; j < N; j++) {
+                C_row[j] += A_row[k] * B_k[j];
+            }
+        }
+    }
+}
+#endif
 
 // ==================== 3. Aggressive Prefetch Strategy (L1 + L2) ====================
 
+#if IS_X86_PLATFORM
 void matmul_aggressive_prefetch_v2(const float* A, const float* B, float* C,
                                     int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
@@ -4603,6 +4719,45 @@ void matmul_aggressive_prefetch_v2(const float* A, const float* B, float* C,
         }
     }
 }
+#else
+// ARM NEON version with software prefetch
+void matmul_aggressive_prefetch_v2(const float* A, const float* B, float* C,
+                                    int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int PREFETCH_DIST = 8;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Software prefetch for B
+            if (k + PREFETCH_DIST < K) {
+                PREFETCH_READ(&B[(k + PREFETCH_DIST) * N]);
+            }
+            
+            int j = 0;
+            for (; j + NEON_SIZE <= N; j += NEON_SIZE) {
+                // Prefetch C row for next iteration
+                if (k > 0) {
+                    PREFETCH_WRITE(&C_row[j + 16]);
+                }
+                
+                float32x4_t c_vec = vld1q_f32(&C_row[j]);
+                float32x4_t b_vec = vld1q_f32(&B_k[j]);
+                c_vec = vfmaq_f32(c_vec, a_val, b_vec);
+                vst1q_f32(&C_row[j], c_vec);
+            }
+            for (; j < N; j++) {
+                C_row[j] += A_row[k] * B_k[j];
+            }
+        }
+    }
+}
+#endif
 
 // ==================== 4. Mixed Precision (BF16/FP32 hybrid) ====================
 
@@ -4633,6 +4788,7 @@ inline float bf16_to_fp32(unsigned short bf16) {
 }
 
 // Mixed precision matmul using BF16 for accumulation
+#if IS_X86_PLATFORM
 void matmul_mixed_precision(const float* A, const float* B, float* C,
                             int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
@@ -4661,6 +4817,28 @@ void matmul_mixed_precision(const float* A, const float* B, float* C,
         }
     }
 }
+#else
+// ARM NEON version
+void matmul_mixed_precision(const float* A, const float* B, float* C,
+                            int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int j = 0; j < N; j += NEON_SIZE) {
+            float32x4_t c_vec = vdupq_n_f32(0.0f);
+            for (int k = 0; k < K; k++) {
+                float32x4_t a_val = vdupq_n_f32(A_row[k]);
+                float32x4_t b_vec = vld1q_f32(&B[k * N + j]);
+                c_vec = vfmaq_f32(c_vec, a_val, b_vec);
+            }
+            vst1q_f32(&C_row[j], c_vec);
+        }
+    }
+}
+#endif
 
 // ==================== 5. Swish Activation (siLU) ====================
 
@@ -4668,6 +4846,7 @@ inline float swish(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
+#if IS_X86_PLATFORM
 void swish_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 one = _mm256_set1_ps(1.0f);
@@ -4685,6 +4864,33 @@ void swish_avx2(float* data, int size) {
         data[i] = swish(data[i]);
     }
 }
+#else
+// ARM NEON version
+void swish_avx2(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t one = vdupq_n_f32(1.0f);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        float32x4_t neg_x = vnegq_f32(x);
+        // Use fast_exp approximation for NEON
+        float x_arr[4], neg_x_arr[4], exp_arr[4];
+        vst1q_f32(x_arr, x);
+        vst1q_f32(neg_x_arr, neg_x);
+        for (int j = 0; j < 4; j++) {
+            exp_arr[j] = std::exp(neg_x_arr[j]);
+        }
+        float32x4_t exp_neg_x = vld1q_f32(exp_arr);
+        float32x4_t sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
+        float32x4_t result = vmulq_f32(x, sigmoid);
+        vst1q_f32(&data[i], result);
+    }
+    for (; i < size; i++) {
+        data[i] = swish(data[i]);
+    }
+}
+#endif
 
 // ==================== 6. Mish Activation ====================
 
@@ -4693,6 +4899,7 @@ inline float mish(float x) {
     return x * std::tanh(softplus);
 }
 
+#if IS_X86_PLATFORM
 void mish_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 one = _mm256_set1_ps(1.0f);
@@ -4720,6 +4927,29 @@ void mish_avx2(float* data, int size) {
         data[i] = mish(data[i]);
     }
 }
+#else
+// ARM NEON version
+void mish_avx2(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t one = vdupq_n_f32(1.0f);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        // Use scalar approximation for exp/log
+        float x_arr[4], result_arr[4];
+        vst1q_f32(x_arr, x);
+        for (int j = 0; j < 4; j++) {
+            result_arr[j] = mish(x_arr[j]);
+        }
+        float32x4_t result = vld1q_f32(result_arr);
+        vst1q_f32(&data[i], result);
+    }
+    for (; i < size; i++) {
+        data[i] = mish(data[i]);
+    }
+}
+#endif
 
 // ==================== 7. CPU Affinity for Parallel Processing ====================
 
@@ -4739,6 +4969,7 @@ int get_cpu_count() {
 
 // ==================== 8. Optimized Memory Copy with NT (Non-Temporal) Hints ====================
 
+#if IS_X86_PLATFORM
 void memcpy_nt(float* dst, const float* src, size_t size) {
     // Non-temporal stores for large copies (bypass cache)
     constexpr size_t AVX_VECS = sizeof(__m256) / sizeof(float);
@@ -4756,9 +4987,16 @@ void memcpy_nt(float* dst, const float* src, size_t size) {
     
     _mm_sfence();  // Memory fence
 }
+#else
+// ARM NEON version - use standard memcpy for simplicity
+void memcpy_nt(float* dst, const float* src, size_t size) {
+    std::memcpy(dst, src, size * sizeof(float));
+}
+#endif
 
 // ==================== 9. Fused Add + ReLU ====================
 
+#if IS_X86_PLATFORM
 void fused_add_relu(float* dst, const float* src, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 zero = _mm256_setzero_ps();
@@ -4775,12 +5013,31 @@ void fused_add_relu(float* dst, const float* src, int size) {
         dst[i] = std::max(0.0f, dst[i] + src[i]);
     }
 }
+#else
+// ARM NEON version
+void fused_add_relu(float* dst, const float* src, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t d = vld1q_f32(&dst[i]);
+        float32x4_t s = vld1q_f32(&src[i]);
+        float32x4_t sum = vaddq_f32(d, s);
+        float32x4_t result = vmaxq_f32(sum, zero);
+        vst1q_f32(&dst[i], result);
+    }
+    for (; i < size; i++) {
+        dst[i] = std::max(0.0f, dst[i] + src[i]);
+    }
+}
+#endif
 
 // ==================== 10. Strassen-like Matrix Multiplication ====================
 
+#if IS_X86_PLATFORM
 void matmul_strassen_optimized(const float* A, const float* B, float* C,
                                int M, int N, int K) {
-    constexpr int AVX_SIZE = 8;
     constexpr int STRASSEN_THRESHOLD = 128;  // Recursion threshold
     
     // Base case: small matrix, use AVX2
@@ -4792,6 +5049,22 @@ void matmul_strassen_optimized(const float* A, const float* B, float* C,
     // Use blocked GEMM for larger matrices
     matmul_multi_level_blocked(A, B, C, M, N, K);
 }
+#else
+// ARM NEON version
+void matmul_strassen_optimized(const float* A, const float* B, float* C,
+                               int M, int N, int K) {
+    constexpr int STRASSEN_THRESHOLD = 64;  // Lower threshold for NEON
+    
+    // Base case: small matrix, use NEON
+    if (M <= STRASSEN_THRESHOLD && N <= STRASSEN_THRESHOLD && K <= STRASSEN_THRESHOLD) {
+        matmul_ikj_order(A, B, C, M, N, K);
+        return;
+    }
+    
+    // Use blocked GEMM for larger matrices
+    matmul_multi_level_blocked(A, B, C, M, N, K);
+}
+#endif
 
 // ==================== Initialize LUTs ====================
 
