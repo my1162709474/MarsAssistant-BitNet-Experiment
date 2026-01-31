@@ -1874,6 +1874,144 @@ void layer_norm_fused(float* output, const float* input,
 
 #endif  // IS_X86_PLATFORM
 
+// ==================== Session 22: Fused Mean+Var LayerNorm ====================
+// Optimization: Single-pass mean and variance computation
+// Reduces memory bandwidth by avoiding second read of input data
+
+#if IS_X86_PLATFORM
+
+void layer_norm_fused_single_pass(float* output, const float* input,
+                                   const float* gamma, const float* beta,
+                                   int size, float epsilon = 1e-5f) {
+    constexpr int AVX_SIZE = 8;
+
+    // Single-pass: compute both mean and variance in one loop
+    // This reduces memory bandwidth by 50% for the first pass
+    __m256 sum_vec = _mm256_setzero_ps();
+    __m256 sq_sum_vec = _mm256_setzero_ps();
+
+    // Process in chunks of AVX_SIZE
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+        sq_sum_vec = _mm256_add_ps(sq_sum_vec, _mm256_mul_ps(vals, vals));
+    }
+
+    // Horizontal sum for mean
+    float32_t sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    float mean = 0;
+    for (int j = 0; j < 8 && i - AVX_SIZE + j < size; j++) {
+        mean += input[i - AVX_SIZE + j];
+    }
+    for (int j = 0; j < 8 && i - AVX_SIZE + j < size && i - AVX_SIZE + j >= 0; j++) {
+        if (i - AVX_SIZE + j < size) mean += sum_arr[j];
+    }
+    mean /= size;
+
+    // Horizontal sum for variance (E[x^2] - E[x]^2)
+    float32_t sq_arr[8];
+    _mm256_storeu_ps(sq_arr, sq_sum_vec);
+    float sq_mean = 0;
+    for (int j = 0; j < 8 && i - AVX_SIZE + j < size && i - AVX_SIZE + j >= 0; j++) {
+        float val = input[i - AVX_SIZE + j];
+        sq_mean += val * val;
+    }
+    for (int j = 0; j < 8 && i - AVX_SIZE + j < size && i - AVX_SIZE + j >= 0; j++) {
+        if (i - AVX_SIZE + j < size) sq_mean += sq_arr[j];
+    }
+    sq_mean /= size;
+
+    // var = E[x^2] - E[x]^2
+    float var = sq_mean - mean * mean;
+    var = var + epsilon;
+    float inv_std = 1.0f / std::sqrt(var);
+
+    // Normalize (vectorized)
+    __m256 inv_std_vec = _mm256_set1_ps(inv_std);
+    __m256 mean_vec = _mm256_set1_ps(mean);
+
+    i = 0;
+    for (; i + AVX_SIZE * 2 <= size; i += AVX_SIZE * 2) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        __m256 g = _mm256_loadu_ps(&gamma[i]);
+        __m256 b = _mm256_loadu_ps(&beta[i]);
+        __m256 norm = _mm256_mul_ps(_mm256_sub_ps(vals, mean_vec), inv_std_vec);
+        _mm256_storeu_ps(&output[i], _mm256_add_ps(_mm256_mul_ps(norm, g), b));
+    }
+
+    for (; i < size; i++) {
+        output[i] = (input[i] - mean) * inv_std * gamma[i] + beta[i];
+    }
+}
+
+#else
+
+// ARM NEON single-pass LayerNorm
+void layer_norm_fused_single_pass(float* output, const float* input,
+                                   const float* gamma, const float* beta,
+                                   int size, float epsilon = 1e-5f) {
+    constexpr int NEON_SIZE = 4;
+
+    // Single-pass: compute both mean and variance in one loop
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    float32x4_t sq_sum_vec = vdupq_n_f32(0.0f);
+
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        sum_vec = vaddq_f32(sum_vec, vals);
+        sq_sum_vec = vaddq_f32(sq_sum_vec, vmulq_f32(vals, vals));
+    }
+
+    // Scalar remainder for mean
+    float mean = 0;
+    for (int j = i; j < size; j++) mean += input[j];
+
+    // Horizontal sum from NEON
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    for (int j = 0; j < 4; j++) mean += sum_arr[j];
+    mean /= size;
+
+    // Scalar remainder for variance
+    float sq_mean = 0;
+    for (int j = i; j < size; j++) {
+        float val = input[j];
+        sq_mean += val * val;
+    }
+
+    // Horizontal sum for E[x^2]
+    float sq_arr[4];
+    vst1q_f32(sq_arr, sq_sum_vec);
+    for (int j = 0; j < 4; j++) sq_mean += sq_arr[j];
+    sq_mean /= size;
+
+    // var = E[x^2] - E[x]^2
+    float var = sq_mean - mean * mean;
+    var = var + epsilon;
+    float inv_std = 1.0f / std::sqrt(var);
+
+    // Normalize
+    float32x4_t mean_vec = vdupq_n_f32(mean);
+    float32x4_t inv_vec = vdupq_n_f32(inv_std);
+
+    for (int i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        float32x4_t g = vld1q_f32(&gamma[i]);
+        float32x4_t b = vld1q_f32(&beta[i]);
+        float32x4_t norm = vmulq_f32(vsubq_f32(vals, mean_vec), inv_vec);
+        vst1q_f32(&output[i], vaddq_f32(vmulq_f32(norm, g), b));
+    }
+
+    for (int i = size - (size % NEON_SIZE); i < size; i++) {
+        output[i] = (input[i] - mean) * inv_std * gamma[i] + beta[i];
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
 // ==================== NEW: Quantization with Lookup Table ====================
 
 // Pre-computed sigmoid lookup table (8-bit input -> 32-bit output)
