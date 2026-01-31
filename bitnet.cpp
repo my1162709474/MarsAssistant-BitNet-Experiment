@@ -198,10 +198,11 @@ void matmul_blocked(const float* A, const float* B, float* C,
 
 #if defined(__x86_64__) || defined(__i386__)
 
-// AVX2 implementation for x86
+// AVX2 implementation for x86 - Optimized with aggressive prefetching
 void matmul_avx2(const float* A, const float* B, float* C,
                  int M, int N, int K) {
     constexpr int AVX_SIZE = 8;  // 256-bit / 32-bit
+    constexpr int PREFETCH_HINT = 2;  // Prefetch distance for next K iteration
     
     for (int i = 0; i < M; i++) {
         const float* A_row = A + i * K;
@@ -216,6 +217,14 @@ void matmul_avx2(const float* A, const float* B, float* C,
         for (int k = 0; k < K; k++) {
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* B_k = B + k * N;
+            
+            // Aggressive prefetch for next K iteration
+            if (k + PREFETCH_HINT < K) {
+                _mm_prefetch(reinterpret_cast<const char*>(&A_row[k + PREFETCH_HINT]), _MM_HINT_T0);
+                for (int j = 0; j < num_vec; j += 2) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&B_k[(j + PREFETCH_HINT) * AVX_SIZE]), _MM_HINT_T0);
+                }
+            }
             
             for (int j = 0; j < num_vec; j++) {
                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
@@ -273,9 +282,43 @@ void matmul_avx2(const float* A, const float* B, float* C,
 // ==================== Optimized 3: 1-bit Quantization ====================
 
 void quantize_1bit(const float* input, unsigned char* output, int size, float threshold) {
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr int AVX_SIZE = 8;
+    const __m256 thresh_vec = _mm256_set1_ps(threshold);
+    
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        __m256 cmp = _mm256_cmp_ps(vals, thresh_vec, _CMP_GT_OQ);
+        unsigned mask = _mm256_movemask_ps(cmp);
+        
+        // Pack 8 bits into bytes
+        output[i] = (mask & 1) | ((mask & 2) << 1) | ((mask & 4) << 2) | ((mask & 8) << 3) |
+                    ((mask & 16) << 4) | ((mask & 32) << 5) | ((mask & 64) << 6) | ((mask & 128) << 7);
+    }
+    // Handle remainder
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        output[i] = (input[i] > threshold) ? 1 : 0;
+    }
+#elif defined(__aarch64__) || defined(__arm__)
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t thresh_vec = vdupq_n_f32(threshold);
+    
+    for (int i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        uint32x4_t cmp = vcgtq_f32(vals, thresh_vec);
+        unsigned mask = vgetq_lane_u32(cmp, 0) | (vgetq_lane_u32(cmp, 1) << 1) |
+                        (vgetq_lane_u32(cmp, 2) << 2) | (vgetq_lane_u32(cmp, 3) << 3);
+        
+        output[i] = mask & 0xFF;
+    }
+    for (int i = size - (size % NEON_SIZE); i < size; i++) {
+        output[i] = (input[i] > threshold) ? 1 : 0;
+    }
+#else
     for (int i = 0; i < size; i++) {
         output[i] = (input[i] > threshold) ? 1 : 0;
     }
+#endif
 }
 
 // 1-bit matrix multiplication using bit operations
@@ -312,22 +355,35 @@ void matmul_1bit(const unsigned char* A, const unsigned char* B,
 }
 
 // Optimized 1-bit matmul with pre-computed packed bits
+// Uses word-level parallelism and reduced memory access
 void matmul_1bit_packed(const unsigned char* A_packed, const unsigned char* B_packed, 
                         float* C, int M, int N, int K) {
     const int K_words = (K + 31) / 32;  // 32-bit words
     
-    for (int i = 0; i < M; i++) {
-        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+    // Process multiple rows together for better cache utilization
+    constexpr int ROW_BATCH = 4;
+    
+    for (int i = 0; i < M; i += ROW_BATCH) {
+        int batch_end = std::min(i + ROW_BATCH, M);
         
         for (int j = 0; j < N; j++) {
             const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            float batch_sum[ROW_BATCH] = {0};
             
-            int diff_count = 0;
+            // Process all batched rows together
             for (int w = 0; w < K_words; w++) {
-                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+                unsigned int b_word = B_words[w];
+                
+                for (int ii = i; ii < batch_end; ii++) {
+                    const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + ii * K);
+                    batch_sum[ii - i] += __builtin_popcount(A_words[w] ^ b_word);
+                }
             }
             
-            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+            // Store results
+            for (int ii = i; ii < batch_end; ii++) {
+                C[ii * N + j] = static_cast<float>(K - 2 * batch_sum[ii - i]);
+            }
         }
     }
 }
@@ -2680,33 +2736,50 @@ void matmul_bf16(const bfloat16* A, const bfloat16* B, float* C, int M, int N, i
 
 #endif
 
-// ==================== NEW: Vectorized Softmax ====================
+// ==================== NEW: Vectorized Softmax - Optimized ====================
+
+// Horizontal sum of AVX vector using pairwise addition
+inline float hsum_ps_avx(__m256 v) {
+    __m256 v0 = _mm256_hadd_ps(v, v);
+    __m256 v1 = _mm256_hadd_ps(v0, v0);
+    float result[4];
+    _mm256_storeu_ps(result, v1);
+    return result[0] + result[2];
+}
 
 void softmax_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     
-    // Find max
+    // Find max with efficient horizontal reduction
     __m256 max_vec = _mm256_setzero_ps();
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
     }
-    float max_arr[8];
-    _mm256_storeu_ps(max_arr, max_vec);
-    float max_val = max_arr[0];
-    for (int j = 1; j < 8 && i - AVX_SIZE + j < size; j++) {
-        if (i - AVX_SIZE + j >= 0 && i - AVX_SIZE + j < size) {
-            max_val = std::max(max_val, data[i - AVX_SIZE + j]);
-        }
-    }
-    for (int j = 0; j < 8; j++) max_val = std::max(max_val, max_arr[j]);
-    for (; i < size; i++) max_val = std::max(max_val, data[i]);
     
-    // Exp and sum
+    // Reduce max_vec to scalar
+    float max_val = hsum_ps_avx(max_vec);
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+    }
+    
+    // Exp and sum - fused operation with memory access optimization
     __m256 max_scalar = _mm256_set1_ps(max_val);
     __m256 sum_vec = _mm256_setzero_ps();
     i = 0;
     
+    // Process in larger chunks for better cache behavior
+    for (; i + AVX_SIZE * 2 <= size; i += AVX_SIZE * 2) {
+        __m256 vals0 = _mm256_loadu_ps(&data[i]);
+        __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        vals0 = _mm256_exp_ps(_mm256_sub_ps(vals0, max_scalar));
+        vals1 = _mm256_exp_ps(_mm256_sub_ps(vals1, max_scalar));
+        _mm256_storeu_ps(&data[i], vals0);
+        _mm256_storeu_ps(&data[i + AVX_SIZE], vals1);
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals0, vals1));
+    }
+    
+    // Remaining elements
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         __m256 vals = _mm256_loadu_ps(&data[i]);
         vals = _mm256_exp_ps(_mm256_sub_ps(vals, max_scalar));
@@ -2714,19 +2787,23 @@ void softmax_avx2(float* data, int size) {
         sum_vec = _mm256_add_ps(sum_vec, vals);
     }
     
-    float sum_arr[8];
-    _mm256_storeu_ps(sum_arr, sum_vec);
-    float sum = 0;
-    for (int j = 0; j < 8; j++) sum += sum_arr[j];
+    float sum = hsum_ps_avx(sum_vec);
     for (; i < size; i++) {
         data[i] = std::exp(data[i] - max_val);
         sum += data[i];
     }
     
-    // Normalize
+    // Normalize - fused multiply for efficiency
     float inv_sum = 1.0f / (sum + 1e-8f);
     __m256 inv_vec = _mm256_set1_ps(inv_sum);
     i = 0;
+    
+    for (; i + AVX_SIZE * 2 <= size; i += AVX_SIZE * 2) {
+        __m256 vals0 = _mm256_loadu_ps(&data[i]);
+        __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals0, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE], _mm256_mul_ps(vals1, inv_vec));
+    }
     
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         __m256 vals = _mm256_loadu_ps(&data[i]);
@@ -2735,21 +2812,55 @@ void softmax_avx2(float* data, int size) {
     for (; i < size; i++) data[i] *= inv_sum;
 }
 
-// ==================== NEW: Vectorized Sigmoid ====================
+// ==================== NEW: Vectorized Sigmoid with Lookup Table ====================
 
+// Sigmoid lookup table for faster computation
+// Maps [min, max] range to 256 discrete values
+constexpr int SIGMOID_LUT_SIZE = 256;
+constexpr float SIGMOID_LUT_MIN = -5.0f;
+constexpr float SIGMOID_LUT_MAX = 5.0f;
+
+static float sigmoid_lut[SIGMOID_LUT_SIZE];
+
+// Initialize sigmoid lookup table
+void init_sigmoid_lut() {
+    const float scale = (SIGMOID_LUT_SIZE - 1) / (SIGMOID_LUT_MAX - SIGMOID_LUT_MIN);
+    for (int i = 0; i < SIGMOID_LUT_SIZE; i++) {
+        float x = SIGMOID_LUT_MIN + i / scale;
+        sigmoid_lut[i] = 1.0f / (1.0f + std::exp(-x));
+    }
+}
+
+// SIMD sigmoid using lookup table with interpolation
 void sigmoid_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
+    const __m256 scale = _mm256_set1_ps((SIGMOID_LUT_SIZE - 1) / (SIGMOID_LUT_MAX - SIGMOID_LUT_MIN));
+    const __m256 offset = _mm256_set1_ps(-SIGMOID_LUT_MIN);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 lut_min_vec = _mm256_set1_ps(SIGMOID_LUT_MIN);
+    const __m256 lut_max_vec = _mm256_set1_ps(SIGMOID_LUT_MAX);
     
     for (int i = 0; i < size; i += AVX_SIZE) {
         __m256 x = _mm256_loadu_ps(&data[i]);
-        __m256 min_val = _mm256_set1_ps(-6.0f);
-        __m256 max_val = _mm256_set1_ps(6.0f);
-        x = _mm256_max_ps(_mm256_min_ps(x, max_val), min_val);
         
-        __m256 exp_neg_x = _mm256_exp_ps(_mm256_negate_ps(x));
-        __m256 sigmoid = _mm256_div_ps(_mm256_set1_ps(1.0f), 
-                                       _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x));
-        _mm256_storeu_ps(&data[i], sigmoid);
+        // Clamp to LUT range
+        x = _mm256_max_ps(_mm256_min_ps(x, lut_max_vec), lut_min_vec);
+        
+        // Convert to LUT index
+        __m256 idx_float = _mm256_mul_ps(_mm256_add_ps(x, offset), scale);
+        __m256i idx = _mm256_cvtps_epi32(idx_float);
+        
+        // Gather from LUT (manual unroll for 8 values)
+        int idx_arr[8];
+        _mm256_storeu_si256((__m256i*)idx_arr, idx);
+        
+        __m256 result = _mm256_setzero_ps();
+        for (int j = 0; j < AVX_SIZE; j++) {
+            int idx0 = std::max(0, std::min(SIGMOID_LUT_SIZE - 1, idx_arr[j]));
+            result = _mm256_insertf128_ps(result, _mm_load_ss(&sigmoid_lut[idx0]), j / 4);
+        }
+        
+        _mm256_storeu_ps(&data[i], result);
     }
 }
 
