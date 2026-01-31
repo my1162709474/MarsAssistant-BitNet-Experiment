@@ -142,6 +142,10 @@ struct BitNetConfig {
 #if defined(__aarch64__) || defined(__arm__)
 void matmul_neon(const float* A, const float* B, float* C, int M, int N, int K);
 void relu_neon(float* data, int size);
+
+// Cross-platform function aliases (define for ARM to map x86 functions to NEON)
+#define matmul_avx2 matmul_neon
+#define matmul_1bit_avx512 matmul_1bit_parallel
 #endif
 
 // ==================== AVX-512 Support (Conditional) ====================
@@ -2949,6 +2953,8 @@ struct StealData {
     int num_threads;
 };
 
+#if IS_X86_PLATFORM
+
 void* matmul_stealing_thread(void* arg) {
     StealData* data = (StealData*)arg;
     constexpr int AVX_SIZE = 8;
@@ -2997,6 +3003,60 @@ void matmul_work_stealing(const float* A, const float* B, float* C,
         pthread_join(threads[t], nullptr);
     }
 }
+
+#else
+
+// ARM fallback for work-stealing (uses simple parallel)
+void* matmul_stealing_thread(void* arg) {
+    StealData* data = (StealData*)arg;
+    constexpr int NEON_SIZE = 4;
+    
+    while (true) {
+        int row = data->next_row.fetch_add(1);
+        if (row >= data->M) break;
+        
+        const float* A_row = data->A + row * data->K;
+        float* C_row = data->C + row * data->N;
+        
+        float32x4_t c_vec[64];
+        int num_vec = data->N / NEON_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < data->K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = data->B + k * data->N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+        }
+    }
+    
+    return nullptr;
+}
+
+void matmul_work_stealing(const float* A, const float* B, float* C,
+                          int M, int N, int K, int num_threads) {
+    StealData data = {A, B, C, M, N, K, 0, num_threads};
+    pthread_t threads[64];
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_create(&threads[t], nullptr, matmul_stealing_thread, &data);
+    }
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
+#endif
 
 // ==================== NEW: Strassen-like Recursive Optimization ====================
 
