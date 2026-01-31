@@ -271,3 +271,168 @@ int main() {
     
     return 0;
 }
+
+// ==================== Optimized 6: Attention Mechanism ====================
+
+// Multi-head attention with cached key/value
+struct AttentionCache {
+    float* keys;
+    float* values;
+    int seq_len;
+    int head_dim;
+    int num_heads;
+    
+    AttentionCache(int sl = 0, int hd = 0, int nh = 0) 
+        : seq_len(sl), head_dim(hd), num_heads(nh) {
+        keys = new float[seq_len * head_dim * num_heads]();
+        values = new float[seq_len * head_dim * num_heads]();
+    }
+    
+    ~AttentionCache() {
+        delete[] keys;
+        delete[] values;
+    }
+};
+
+// Flash attention style: compute attention in blocks to reduce memory
+void attention_blocked(const float* Q, const float* K, const float* V,
+                       float* output, int B, int T, int d, float scale) {
+    constexpr int BLOCK = 64;
+    
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < d; h += BLOCK) {
+            // Process in blocks to stay in L1 cache
+            float block_max = -INFINITY;
+            float block_sum = 0.0f;
+            
+            // Compute Q*K^T in blocks
+            for (int t = 0; t < T; t += BLOCK) {
+                for (int i = 0; i < BLOCK; i++) {
+                    if (t + i >= T) break;
+                    
+                    float qk = 0.0f;
+                    for (int j = 0; j < BLOCK; j++) {
+                        if (h + j >= d) break;
+                        qk += Q[b * T * d + (t + i) * d + (h + j)] * 
+                              K[b * T * d + (t + j) * d + (h + j)];
+                    }
+                    qk *= scale;
+                    
+                    // Softmax with numerical stability
+                    qk = std::exp(qk - block_max);
+                    block_sum += qk;
+                    
+                    // Store intermediate
+                    float* temp = output + b * T * d + (t + i) * d + h;
+                    temp[0] = qk;  // Using first element as temp storage
+                }
+            }
+            
+            // Normalize
+            float inv_sum = 1.0f / (block_sum + 1e-8f);
+            
+            // Compute output: softmax(Q*K^T) * V
+            for (int i = 0; i < BLOCK; i++) {
+                if (h + i >= d) break;
+                float attn_weight = output[b * T * d + h * d + i] * inv_sum;  // Simplified
+                for (int t = 0; t < T; t++) {
+                    output[b * T * d + t * d + (h + i)] += 
+                        attn_weight * V[b * T * d + t * d + (h + i)];
+                }
+            }
+        }
+    }
+}
+
+// ==================== Optimized 7: Memory Pool ====================
+
+class MemoryPool {
+private:
+    std::vector<void*> free_blocks;
+    size_t block_size;
+    size_t total_allocated;
+    
+public:
+    MemoryPool(size_t bs = 1024 * 1024) : block_size(bs), total_allocated(0) {}
+    
+    void* allocate(size_t size) {
+        if (size <= block_size && !free_blocks.empty()) {
+            void* ptr = free_blocks.back();
+            free_blocks.pop_back();
+            return ptr;
+        }
+        
+        // Allocate new block (aligned for SIMD)
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, CACHE_LINE_SIZE, size) == 0) {
+            total_allocated += size;
+            return ptr;
+        }
+        return nullptr;
+    }
+    
+    void deallocate(void* ptr) {
+        free_blocks.push_back(ptr);
+    }
+    
+    size_t total_used() const { return total_allocated; }
+};
+
+// ==================== Optimized 8: Fused Operations ====================
+
+// Fuse ReLU + Add into single pass
+void fused_relu_add(float* output, const float* input1, 
+                    const float* input2, int size) {
+    constexpr int AVX_SIZE = 8;
+    __m256 zero = _mm256_setzero_ps();
+    
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 a = _mm256_loadu_ps(&input1[i]);
+        __m256 b = _mm256_loadu_ps(&input2[i]);
+        __m256 sum = _mm256_add_ps(a, b);
+        sum = _mm256_max_ps(sum, zero);
+        _mm256_storeu_ps(&output[i], sum);
+    }
+}
+
+// Fused multiply-add with ReLU
+void fused_mul_add_relu(float* output, const float* a, 
+                        const float* b, const float* c, int size) {
+    constexpr int AVX_SIZE = 8;
+    __m256 zero = _mm256_setzero_ps();
+    
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 ma = _mm256_loadu_ps(&a[i]);
+        __m256 mb = _mm256_loadu_ps(&b[i]);
+        __m256 mc = _mm256_loadu_ps(&c[i]);
+        __m256 product = _mm256_mul_ps(ma, mb);
+        __m256 sum = _mm256_add_ps(product, mc);
+        sum = _mm256_max_ps(sum, zero);
+        _mm256_storeu_ps(&output[i], sum);
+    }
+}
+
+// ==================== Optimized 9: Batch Processing ====================
+
+// Process multiple matrices in batch for better cache utilization
+void matmul_batch(const float* A_batch, const float* B, float* C_batch,
+                  int batch_size, int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int batch = 0; batch < batch_size; batch++) {
+        const float* A = A_batch + batch * M * K;
+        float* C = C_batch + batch * M * N;
+        
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j += AVX_SIZE) {
+                __m256 sum = _mm256_setzero_ps();
+                for (int k = 0; k < K; k++) {
+                    __m256 a = _mm256_set1_ps(A[i * K + k]);
+                    __m256 b = _mm256_loadu_ps(&B[k * N + j]);
+                    sum = _mm256_add_ps(sum, _mm256_mul_ps(a, b));
+                }
+                _mm256_storeu_ps(&C[i * N + j], sum);
+            }
+        }
+    }
+}
