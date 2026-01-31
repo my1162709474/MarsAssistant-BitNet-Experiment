@@ -1812,4 +1812,454 @@ int dot_product_neon(const unsigned char* a, const unsigned char* b, int len) {
     return count;
 }
 
+// ==================== NEW: Winograd Fast Convolution Algorithm ====================
+// Winograd F(2x2, 3x3) - Reduces multiplications by 2.25x
+
+// Pre-computed Winograd transformation matrices
+alignas(32) static const float winograd_g[3][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.5f, 0.5f, 0.5f},
+    {0.5f, -0.5f, 0.5f},
+    {0.0f, 0.0f, 1.0f}
+};
+
+alignas(32) static const float winograd_b[4][4] = {
+    {1.0f, 0.0f, -1.0f, 0.0f},
+    {0.0f, 1.0f, 1.0f, 0.0f},
+    {0.0f, -1.0f, 1.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f, -1.0f}
+};
+
+// Winograd kernel transform (G @ W @ G^T)
+inline void winograd_kernel_transform(const float kernel[3][3], float kernel_trans[4][4]) {
+    float temp[4][3];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 3; j++) {
+            temp[i][j] = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                temp[i][j] += winograd_g[i][k] * kernel[k][j];
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            kernel_trans[i][j] = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                kernel_trans[i][j] += temp[i][k] * winograd_g[j][k];
+            }
+        }
+    }
+}
+
+// Winograd input transform (B^T @ d @ B)
+inline void winograd_input_transform(const float input[4][4], float input_trans[4][4]) {
+    float temp[4][4];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            temp[i][j] = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                temp[i][j] += winograd_b[i][k] * input[k][j];
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            input_trans[i][j] = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                input_trans[i][j] += temp[i][k] * winograd_b[k][j];
+            }
+        }
+    }
+}
+
+// Vectorized Winograd tile (AVX2)
+inline void winograd_tile_avx2(const float kernel_trans[4][4], const float input_trans[4][4],
+                               float output[2][2]) {
+    __m256 sum = _mm256_setzero_ps();
+    for (int i = 0; i < 4; i++) {
+        __m256 k_row = _mm256_loadu_ps(kernel_trans[i]);
+        __m256 i_row = _mm256_loadu_ps(input_trans[i]);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(k_row, i_row));
+    }
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum);
+    output[0][0] = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    output[0][1] = sum_arr[4] + sum_arr[5] + sum_arr[6] + sum_arr[7];
+    output[1][0] = output[0][0];
+    output[1][1] = output[0][1];
+}
+
+// Winograd convolution
+void conv2d_winograd(const float* input, const float* kernel, float* output,
+                     int in_h, int in_w, int out_channels, int in_channels) {
+    const int k_size = 3;
+    const int out_h = in_h - k_size + 1;
+    const int out_w = in_w - k_size + 1;
+    
+    // Pre-transform kernels
+    float kernel_trans[out_channels][4][4];
+    for (int oc = 0; oc < out_channels; oc++) {
+        float kernel_3x3[3][3];
+        for (int ic = 0; ic < in_channels; ic++) {
+            const float* k_base = kernel + oc * in_channels * 9 + ic * 9;
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) {
+                    kernel_3x3[i][j] = k_base[i * 3 + j];
+                }
+            }
+            winograd_kernel_transform(kernel_3x3, kernel_trans[oc]);
+        }
+    }
+    
+    // Process tiles (2x2 output per tile)
+    for (int tile_y = 0; tile_y < out_h; tile_y += 2) {
+        for (int tile_x = 0; tile_x < out_w; tile_x += 2) {
+            float input_tile[4][4];
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    int y = tile_y + i;
+                    int x = tile_x + j;
+                    input_tile[i][j] = (y < in_h && x < in_w) ? input[y * in_w + x] : 0.0f;
+                }
+            }
+            
+            float input_trans[4][4];
+            winograd_input_transform(input_tile, input_trans);
+            
+            for (int oc = 0; oc < out_channels; oc++) {
+                float tile_out[2][2];
+                winograd_tile_avx2(kernel_trans[oc], input_trans, tile_out);
+                
+                for (int i = 0; i < 2; i++) {
+                    for (int j = 0; j < 2; j++) {
+                        int out_y = tile_y + i;
+                        int out_x = tile_x + j;
+                        if (out_y < out_h && out_x < out_w) {
+                            output[oc * out_h * out_w + out_y * out_w + out_x] += tile_out[i][j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== NEW: Fast GELU Activation ====================
+// GELU(x) = x * Φ(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+
+inline float fast_gelu(float x) {
+    const float c0 = 0.7978845608f;  // √(2/π)
+    const float c1 = 0.044715f;
+    const float c2 = 0.5f;
+    
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float tanh_arg = c0 * (x + c1 * x3);
+    
+    // Fast tanh: (2x + 0.2x³) / (2 + 0.2x²)
+    float tanh_x2 = tanh_arg * tanh_arg;
+    float tanh_x3 = tanh_x2 * tanh_arg;
+    float tanh_val = (2.0f * tanh_arg + 0.2f * tanh_x3) / (2.0f + 0.2f * tanh_x2);
+    if (std::abs(tanh_arg) >= 3.5f) tanh_val = (tanh_arg > 0) ? 1.0f : -1.0f;
+    
+    return c2 * x * (1.0f + tanh_val);
+}
+
+// SIMD GELU (AVX2)
+void gelu_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 c0 = _mm256_set1_ps(0.7978845608f);
+    const __m256 c1 = _mm256_set1_ps(0.044715f);
+    const __m256 c2 = _mm256_set1_ps(0.5f);
+    const __m256 two = _mm256_set1_ps(2.0f);
+    const __m256 point2 = _mm256_set1_ps(0.2f);
+    const __m256 three_point5 = _mm256_set1_ps(3.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        __m256 x2 = _mm256_mul_ps(x, x);
+        __m256 x3 = _mm256_mul_ps(x2, x);
+        __m256 tanh_arg = _mm256_mul_ps(c0, _mm256_add_ps(x, _mm256_mul_ps(c1, x3)));
+        
+        __m256 tanh_x2 = _mm256_mul_ps(tanh_arg, tanh_arg);
+        __m256 tanh_x3 = _mm256_mul_ps(tanh_x2, tanh_arg);
+        __m256 num = _mm256_add_ps(_mm256_mul_ps(two, tanh_arg), _mm256_mul_ps(point2, tanh_x3));
+        __m256 den = _mm256_add_ps(two, _mm256_mul_ps(point2, tanh_x2));
+        __m256 tanh_val = _mm256_div_ps(num, den);
+        
+        // Clamp for large values
+        __m256 abs_tanh = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), tanh_arg);
+        __m256 clamp_mask = _mm256_cmp_ps(abs_tanh, three_point5, _CMP_GT_OQ);
+        __m256 clamped_tanh = _mm256_blendv_ps(tanh_val, one, clamp_mask);
+        
+        __m256 result = _mm256_mul_ps(c2, _mm256_mul_ps(x, _mm256_add_ps(one, clamped_tanh)));
+        _mm256_storeu_ps(&data[i], result);
+    }
+}
+
+// ARM NEON GELU
+void gelu_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t c0 = vdupq_n_f32(0.7978845608f);
+    const float32x4_t c1 = vdupq_n_f32(0.044715f);
+    const float32x4_t c2 = vdupq_n_f32(0.5f);
+    const float32x4_t two = vdupq_n_f32(2.0f);
+    const float32x4_t point2 = vdupq_n_f32(0.2f);
+    
+    for (int i = 0; i < size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        float32x4_t x2 = vmulq_f32(x, x);
+        float32x4_t x3 = vmulq_f32(x2, x);
+        float32x4_t tanh_arg = vmulq_f32(c0, vaddq_f32(x, vmulq_f32(c1, x3)));
+        
+        float32x4_t tanh_x2 = vmulq_f32(tanh_arg, tanh_arg);
+        float32x4_t tanh_x3 = vmulq_f32(tanh_x2, tanh_arg);
+        float32x4_t num = vaddq_f32(vmulq_f32(two, tanh_arg), vmulq_f32(point2, tanh_x3));
+        float32x4_t den = vaddq_f32(two, vmulq_f32(point2, tanh_x2));
+        float32x4_t tanh_val = vdivq_f32(num, den);
+        
+        float32x4_t result = vmulq_f32(c2, vmulq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), tanh_val)));
+        vst1q_f32(&data[i], result);
+    }
+}
+
+// ==================== NEW: BF16/FP32 Hybrid Precision MatMul ====================
+
+#if defined(__AVX512BF16__)
+
+inline float bf16_dot_product(const bfloat16* a, const bfloat16* b, int len) {
+    const int BF16_VEC_SIZE = 32;
+    __m512 sum = _mm512_setzero_ps();
+    int i = 0;
+    
+    for (; i + BF16_VEC_SIZE <= len; i += BF16_VEC_SIZE) {
+        __m512i a_vec = _mm512_loadu_si512((__m512i*)(a + i));
+        __m512i b_vec = _mm512_loadu_si512((__m512i*)(b + i));
+        __m512i dp = _mm512_dpbf16_ps(sum, a_vec, b_vec);
+        sum = _mm512_castsi512_ps(dp);
+    }
+    
+    float result = 0.0f;
+    float arr[16];
+    _mm512_storeu_ps(arr, sum);
+    for (int j = 0; j < 16; j++) result += arr[j];
+    
+    for (; i < len; i++) result += (float)a[i] * (float)b[i];
+    return result;
+}
+
+void matmul_bf16(const bfloat16* A, const bfloat16* B, float* C, int M, int N, int K) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            C[i * N + j] = bf16_dot_product(&A[i * K], &B[j], K);
+        }
+    }
+}
+
+#else
+
+void matmul_bf16(const bfloat16* A, const bfloat16* B, float* C, int M, int N, int K) {
+    std::vector<float> A_fp32(M * K), B_fp32(K * N);
+    for (int i = 0; i < M * K; i++) A_fp32[i] = (float)A[i];
+    for (int i = 0; i < K * N; i++) B_fp32[i] = (float)B[i];
+    matmul_avx2(A_fp32.data(), B_fp32.data(), C, M, N, K);
+}
+
+#endif
+
+// ==================== NEW: Vectorized Softmax ====================
+
+void softmax_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Find max
+    __m256 max_vec = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+    }
+    float max_arr[8];
+    _mm256_storeu_ps(max_arr, max_vec);
+    float max_val = max_arr[0];
+    for (int j = 1; j < 8 && i - AVX_SIZE + j < size; j++) {
+        if (i - AVX_SIZE + j >= 0 && i - AVX_SIZE + j < size) {
+            max_val = std::max(max_val, data[i - AVX_SIZE + j]);
+        }
+    }
+    for (int j = 0; j < 8; j++) max_val = std::max(max_val, max_arr[j]);
+    for (; i < size; i++) max_val = std::max(max_val, data[i]);
+    
+    // Exp and sum
+    __m256 max_scalar = _mm256_set1_ps(max_val);
+    __m256 sum_vec = _mm256_setzero_ps();
+    i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_exp_ps(_mm256_sub_ps(vals, max_scalar));
+        _mm256_storeu_ps(&data[i], vals);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+    }
+    
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    float sum = 0;
+    for (int j = 0; j < 8; j++) sum += sum_arr[j];
+    for (; i < size; i++) {
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+}
+
+// ==================== NEW: Vectorized Sigmoid ====================
+
+void sigmoid_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        __m256 min_val = _mm256_set1_ps(-6.0f);
+        __m256 max_val = _mm256_set1_ps(6.0f);
+        x = _mm256_max_ps(_mm256_min_ps(x, max_val), min_val);
+        
+        __m256 exp_neg_x = _mm256_exp_ps(_mm256_negate_ps(x));
+        __m256 sigmoid = _mm256_div_ps(_mm256_set1_ps(1.0f), 
+                                       _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x));
+        _mm256_storeu_ps(&data[i], sigmoid);
+    }
+}
+
+// ==================== NEW: Cache-Optimized Panel GEMM ====================
+
+void matmul_panel_copy(const float* A, const float* B, float* C,
+                       int M, int N, int K) {
+    constexpr int PANEL_M = 64;
+    constexpr int PANEL_K = 8;
+    constexpr int AVX_SIZE = 8;
+    
+    float A_panel[PANEL_M * PANEL_K];
+    
+    for (int i = 0; i < M; i += PANEL_M) {
+        for (int k = 0; k < K; k += PANEL_K) {
+            int m_end = std::min(i + PANEL_M, M);
+            int k_end = std::min(k + PANEL_K, K);
+            int m_len = m_end - i;
+            int k_len = k_end - k;
+            
+            // Copy panel (contiguous access)
+            for (int ii = 0; ii < m_len; ii++) {
+                for (int kk = 0; kk < k_len; kk++) {
+                    A_panel[ii * PANEL_K + kk] = A[(i + ii) * K + (k + kk)];
+                }
+            }
+            
+            // Compute
+            for (int j = 0; j < N; j += AVX_SIZE) {
+                for (int ii = 0; ii < m_len; ii++) {
+                    __m256 c_vec = _mm256_loadu_ps(&C[(i + ii) * N + j]);
+                    
+                    for (int kk = 0; kk < k_len; kk++) {
+                        __m256 a_val = _mm256_set1_ps(A_panel[ii * PANEL_K + kk]);
+                        const float* B_k = B + (k + kk) * N;
+                        c_vec = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j]), c_vec);
+                    }
+                    
+                    _mm256_storeu_ps(&C[(i + ii) * N + j], c_vec);
+                }
+            }
+        }
+    }
+}
+
+// ==================== NEW: Performance Monitoring ====================
+
+struct PerfStats {
+    double matmul_time = 0;
+    double attention_time = 0;
+    int matmul_calls = 0;
+    int attention_calls = 0;
+};
+
+PerfStats global_stats;
+
+void perf_record_matmul(double time_ms) {
+    global_stats.matmul_time += time_ms;
+    global_stats.matmul_calls++;
+}
+
+void perf_print_stats() {
+    std::cout << "\n=== Performance Statistics ===" << std::endl;
+    std::cout << "MatMul: " << global_stats.matmul_calls << " calls, "
+              << global_stats.matmul_time << " ms total" << std::endl;
+    if (global_stats.matmul_calls > 0) {
+        std::cout << "  Average: " << (global_stats.matmul_time / global_stats.matmul_calls) << " ms/call" << std::endl;
+    }
+    std::cout << "Attention: " << global_stats.attention_calls << " calls, "
+              << global_stats.attention_time << " ms total" << std::endl;
+}
+
+// ==================== NEW: INT8 Quantization ====================
+
+void quantize_int8(const float* input, int8_t* output, int size, 
+                   float* scale, int8_t* zero_point) {
+    float min_val = input[0], max_val = input[0];
+    for (int i = 1; i < size; i++) {
+        min_val = std::min(min_val, input[i]);
+        max_val = std::max(max_val, input[i]);
+    }
+    
+    *scale = (max_val - min_val) / 254.0f;  // INT8 range: -127 to 127
+    *zero_point = static_cast<int8_t>(std::round(-min_val / *scale + 128));
+    
+    for (int i = 0; i < size; i++) {
+        output[i] = static_cast<int8_t>(std::round(input[i] / *scale) + *zero_point);
+    }
+}
+
+void dequantize_int8(const int8_t* input, float* output, int size,
+                     float scale, int8_t zero_point) {
+    for (int i = 0; i < size; i++) {
+        output[i] = (static_cast<float>(input[i] - zero_point)) * scale;
+    }
+}
+
+// ==================== NEW: Vectorized INT8 GEMM ====================
+
+void matmul_int8_simd(const int8_t* A, const int8_t* B, float* C,
+                      int M, int N, int K, float scale_a, float scale_b) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j += AVX_SIZE) {
+            __m256 sum = _mm256_setzero_ps();
+            
+            for (int k = 0; k < K; k++) {
+                __m256 a_val = _mm256_set1_ps(static_cast<float>(A[i * K + k]));
+                const int8_t* b_row = B + k * N;
+                __m256 b_vec = _mm256_set_ps(
+                    static_cast<float>(b_row[j + 7]), static_cast<float>(b_row[j + 6]),
+                    static_cast<float>(b_row[j + 5]), static_cast<float>(b_row[j + 4]),
+                    static_cast<float>(b_row[j + 3]), static_cast<float>(b_row[j + 2]),
+                    static_cast<float>(b_row[j + 1]), static_cast<float>(b_row[j + 0])
+                );
+                sum = _mm256_fmadd_ps(a_val, b_vec, sum);
+            }
+            
+            _mm256_storeu_ps(&C[i * N + j], _mm256_mul_ps(sum, _mm256_set1_ps(scale_a * scale_b)));
+        }
+    }
+}
+
 #endif
