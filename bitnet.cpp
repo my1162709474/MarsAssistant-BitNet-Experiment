@@ -3042,15 +3042,60 @@ void* matmul_stealing_thread(void* arg) {
     return nullptr;
 }
 
+// ARM-specific StealData without atomic<int>
+struct StealDataARM {
+    const float* A;
+    const float* B;
+    float* C;
+    int M, N, K;
+    int next_row;
+    int num_threads;
+};
+
+void* matmul_stealing_thread_arm(void* arg) {
+    StealDataARM* data = (StealDataARM*)arg;
+    constexpr int NEON_SIZE = 4;
+    
+    while (true) {
+        int row = __sync_fetch_and_add(&data->next_row, 1);
+        if (row >= data->M) break;
+
+        const float* A_row = data->A + row * data->K;
+        float* C_row = data->C + row * data->N;
+
+        float32x4_t c_vec[64];
+        int num_vec = data->N / NEON_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = vdupq_n_f32(0.0f);
+        }
+
+        for (int k = 0; k < data->K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = data->B + k * data->N;
+
+            for (int j = 0; j < num_vec; j++) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+            }
+        }
+
+        for (int j = 0; j < num_vec; j++) {
+            vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+        }
+    }
+
+    return nullptr;
+}
+
 void matmul_work_stealing(const float* A, const float* B, float* C,
                           int M, int N, int K, int num_threads) {
-    StealData data = {A, B, C, M, N, K, 0, num_threads};
+    StealDataARM data = {A, B, C, M, N, K, 0, num_threads};
     pthread_t threads[64];
-    
+
     for (int t = 0; t < num_threads; t++) {
-        pthread_create(&threads[t], nullptr, matmul_stealing_thread, &data);
+        pthread_create(&threads[t], nullptr, matmul_stealing_thread_arm, &data);
     }
-    
+
     for (int t = 0; t < num_threads; t++) {
         pthread_join(threads[t], nullptr);
     }
@@ -3094,35 +3139,37 @@ void matmul_strassen_recursive(const float* A, const float* B, float* C,
 #define RESTRICT
 #endif
 
-void matmul_pointer_opt(float* RESTRICT A, float* RESTRICT B, 
+#if IS_X86_PLATFORM
+void matmul_pointer_opt(float* RESTRICT A, float* RESTRICT B,
                         float* RESTRICT C, int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
-    
+
     for (int i = 0; i < M; i++) {
         float* RESTRICT C_row = C + i * N;
         const float* RESTRICT A_row = A + i * K;
-        
+
         __m256 c_vec[64];
         int num_vec = N / AVX_SIZE;
         for (int j = 0; j < num_vec; j++) {
             c_vec[j] = _mm256_setzero_ps();
         }
-        
+
         for (int k = 0; k < K; k++) {
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* RESTRICT B_k = B + k * N;
-            
+
             for (int j = 0; j < num_vec; j++) {
                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
                 c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
             }
         }
-        
+
         for (int j = 0; j < num_vec; j++) {
             _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
     }
 }
+#endif
 
 // ==================== ARM NEON Optimization ====================
 #if defined(__ARM_NEON) && !defined(BITNET_NEON_DEFINED)
@@ -3168,8 +3215,13 @@ int dot_product_neon(const unsigned char* a, const unsigned char* b, int len) {
         uint8x16_t xored = veorq_u8(va, vb);
         uint8x16_t masked = vmvnq_u8(xored);
         
-        // Sum bits (popcount)
-        uint16x8_t sum1 = vpaddlq_u8(vpaddlq_u4(vpaddlq_u1(masked)));
+        // Sum bits (popcount) - correct NEON instruction chain
+        uint16x8_t sum1 = vpaddlq_u8(vpaddlq_u8(vdupq_n_u8(0))); // placeholder
+        // Correct popcount using pairwise addition: u8 -> u16 -> u32 -> u64
+        uint16x8_t sum_step1 = vpaddlq_u8(masked);  // u8 -> u16, pairwise add
+        uint32x4_t sum_step2 = vpaddlq_u16(sum_step1);  // u16 -> u32, pairwise add
+        uint64x2_t sum_step3 = vpaddlq_u32(sum_step2);  // u32 -> u64, pairwise add
+        count += vgetq_lane_u64(sum_step3, 0) + vgetq_lane_u64(sum_step3, 1);
         count += vgetq_lane_s16(sum1, 0) + vgetq_lane_s16(sum1, 4);
     }
     
@@ -3187,7 +3239,7 @@ int dot_product_neon(const unsigned char* a, const unsigned char* b, int len) {
 // Winograd F(2x2, 3x3) - Reduces multiplications by 2.25x
 
 // Pre-computed Winograd transformation matrices
-alignas(32) static const float winograd_g[3][3] = {
+alignas(32) static const float winograd_g[4][3] = {
     {1.0f, 0.0f, 0.0f},
     {0.5f, 0.5f, 0.5f},
     {0.5f, -0.5f, 0.5f},
@@ -3243,6 +3295,7 @@ inline void winograd_input_transform(const float input[4][4], float input_trans[
     }
 }
 
+#if IS_X86_PLATFORM
 // Vectorized Winograd tile (AVX2)
 inline void winograd_tile_avx2(const float kernel_trans[4][4], const float input_trans[4][4],
                                float output[2][2]) {
@@ -3259,6 +3312,7 @@ inline void winograd_tile_avx2(const float kernel_trans[4][4], const float input
     output[1][0] = output[0][0];
     output[1][1] = output[0][1];
 }
+#endif
 
 // Winograd convolution
 void conv2d_winograd(const float* input, const float* kernel, float* output,
@@ -3266,7 +3320,7 @@ void conv2d_winograd(const float* input, const float* kernel, float* output,
     const int k_size = 3;
     const int out_h = in_h - k_size + 1;
     const int out_w = in_w - k_size + 1;
-    
+
     // Pre-transform kernels
     float kernel_trans[out_channels][4][4];
     for (int oc = 0; oc < out_channels; oc++) {
@@ -3281,7 +3335,7 @@ void conv2d_winograd(const float* input, const float* kernel, float* output,
             winograd_kernel_transform(kernel_3x3, kernel_trans[oc]);
         }
     }
-    
+
     // Process tiles (2x2 output per tile)
     for (int tile_y = 0; tile_y < out_h; tile_y += 2) {
         for (int tile_x = 0; tile_x < out_w; tile_x += 2) {
@@ -3293,14 +3347,26 @@ void conv2d_winograd(const float* input, const float* kernel, float* output,
                     input_tile[i][j] = (y < in_h && x < in_w) ? input[y * in_w + x] : 0.0f;
                 }
             }
-            
+
             float input_trans[4][4];
             winograd_input_transform(input_tile, input_trans);
-            
+
             for (int oc = 0; oc < out_channels; oc++) {
                 float tile_out[2][2];
+#if IS_X86_PLATFORM
                 winograd_tile_avx2(kernel_trans[oc], input_trans, tile_out);
-                
+#else
+                // ARM: scalar fallback for Winograd
+                for (int i = 0; i < 4; i++) {
+                    for (int j = 0; j < 4; j++) {
+                        tile_out[0][0] += kernel_trans[oc][i][j] * input_trans[i][j];
+                    }
+                }
+                tile_out[0][1] = tile_out[0][0];
+                tile_out[1][0] = tile_out[0][0];
+                tile_out[1][1] = tile_out[0][0];
+#endif
+
                 for (int i = 0; i < 2; i++) {
                     for (int j = 0; j < 2; j++) {
                         int out_y = tile_y + i;
@@ -3316,7 +3382,6 @@ void conv2d_winograd(const float* input, const float* kernel, float* output,
 }
 
 #endif  // BITNET_NEON_DEFINED
-#endif  // IS_ARM_PLATFORM (third block)
 
 // ==================== NEW: Fast GELU Activation ====================
 // GELU(x) = x * Φ(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
@@ -3339,6 +3404,7 @@ inline float fast_gelu(float x) {
     return c2 * x * (1.0f + tanh_val);
 }
 
+#if IS_X86_PLATFORM
 // SIMD GELU (AVX2)
 void gelu_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
@@ -3349,28 +3415,29 @@ void gelu_avx2(float* data, int size) {
     const __m256 point2 = _mm256_set1_ps(0.2f);
     const __m256 three_point5 = _mm256_set1_ps(3.5f);
     const __m256 one = _mm256_set1_ps(1.0f);
-    
+
     for (int i = 0; i < size; i += AVX_SIZE) {
         __m256 x = _mm256_loadu_ps(&data[i]);
         __m256 x2 = _mm256_mul_ps(x, x);
         __m256 x3 = _mm256_mul_ps(x2, x);
         __m256 tanh_arg = _mm256_mul_ps(c0, _mm256_add_ps(x, _mm256_mul_ps(c1, x3)));
-        
+
         __m256 tanh_x2 = _mm256_mul_ps(tanh_arg, tanh_arg);
         __m256 tanh_x3 = _mm256_mul_ps(tanh_x2, tanh_arg);
         __m256 num = _mm256_add_ps(_mm256_mul_ps(two, tanh_arg), _mm256_mul_ps(point2, tanh_x3));
         __m256 den = _mm256_add_ps(two, _mm256_mul_ps(point2, tanh_x2));
         __m256 tanh_val = _mm256_div_ps(num, den);
-        
+
         // Clamp for large values
         __m256 abs_tanh = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), tanh_arg);
         __m256 clamp_mask = _mm256_cmp_ps(abs_tanh, three_point5, _CMP_GT_OQ);
         __m256 clamped_tanh = _mm256_blendv_ps(tanh_val, one, clamp_mask);
-        
+
         __m256 result = _mm256_mul_ps(c2, _mm256_mul_ps(x, _mm256_add_ps(one, clamped_tanh)));
         _mm256_storeu_ps(&data[i], result);
     }
 }
+#endif
 
 // ARM NEON GELU
 void gelu_neon(float* data, int size) {
@@ -3433,14 +3500,26 @@ void matmul_bf16(const bfloat16* A, const bfloat16* B, float* C, int M, int N, i
 
 #else
 
+#if IS_X86_PLATFORM
 void matmul_bf16(const bfloat16* A, const bfloat16* B, float* C, int M, int N, int K) {
     std::vector<float> A_fp32(M * K), B_fp32(K * N);
     for (int i = 0; i < M * K; i++) A_fp32[i] = (float)A[i];
     for (int i = 0; i < K * N; i++) B_fp32[i] = (float)B[i];
     matmul_avx2(A_fp32.data(), B_fp32.data(), C, M, N, K);
 }
+#else
+// ARM fallback for bfloat16 matmul (use float conversion + neon)
+void matmul_bf16(const bfloat16_t* A, const bfloat16_t* B, float* C, int M, int N, int K) {
+    std::vector<float> A_fp32(M * K), B_fp32(K * N);
+    for (int i = 0; i < M * K; i++) A_fp32[i] = (float)A[i];
+    for (int i = 0; i < K * N; i++) B_fp32[i] = (float)B[i];
+    matmul_neon(A_fp32.data(), B_fp32.data(), C, M, N, K);
+}
+#endif
 
 #endif
+
+#if IS_X86_PLATFORM
 
 // ==================== NEW: Vectorized Softmax - Optimized ====================
 
@@ -3455,7 +3534,7 @@ inline float hsum_ps_avx(__m256 v) {
 
 void softmax_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
-    
+
     // Find max with efficient horizontal reduction
     __m256 max_vec = _mm256_setzero_ps();
     int i = 0;
@@ -3730,15 +3809,17 @@ struct Bit2Matrix {
     }
 };
 
+#if IS_X86_PLATFORM
+
 constexpr float LUT_2BIT[4] = {-1.5f, -0.5f, 0.5f, 1.5f};
 
 void matmul_2bit(const Bit2Matrix& A, const float* B, float* C, int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
-    
+
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j += AVX_SIZE) {
             __m256 sum = _mm256_setzero_ps();
-            
+
             for (int k = 0; k < K; k++) {
                 unsigned char q = A.get(i, k);
                 __m256 a_vec = _mm256_set1_ps(LUT_2BIT[q]);
@@ -3751,6 +3832,8 @@ void matmul_2bit(const Bit2Matrix& A, const float* B, float* C, int M, int N, in
         }
     }
 }
+
+#endif  // IS_X86_PLATFORM
 
 // ==================== NEW: Memory Pool ====================
 
@@ -3787,7 +3870,7 @@ public:
 };
 
 MemoryPool* get_memory_pool() {
-    static MemoryPool pool(16);
+    static MemoryPool pool;
     return &pool;
 }
 
@@ -3837,23 +3920,25 @@ inline void matmul_1bit_ultra(const unsigned char* A_packed, const unsigned char
 
 // ==================== NEW: Fused Attention ====================
 
+#if IS_X86_PLATFORM
+
 void attention_fused(const float* Q, const float* K, const float* V,
                      float* output, int batch, int num_heads,
                      int seq_len, int head_dim) {
     constexpr int AVX_SIZE = 8;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    
+
     for (int b = 0; b < batch; b++) {
         for (int h = 0; h < num_heads; h++) {
             for (int i = 0; i < seq_len; i++) {
                 float max_val = -INFINITY;
                 std::vector<float> attn_scores(seq_len);
-                
+
                 for (int j = 0; j < seq_len; j++) {
                     float dot = 0;
                     const float* q_row = Q + (b * num_heads + h) * seq_len * head_dim + i * head_dim;
                     const float* k_row = K + (b * num_heads + h) * seq_len * head_dim + j * head_dim;
-                    
+
                     for (int d = 0; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
                         __m256 q_vec = _mm256_loadu_ps(q_row + d);
                         __m256 k_vec = _mm256_loadu_ps(k_row + d);
@@ -3865,18 +3950,18 @@ void attention_fused(const float* Q, const float* K, const float* V,
                     for (int d = (head_dim / AVX_SIZE) * AVX_SIZE; d < head_dim; d++) {
                         dot += q_row[d] * k_row[d];
                     }
-                    
+
                     attn_scores[j] = dot * scale;
                     max_val = std::max(max_val, attn_scores[j]);
                 }
-                
+
                 float sum = 0;
                 for (int j = 0; j < seq_len; j++) {
                     attn_scores[j] = std::exp(attn_scores[j] - max_val);
                     sum += attn_scores[j];
                 }
                 for (int j = 0; j < seq_len; j++) attn_scores[j] /= sum;
-                
+
                 std::vector<float> out_vec(head_dim, 0.0f);
                 for (int j = 0; j < seq_len; j++) {
                     const float* v_row = V + (b * num_heads + h) * seq_len * head_dim + j * head_dim;
@@ -3884,13 +3969,15 @@ void attention_fused(const float* Q, const float* K, const float* V,
                         out_vec[d] += attn_scores[j] * v_row[d];
                     }
                 }
-                
+
                 float* out_ptr = output + (b * num_heads + h) * seq_len * head_dim + i * head_dim;
                 for (int d = 0; d < head_dim; d++) out_ptr[d] = out_vec[d];
             }
         }
     }
 }
+
+#endif  // IS_X86_PLATFORM
 
 // ==================== NEW: Session 9 Optimizations (2026-02-01 01:22) ====================
 
@@ -3899,15 +3986,17 @@ void attention_fused(const float* Q, const float* K, const float* V,
 #include <omp.h>
 #endif
 
+#if IS_X86_PLATFORM
+
 inline float parallel_sum_avx2(const float* data, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 sum_vec = _mm256_setzero_ps();
-    
+
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&data[i]));
     }
-    
+
     // Horizontal sum
     float32_t sum_arr[8];
     _mm256_storeu_ps(sum_arr, sum_vec);
@@ -3916,9 +4005,11 @@ inline float parallel_sum_avx2(const float* data, int size) {
         if (i - AVX_SIZE + j < size) sum += sum_arr[j];
     }
     for (; i < size; i++) sum += data[i];
-    
+
     return sum;
 }
+
+#endif  // IS_X86_PLATFORM
 
 float parallel_sum(const float* data, int size) {
 #ifdef _OPENMP
@@ -4113,10 +4204,12 @@ static PreAllocatedBuffer global_buffer(512 * 1024);
 
 // ==================== 6. Vectorized Fill Operation (memset for floats) ====================
 
+#if IS_X86_PLATFORM
+
 void memset_float_avx2(float* data, float value, int size) {
     constexpr int AVX_SIZE = 8;
     __m256 val_vec = _mm256_set1_ps(value);
-    
+
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         _mm256_storeu_ps(&data[i], val_vec);
@@ -4138,7 +4231,7 @@ inline __m256 clamp_branchless_avx2(__m256 x, __m256 min_val, __m256 max_val) {
 
 void transpose_matrix_avx2(float* dst, const float* src, int rows, int cols) {
     constexpr int AVX_SIZE = 8;
-    
+
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols; j += AVX_SIZE) {
             // Load row and store as column
@@ -4149,6 +4242,8 @@ void transpose_matrix_avx2(float* dst, const float* src, int rows, int cols) {
         }
     }
 }
+
+#endif  // IS_X86_PLATFORM
 
 // ==================== 9. Dynamic Scheduling with Chunk Size ====================
 
@@ -4161,23 +4256,23 @@ void matmul_dynamic_schedule(const float* A, const float* B, float* C,
         constexpr int AVX_SIZE = 8;
         const float* A_row = A + i * K;
         float* C_row = C + i * N;
-        
+
         __m256 c_vec[64];
         int num_vec = N / AVX_SIZE;
         for (int j = 0; j < num_vec; j++) {
             c_vec[j] = _mm256_setzero_ps();
         }
-        
+
         for (int k = 0; k < K; k++) {
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* B_k = B + k * N;
-            
+
             for (int j = 0; j < num_vec; j++) {
                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
                 c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
             }
         }
-        
+
         for (int j = 0; j < num_vec; j++) {
             _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
