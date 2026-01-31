@@ -1,0 +1,328 @@
+=== Sun Feb  1 01:44:33 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+❌ Compilation failed!
+bitnet.cpp:1011:13: error: unknown type name '__m256'
+ 1011 |             __m256 c_vec[64];
+      |             ^
+bitnet.cpp:1014:28: error: use of undeclared identifier '_mm256_setzero_ps'
+ 1014 |                 c_vec[j] = _mm256_setzero_ps();
+      |                            ^
+bitnet.cpp:1018:17: error: unknown type name '__m256'
+ 1018 |                 __m256 a_val = _mm256_set1_ps(A_row[k]);
+      |                 ^
+bitnet.cpp:1018:32: error: use of undeclared identifier '_mm256_set1_ps'
+ 1018 |                 __m256 a_val = _mm256_set1_ps(A_row[k]);
+      |                                ^
+bitnet.cpp:1023:34: error: use of undeclared identifier '_MM_HINT_T0'
+ 1023 |                                  _MM_HINT_T0);
+      |                                  ^
+bitnet.cpp:1027:21: error: unknown type name '__m256'
+ 1027 |                     __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+      |                     ^
+bitnet.cpp:1027:36: error: use of undeclared identifier '_mm256_loadu_ps'
+ 1027 |                     __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+      |                                    ^
+bitnet.cpp:1071:9: error: unknown type name '__m256'
+ 1071 |         __m256 c_vec[64];
+      |         ^
+bitnet.cpp:1074:24: error: use of undeclared identifier '_mm256_setzero_ps'
+ 1074 |             c_vec[j] = _mm256_setzero_ps();
+      |                        ^
+bitnet.cpp:1079:13: error: unknown type name '__m256'
+ 1079 |             __m256 a_val = _mm256_set1_ps(A_row[k]);
+      |             ^
+bitnet.cpp:1079:28: error: use of undeclared identifier '_mm256_set1_ps'
+ 1079 |             __m256 a_val = _mm256_set1_ps(A_row[k]);
+      |                            ^
+bitnet.cpp:1084:17: error: use of undeclared identifier 'prefetch_read'
+ 1084 |                 prefetch_read(B + (k + PREFETCH_DIST) * N);
+      |                 ^
+bitnet.cpp:1085:17: error: use of undeclared identifier 'prefetch_read'
+ 1085 |                 prefetch_read(A_row + k + PREFETCH_DIST);
+      |                 ^
+bitnet.cpp:1089:17: error: unknown type name '__m256'
+ 1089 |                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+      |                 ^
+bitnet.cpp:1089:32: error: use of undeclared identifier '_mm256_loadu_ps'
+ 1089 |                 __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+      |                                ^
+bitnet.cpp:1104:6: error: redefinition of 'matmul_neon'
+ 1104 | void matmul_neon(const float* A, const float* B, float* C,
+      |      ^
+bitnet.cpp:235:6: note: previous definition is here
+  235 | void matmul_neon(const float* A, const float* B, float* C,
+      |      ^
+bitnet.cpp:1136:6: error: redefinition of 'relu_neon'
+ 1136 | void relu_neon(float* data, int size) {
+      |      ^
+bitnet.cpp:588:6: note: previous definition is here
+  588 | void relu_neon(float* data, int size) {
+      |      ^
+bitnet.cpp:1218:45: error: unknown type name '__m256'
+ 1218 |                                             __m256 a = _mm256_set1_ps(A_row[k]);
+      |                                             ^
+bitnet.cpp:1218:56: error: use of undeclared identifier '_mm256_set1_ps'
+ 1218 |                                             __m256 a = _mm256_set1_ps(A_row[k]);
+      |                                                        ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+Done at Sun Feb  1 01:44:33 CST 2026
+---
+=== Sun Feb  1 01:45:05 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+❌ Compilation failed!
+In file included from bitnet.cpp:19:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+In file included from bitnet.cpp:19:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:14:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/hresetintrin.h:42:27: error: invalid input constraint 'a' in asm
+   42 |   __asm__ ("hreset $0" :: "a"(__eax));
+      |                           ^
+In file included from bitnet.cpp:19:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:26:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:33:10: error: use of undeclared identifier '__builtin_ia32_crc32qi'
+   33 |   return __builtin_ia32_crc32qi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:53:10: error: use of undeclared identifier '__builtin_ia32_crc32hi'; did you mean '__builtin_arm_crc32h'?
+   53 |   return __builtin_ia32_crc32hi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:73:10: error: use of undeclared identifier '__builtin_ia32_crc32si'
+   73 |   return __builtin_ia32_crc32si(__C, __D);
+      |          ^
+In file included from bitnet.cpp:19:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:34:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_aadd32'; did you mean '__builtin_arm_addg'?
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: argument to '__builtin_arm_addg' must be a constant integer
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^                                 ~~~
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:61:3: error: use of undeclared identifier '__builtin_ia32_aand32'
+   61 |   __builtin_ia32_aand32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:83:3: error: use of undeclared identifier '__builtin_ia32_aor32'
+   83 |   __builtin_ia32_aor32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:105:3: error: use of undeclared identifier '__builtin_ia32_axor32'
+  105 |   __builtin_ia32_axor32((int *)__A, __B);
+      |   ^
+In file included from bitnet.cpp:19:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_emms'; did you mean '__builtin_isless'?
+   39 |   __builtin_ia32_emms();
+      |   ^
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__math/traits.h:157:10: note: '__builtin_isless' declared here
+  157 |   return __builtin_isless((type)__x, (type)__y);
+      |          ^
+In file included from bitnet.cpp:19:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:23: error: too few arguments to function call, expected 2, have 0
+   39 |   __builtin_ia32_emms();
+      |   ~~~~~~~~~~~~~~~~~~~~^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:56:19: error: use of undeclared identifier '__builtin_ia32_vec_init_v2si'
+   56 |     return (__m64)__builtin_ia32_vec_init_v2si(__i, 0);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:73:12: error: use of undeclared identifier '__builtin_ia32_vec_ext_v2si'
+   73 |     return __builtin_ia32_vec_ext_v2si((__v2si)__m, 0);
+      |            ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:130:19: error: use of undeclared identifier '__builtin_ia32_packsswb'
+  130 |     return (__m64)__builtin_ia32_packsswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:155:19: error: use of undeclared identifier '__builtin_ia32_packssdw'
+  155 |     return (__m64)__builtin_ia32_packssdw((__v2si)__m1, (__v2si)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:180:19: error: use of undeclared identifier '__builtin_ia32_packuswb'
+  180 |     return (__m64)__builtin_ia32_packuswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:207:19: error: use of undeclared identifier '__builtin_ia32_punpckhbw'
+  207 |     return (__m64)__builtin_ia32_punpckhbw((__v8qi)__m1, (__v8qi)__m2);
+      |                   ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+Done at Sun Feb  1 01:45:06 CST 2026
+---
+=== Sun Feb  1 01:45:22 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+❌ Compilation failed!
+In file included from bitnet.cpp:36:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+In file included from bitnet.cpp:36:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:14:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/hresetintrin.h:42:27: error: invalid input constraint 'a' in asm
+   42 |   __asm__ ("hreset $0" :: "a"(__eax));
+      |                           ^
+In file included from bitnet.cpp:36:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:26:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:33:10: error: use of undeclared identifier '__builtin_ia32_crc32qi'
+   33 |   return __builtin_ia32_crc32qi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:53:10: error: use of undeclared identifier '__builtin_ia32_crc32hi'; did you mean '__builtin_arm_crc32h'?
+   53 |   return __builtin_ia32_crc32hi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:73:10: error: use of undeclared identifier '__builtin_ia32_crc32si'
+   73 |   return __builtin_ia32_crc32si(__C, __D);
+      |          ^
+In file included from bitnet.cpp:36:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:34:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_aadd32'; did you mean '__builtin_arm_addg'?
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: argument to '__builtin_arm_addg' must be a constant integer
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^                                 ~~~
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:61:3: error: use of undeclared identifier '__builtin_ia32_aand32'
+   61 |   __builtin_ia32_aand32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:83:3: error: use of undeclared identifier '__builtin_ia32_aor32'
+   83 |   __builtin_ia32_aor32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:105:3: error: use of undeclared identifier '__builtin_ia32_axor32'
+  105 |   __builtin_ia32_axor32((int *)__A, __B);
+      |   ^
+In file included from bitnet.cpp:36:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_emms'; did you mean '__builtin_isless'?
+   39 |   __builtin_ia32_emms();
+      |   ^
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__math/traits.h:157:10: note: '__builtin_isless' declared here
+  157 |   return __builtin_isless((type)__x, (type)__y);
+      |          ^
+In file included from bitnet.cpp:36:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:23: error: too few arguments to function call, expected 2, have 0
+   39 |   __builtin_ia32_emms();
+      |   ~~~~~~~~~~~~~~~~~~~~^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:56:19: error: use of undeclared identifier '__builtin_ia32_vec_init_v2si'
+   56 |     return (__m64)__builtin_ia32_vec_init_v2si(__i, 0);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:73:12: error: use of undeclared identifier '__builtin_ia32_vec_ext_v2si'
+   73 |     return __builtin_ia32_vec_ext_v2si((__v2si)__m, 0);
+      |            ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:130:19: error: use of undeclared identifier '__builtin_ia32_packsswb'
+  130 |     return (__m64)__builtin_ia32_packsswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:155:19: error: use of undeclared identifier '__builtin_ia32_packssdw'
+  155 |     return (__m64)__builtin_ia32_packssdw((__v2si)__m1, (__v2si)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:180:19: error: use of undeclared identifier '__builtin_ia32_packuswb'
+  180 |     return (__m64)__builtin_ia32_packuswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:207:19: error: use of undeclared identifier '__builtin_ia32_punpckhbw'
+  207 |     return (__m64)__builtin_ia32_punpckhbw((__v8qi)__m1, (__v8qi)__m2);
+      |                   ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+Done at Sun Feb  1 01:45:22 CST 2026
+---
+=== Sun Feb  1 01:45:56 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+❌ Compilation failed!
+In file included from bitnet.cpp:47:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+In file included from bitnet.cpp:47:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:14:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/hresetintrin.h:42:27: error: invalid input constraint 'a' in asm
+   42 |   __asm__ ("hreset $0" :: "a"(__eax));
+      |                           ^
+In file included from bitnet.cpp:47:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:26:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:33:10: error: use of undeclared identifier '__builtin_ia32_crc32qi'
+   33 |   return __builtin_ia32_crc32qi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:53:10: error: use of undeclared identifier '__builtin_ia32_crc32hi'; did you mean '__builtin_arm_crc32h'?
+   53 |   return __builtin_ia32_crc32hi(__C, __D);
+      |          ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/crc32intrin.h:73:10: error: use of undeclared identifier '__builtin_ia32_crc32si'
+   73 |   return __builtin_ia32_crc32si(__C, __D);
+      |          ^
+In file included from bitnet.cpp:47:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:17:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/x86gprintrin.h:34:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_aadd32'; did you mean '__builtin_arm_addg'?
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:39:3: error: argument to '__builtin_arm_addg' must be a constant integer
+   39 |   __builtin_ia32_aadd32((int *)__A, __B);
+      |   ^                                 ~~~
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:61:3: error: use of undeclared identifier '__builtin_ia32_aand32'
+   61 |   __builtin_ia32_aand32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:83:3: error: use of undeclared identifier '__builtin_ia32_aor32'
+   83 |   __builtin_ia32_aor32((int *)__A, __B);
+      |   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/raointintrin.h:105:3: error: use of undeclared identifier '__builtin_ia32_axor32'
+  105 |   __builtin_ia32_axor32((int *)__A, __B);
+      |   ^
+In file included from bitnet.cpp:47:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:14:2: error: "This header is only meant to be used on x86 and x64 architecture"
+   14 | #error "This header is only meant to be used on x86 and x64 architecture"
+      |  ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:3: error: use of undeclared identifier '__builtin_ia32_emms'; did you mean '__builtin_isless'?
+   39 |   __builtin_ia32_emms();
+      |   ^
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__math/traits.h:157:10: note: '__builtin_isless' declared here
+  157 |   return __builtin_isless((type)__x, (type)__y);
+      |          ^
+In file included from bitnet.cpp:47:
+In file included from /Library/Developer/CommandLineTools/usr/lib/clang/17/include/immintrin.h:20:
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:39:23: error: too few arguments to function call, expected 2, have 0
+   39 |   __builtin_ia32_emms();
+      |   ~~~~~~~~~~~~~~~~~~~~^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:56:19: error: use of undeclared identifier '__builtin_ia32_vec_init_v2si'
+   56 |     return (__m64)__builtin_ia32_vec_init_v2si(__i, 0);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:73:12: error: use of undeclared identifier '__builtin_ia32_vec_ext_v2si'
+   73 |     return __builtin_ia32_vec_ext_v2si((__v2si)__m, 0);
+      |            ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:130:19: error: use of undeclared identifier '__builtin_ia32_packsswb'
+  130 |     return (__m64)__builtin_ia32_packsswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:155:19: error: use of undeclared identifier '__builtin_ia32_packssdw'
+  155 |     return (__m64)__builtin_ia32_packssdw((__v2si)__m1, (__v2si)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:180:19: error: use of undeclared identifier '__builtin_ia32_packuswb'
+  180 |     return (__m64)__builtin_ia32_packuswb((__v4hi)__m1, (__v4hi)__m2);
+      |                   ^
+/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mmintrin.h:207:19: error: use of undeclared identifier '__builtin_ia32_punpckhbw'
+  207 |     return (__m64)__builtin_ia32_punpckhbw((__v8qi)__m1, (__v8qi)__m2);
+      |                   ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+Done at Sun Feb  1 01:45:57 CST 2026
+---
+=== Sun Feb  1 01:46:20 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+✅ Compilation successful!
+Done at Sun Feb  1 01:46:20 CST 2026
+---
