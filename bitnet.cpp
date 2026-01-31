@@ -31,12 +31,45 @@ struct Matrix {
     int stride;
     
     Matrix(int r = 0, int c = 0) : rows(r), cols(c), stride(c) {
-        data = new float[rows * cols];
+        // Aligned allocation for SIMD (32-byte alignment for AVX2)
+        posix_memalign(reinterpret_cast<void**>(&data), CACHE_LINE_SIZE, 
+                       sizeof(float) * rows * cols);
         std::memset(data, 0, sizeof(float) * rows * cols);
     }
     
     ~Matrix() {
-        delete[] data;
+        free(data);
+    }
+};
+
+// ==================== NEW: Aligned 1-bit Matrix ====================
+
+struct BitMatrix {
+    unsigned char* data;
+    int rows;
+    int cols;
+    int stride_bytes;
+    
+    BitMatrix(int r = 0, int c = 0) : rows(r), cols(c) {
+        stride_bytes = (cols + 7) / 8;  // Bits to bytes
+        posix_memalign(reinterpret_cast<void**>(&data), CACHE_LINE_SIZE,
+                       sizeof(unsigned char) * rows * stride_bytes);
+        std::memset(data, 0, sizeof(unsigned char) * rows * stride_bytes);
+    }
+    
+    ~BitMatrix() {
+        free(data);
+    }
+    
+    // Pack bits on-the-fly from float matrix
+    void pack_from_float(const float* src) {
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                if (src[i * cols + j] > 0.0f) {
+                    data[i * stride_bytes + j / 8] |= (1 << (j % 8));
+                }
+            }
+        }
     }
 };
 
@@ -242,6 +275,115 @@ void matmul_1bit_packed(const unsigned char* A_packed, const unsigned char* B_pa
         }
     }
 }
+
+// ==================== NEW: Parallel 1-bit Matrix Multiplication ====================
+
+struct BitMatmulThreadData {
+    const unsigned char* A_packed;
+    const unsigned char* B_packed;
+    float* C;
+    int M, N, K;
+    int start_row, end_row;
+    int K_words;
+};
+
+void* matmul_1bit_thread(void* arg) {
+    BitMatmulThreadData* data = (BitMatmulThreadData*)arg;
+    const unsigned char* A_packed = data->A_packed;
+    const unsigned char* B_packed = data->B_packed;
+    float* C = data->C;
+    int M = data->M;
+    int N = data->N;
+    int K = data->K;
+    int start = data->start_row;
+    int end = data->end_row;
+    int K_words = data->K_words;
+    
+    for (int i = start; i < end; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            
+            int diff_count = 0;
+            for (int w = 0; w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+        }
+    }
+    
+    return nullptr;
+}
+
+void matmul_1bit_parallel(const unsigned char* A_packed, const unsigned char* B_packed, 
+                          float* C, int M, int N, int K, int num_threads) {
+    pthread_t threads[64];
+    BitMatmulThreadData thread_data[64];
+    int rows_per_thread = M / num_threads;
+    int K_words = (K + 31) / 32;
+    
+    for (int t = 0; t < num_threads; t++) {
+        thread_data[t] = {A_packed, B_packed, C, M, N, K,
+                          t * rows_per_thread,
+                          (t == num_threads - 1) ? M : (t + 1) * rows_per_thread,
+                          K_words};
+        pthread_create(&threads[t], nullptr, matmul_1bit_thread, &thread_data[t]);
+    }
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
+// ==================== NEW: Optimized 1-bit with SIMD Popcount ====================
+
+#if defined(__AVX512VPOPCNTDQ__)
+
+void matmul_1bit_avx512(const unsigned char* A_packed, const unsigned char* B_packed, 
+                        float* C, int M, int N, int K) {
+    const int K_words = (K + 31) / 32;
+    const int VEC_SIZE = 16;  // AVX-512 processes 16 32-bit words at once
+    
+    for (int i = 0; i < M; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            
+            __m512i diff_sum = _mm512_setzero_si512();
+            
+            for (int w = 0; w + VEC_SIZE <= K_words; w += VEC_SIZE) {
+                __m512i a_vec = _mm512_loadu_si512(&A_words[w]);
+                __m512i b_vec = _mm512_loadu_si512(&B_words[w]);
+                __m512i diff = _mm512_xor_si512(a_vec, b_vec);
+                __m512i popcnt = _mm512_popcnt_epi32(diff);
+                diff_sum = _mm512_add_epi32(diff_sum, popcnt);
+            }
+            
+            // Horizontal sum of popcounts
+            int diff_count = _mm512_reduce_add_epi32(diff_sum);
+            
+            // Process remaining words
+            for (int w = K_words - (K_words % VEC_SIZE); w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+        }
+    }
+}
+
+#else
+
+void matmul_1bit_avx512(const unsigned char* A_packed, const unsigned char* B_packed, 
+                        float* C, int M, int N, int K) {
+    // Fallback to parallel implementation
+    matmul_1bit_parallel(A_packed, B_packed, C, M, N, K, 4);
+}
+
+#endif
 
 // ==================== Optimized 4: Parallel with Pthreads ====================
 
@@ -608,6 +750,120 @@ void matmul_batch(const float* A_batch, const float* B, float* C_batch,
                 }
                 _mm256_storeu_ps(&C[i * N + j], sum);
             }
+        }
+    }
+}
+
+// ==================== NEW: Batched Parallel Processing ====================
+
+struct BatchThreadData {
+    const float* A_batch;
+    const float* B;
+    float* C_batch;
+    int batch_size;
+    int M, N, K;
+    int start_batch, end_batch;
+};
+
+void* matmul_batch_thread(void* arg) {
+    BatchThreadData* data = (BatchThreadData*)arg;
+    
+    for (int batch = data->start_batch; batch < data->end_batch; batch++) {
+        const float* A = data->A_batch + batch * data->M * data->K;
+        float* C = data->C_batch + batch * data->M * data->N;
+        
+        constexpr int AVX_SIZE = 8;
+        constexpr int PREFETCH_DIST = 3;
+        
+        for (int i = 0; i < data->M; i++) {
+            const float* A_row = A + i * data->K;
+            float* C_row = C + i * data->N;
+            
+            __m256 c_vec[64];
+            int num_vec = data->N / AVX_SIZE;
+            for (int j = 0; j < num_vec; j++) {
+                c_vec[j] = _mm256_setzero_ps();
+            }
+            
+            for (int k = 0; k < data->K; k++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k]);
+                const float* B_k = data->B + k * data->N;
+                
+                if (k + PREFETCH_DIST < data->K) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&data->B[(k + PREFETCH_DIST) * data->N]), 
+                                 _MM_HINT_T0);
+                }
+                
+                for (int j = 0; j < num_vec; j++) {
+                    __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                    c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+                }
+            }
+            
+            for (int j = 0; j < num_vec; j++) {
+                _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+            }
+        }
+    }
+    
+    return nullptr;
+}
+
+void matmul_batch_parallel(const float* A_batch, const float* B, float* C_batch,
+                           int batch_size, int M, int N, int K, int num_threads) {
+    pthread_t threads[64];
+    BatchThreadData thread_data[64];
+    int batches_per_thread = batch_size / num_threads;
+    
+    for (int t = 0; t < num_threads; t++) {
+        thread_data[t] = {A_batch, B, C_batch, batch_size, M, N, K,
+                          t * batches_per_thread,
+                          (t == num_threads - 1) ? batch_size : (t + 1) * batches_per_thread};
+        pthread_create(&threads[t], nullptr, matmul_batch_thread, &thread_data[t]);
+    }
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
+// ==================== NEW: Stream Processing for Large Matrices ====================
+
+// Process large matrices in streams to minimize cache pollution
+void matmul_stream(const float* A, const float* B, float* C,
+                   int M, int N, int K, int stream_size = 64) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 4;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        __m256 c_vec[64];
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        // Process K in streams to maintain cache working set
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Prefetch next streams
+            if (k + PREFETCH_DIST < K) {
+                prefetch_read(B + (k + PREFETCH_DIST) * N);
+                prefetch_read(A_row + k + PREFETCH_DIST);
+            }
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
     }
 }
