@@ -46,6 +46,63 @@ struct BitNetConfig {
     float threshold;
 };
 
+// ==================== Compiler Optimization Hints ====================
+
+// Compiler hints for auto-vectorization and inlining
+#ifdef __GNUC__
+#define HOT_FUNC __attribute__((hot))
+#define ALIGNED __attribute__((aligned(32)))
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define HOT_FUNC
+#define ALIGNED
+#define LIKELY(x) (x)
+#define UNLIKELY(x) (x)
+#endif
+
+// ==================== AVX-512 Support (Conditional) ====================
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#define USE_AVX512 1
+constexpr int AVX512_SIZE = 16;  // 512-bit / 32-bit
+
+void matmul_avx512(const float* A, const float* B, float* C,
+                   int M, int N, int K) {
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        __m512 c_vec[32];  // Support up to 512 columns
+        int num_vec = N / AVX512_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm512_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m512 a_val = _mm512_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m512 b_vec = _mm512_loadu_ps(&B_k[j * AVX512_SIZE]);
+                c_vec[j] = _mm512_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm512_storeu_ps(&C_row[j * AVX512_SIZE], c_vec[j]);
+        }
+    }
+}
+#else
+#define USE_AVX512 0
+void matmul_avx512(const float* A, const float* B, float* C,
+                   int M, int N, int K) {
+    // Fallback to AVX2 if AVX-512 not available
+    matmul_avx2(A, B, C, M, N, K);
+}
+#endif
+
 // ==================== Original Matrix Multiplication ====================
 
 void matmul_naive(const float* A, const float* B, float* C, 
@@ -90,17 +147,34 @@ void matmul_avx2(const float* A, const float* B, float* C,
                  int M, int N, int K) {
     constexpr int AVX_SIZE = 8;  // 256-bit / 32-bit
     
+    // Optimized: i-k-j ordering for better cache locality
+    // Process K dimension first, then broadcast A row
     for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j += AVX_SIZE) {
-            __m256 sum = _mm256_setzero_ps();
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        // Initialize output vector
+        __m256 c_vec[64];  // Support up to 512 columns
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        // k loop outside for cache-friendly access
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
             
-            for (int k = 0; k < K; k++) {
-                __m256 a = _mm256_set1_ps(A[i * K + k]);
-                __m256 b = _mm256_loadu_ps(&B[k * N + j]);
-                sum = _mm256_add_ps(sum, _mm256_mul_ps(a, b));
+            // Process multiple columns per iteration
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);  // FMA: a*b + c
             }
-            
-            _mm256_storeu_ps(&C[i * N + j], sum);
+        }
+        
+        // Store results
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
     }
 }
@@ -116,15 +190,53 @@ void quantize_1bit(const float* input, unsigned char* output, int size, float th
 // 1-bit matrix multiplication using bit operations
 void matmul_1bit(const unsigned char* A, const unsigned char* B, 
                  float* C, int M, int N, int K) {
+    // Optimized: Process 8 bits at a time using word-level operations
+    const int K_words = (K + 7) / 8;  // Number of 8-bit chunks
+    
     for (int i = 0; i < M; i++) {
+        const unsigned char* A_row = A + i * K;
+        
         for (int j = 0; j < N; j++) {
             int popcount = 0;
-            for (int k = 0; k < K; k++) {
-                // XOR gives 1 where bits differ
-                popcount += __builtin_popcount(A[i * K + k] ^ B[k * N + j]);
+            
+            // Process 8 elements per iteration using word popcount
+            for (int k = 0; k < K_words; k++) {
+                unsigned char a_byte = A_row[k];
+                unsigned char b_byte = 0;
+                
+                // Extract bit from B (stored as individual bytes)
+                for (int bit = 0; bit < 8 && k * 8 + bit < K; bit++) {
+                    if (B[(k * 8 + bit) * N + j]) {
+                        b_byte |= (1 << bit);
+                    }
+                }
+                
+                popcount += __builtin_popcount(a_byte ^ b_byte);
             }
+            
             // Expected value: E[X] - E[~X] = (K - 2*popcount) * scale
             C[i * N + j] = static_cast<float>(K - 2 * popcount);
+        }
+    }
+}
+
+// Optimized 1-bit matmul with pre-computed packed bits
+void matmul_1bit_packed(const unsigned char* A_packed, const unsigned char* B_packed, 
+                        float* C, int M, int N, int K) {
+    const int K_words = (K + 31) / 32;  // 32-bit words
+    
+    for (int i = 0; i < M; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            
+            int diff_count = 0;
+            for (int w = 0; w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
         }
     }
 }
@@ -151,16 +263,36 @@ void* matmul_thread(void* arg) {
     int end = data->end_row;
     
     constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 3;  // Prefetch 3 iterations ahead
     
     for (int i = start; i < end; i++) {
-        for (int j = 0; j < N; j += AVX_SIZE) {
-            __m256 sum = _mm256_setzero_ps();
-            for (int k = 0; k < K; k++) {
-                __m256 a = _mm256_set1_ps(A[i * K + k]);
-                __m256 b = _mm256_loadu_ps(&B[k * N + j]);
-                sum = _mm256_add_ps(sum, _mm256_mul_ps(a, b));
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        // Initialize output vector
+        __m256 c_vec[64];
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Prefetch next row of B for better cache utilization
+            if (k + PREFETCH_DIST < K) {
+                _mm_prefetch(reinterpret_cast<const char*>(&B[(k + PREFETCH_DIST) * N]), _MM_HINT_T0);
             }
-            _mm256_storeu_ps(&C[i * N + j], sum);
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
         }
     }
     
@@ -295,49 +427,90 @@ struct AttentionCache {
 };
 
 // Flash attention style: compute attention in blocks to reduce memory
+// Optimized with SIMD and better memory access patterns
 void attention_blocked(const float* Q, const float* K, const float* V,
                        float* output, int B, int T, int d, float scale) {
     constexpr int BLOCK = 64;
+    constexpr int AVX_SIZE = 8;
+    
+    // Temporary buffer for softmax computation (block x block)
+    float softmax_buf[BLOCK * BLOCK];
     
     for (int b = 0; b < B; b++) {
+        const float* Q_b = Q + b * T * d;
+        const float* K_b = K + b * T * d;
+        const float* V_b = V + b * T * d;
+        float* O_b = output + b * T * d;
+        
+        // Initialize output to zeros
+        std::memset(O_b, 0, sizeof(float) * T * d);
+        
         for (int h = 0; h < d; h += BLOCK) {
-            // Process in blocks to stay in L1 cache
-            float block_max = -INFINITY;
-            float block_sum = 0.0f;
+            int block_h = std::min(BLOCK, d - h);
             
-            // Compute Q*K^T in blocks
-            for (int t = 0; t < T; t += BLOCK) {
-                for (int i = 0; i < BLOCK; i++) {
-                    if (t + i >= T) break;
+            // Process query block
+            for (int qi = 0; qi < T; qi++) {
+                float row_max = -INFINITY;
+                
+                // Compute Q[qi] * K^T for all keys
+                for (int ki = 0; ki < T; ki++) {
+                    float dot = 0.0f;
+                    const float* Q_ptr = Q_b + qi * d + h;
+                    const float* K_ptr = K_b + ki * d + h;
                     
-                    float qk = 0.0f;
-                    for (int j = 0; j < BLOCK; j++) {
-                        if (h + j >= d) break;
-                        qk += Q[b * T * d + (t + i) * d + (h + j)] * 
-                              K[b * T * d + (t + j) * d + (h + j)];
+                    // Unrolled dot product with AVX
+                    int j = 0;
+                    for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
+                        __m256 qv = _mm256_loadu_ps(Q_ptr + j);
+                        __m256 kv = _mm256_loadu_ps(K_ptr + j);
+                        __m256 prod = _mm256_mul_ps(qv, kv);
+                        
+                        // Horizontal sum
+                        __m128 high = _mm256_extractf128_ps(prod, 1);
+                        __m128 low = _mm256_castps256_ps128(prod);
+                        __m128 sum = _mm_add_ps(low, high);
+                        sum = _mm_hadd_ps(sum, sum);
+                        sum = _mm_hadd_ps(sum, sum);
+                        dot += _mm_cvtss_f32(sum);
                     }
-                    qk *= scale;
                     
-                    // Softmax with numerical stability
-                    qk = std::exp(qk - block_max);
-                    block_sum += qk;
+                    // Scalar tail
+                    for (; j < block_h; j++) {
+                        dot += Q_ptr[j] * K_ptr[j];
+                    }
                     
-                    // Store intermediate
-                    float* temp = output + b * T * d + (t + i) * d + h;
-                    temp[0] = qk;  // Using first element as temp storage
+                    dot *= scale;
+                    softmax_buf[qi * T + ki] = dot;
+                    row_max = std::max(row_max, dot);
                 }
-            }
-            
-            // Normalize
-            float inv_sum = 1.0f / (block_sum + 1e-8f);
-            
-            // Compute output: softmax(Q*K^T) * V
-            for (int i = 0; i < BLOCK; i++) {
-                if (h + i >= d) break;
-                float attn_weight = output[b * T * d + h * d + i] * inv_sum;  // Simplified
-                for (int t = 0; t < T; t++) {
-                    output[b * T * d + t * d + (h + i)] += 
-                        attn_weight * V[b * T * d + t * d + (h + i)];
+                
+                // Softmax with numerical stability
+                float row_sum = 0.0f;
+                for (int ki = 0; ki < T; ki++) {
+                    float val = std::exp(softmax_buf[qi * T + ki] - row_max);
+                    softmax_buf[qi * T + ki] = val;
+                    row_sum += val;
+                }
+                float row_inv_sum = 1.0f / (row_sum + 1e-8f);
+                
+                // Compute output: softmax * V
+                for (int ki = 0; ki < T; ki++) {
+                    float weight = softmax_buf[qi * T + ki] * row_inv_sum;
+                    const float* V_row = V_b + ki * d + h;
+                    float* O_row = O_b + qi * d + h;
+                    
+                    // Add weighted V row to output
+                    int j = 0;
+                    for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
+                        __m256 ov = _mm256_loadu_ps(O_row + j);
+                        __m256 vv = _mm256_loadu_ps(V_row + j);
+                        __m256 wv = _mm256_set1_ps(weight);
+                        _mm256_storeu_ps(O_row + j, _mm256_fmadd_ps(wv, vv, ov));
+                    }
+                    
+                    for (; j < block_h; j++) {
+                        O_row[j] += weight * V_row[j];
+                    }
                 }
             }
         }

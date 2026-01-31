@@ -96,8 +96,9 @@ Goal: **10x performance improvement** through systematic optimization
 
 ### Remaining Opportunities
 - [ ] GPU CUDA kernel
-- [ ] Attention mechanism optimization
-- [ ] Memory pool/arena allocator
+- [x] Attention mechanism optimization
+- [x] Memory pool/arena allocator
 - [ ] Compiler auto-vectorization hints
 - [ ] Profile-guided optimization
-- [ ] AVX-512 support (if available) 
+- [x] Fused operations (ReLU+Add, Mul+Add+ReLU)
+- [x] Batch processing 
