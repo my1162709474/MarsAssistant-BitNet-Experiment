@@ -17954,5 +17954,492 @@ FORCE_INLINE void memory_set_zero_neon(float* ptr, size_t size) {
 #endif
 
 // ============================================================================
-// End of Session 46 Optimizations
+// Session 47: Advanced Vector Quantization & Memory Layout Optimization
+// ============================================================================
+
+// ==================== Ultra-Fast Vector Quantization (AVX2) ====================
+
+FORCE_INLINE void quantize_vectorized_avx2(const float* src, int8_t* dst, int size) {
+    constexpr int VEC_SIZE = 8;
+    int i = 0;
+    
+    // Find min/max using vectorized operations
+    __m256 min_vec = _mm256_loadu_ps(src);
+    __m256 max_vec = min_vec;
+    
+    for (i = VEC_SIZE; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        __m256 vals = _mm256_loadu_ps(src + i);
+        min_vec = _mm256_min_ps(min_vec, vals);
+        max_vec = _mm256_max_ps(max_vec, vals);
+    }
+    
+    // Horizontal min/max reduction
+    float min_vals[8], max_vals[8];
+    _mm256_storeu_ps(min_vals, min_vec);
+    _mm256_storeu_ps(max_vals, max_vec);
+    float global_min = min_vals[0], global_max = max_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) {
+        global_min = std::min(global_min, min_vals[j]);
+        global_max = std::max(global_max, max_vals[j]);
+    }
+    
+    // Scalar remainder
+    for (; i < size; i++) {
+        global_min = std::min(global_min, src[i]);
+        global_max = std::max(global_max, src[i]);
+    }
+    
+    // Handle edge case
+    if (global_max - global_min < 1e-5f) {
+        global_min = -1.0f;
+        global_max = 1.0f;
+    }
+    
+    float scale = 127.0f / (global_max - global_min);
+    float offset = -global_min * scale;
+    
+    __m256 scale_vec = _mm256_set1_ps(scale);
+    __m256 offset_vec = _mm256_set1_ps(offset);
+    __m256 zero_vec = _mm256_setzero_ps();
+    __m256 one_twoseven = _mm256_set1_ps(127.0f);
+    
+    // Quantize in batches
+    i = 0;
+    for (; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        for (int j = 0; j < 4; j++) {
+            __m256 vals = _mm256_loadu_ps(src + i + j * VEC_SIZE);
+            __m256 scaled = _mm256_add_ps(_mm256_mul_ps(vals, scale_vec), offset_vec);
+            scaled = _mm256_min_ps(one_twoseven, _mm256_max_ps(zero_vec, scaled));
+            _mm256_storeu_ps(src + i + j * VEC_SIZE, scaled);  // Reuse buffer if needed
+        }
+        // Pack to int8 (assuming dst has enough space)
+        for (int j = 0; j < VEC_SIZE * 4; j++) {
+            dst[i + j] = static_cast<int8_t>(src[i + j]);
+        }
+    }
+    
+    // Handle remainder
+    for (; i < size; i++) {
+        float val = std::max(0.0f, std::min(127.0f, src[i] * scale + offset));
+        dst[i] = static_cast<int8_t>(val);
+    }
+}
+
+// ==================== Ultra-Fast Vector Quantization (NEON) ====================
+
+FORCE_INLINE void quantize_vectorized_neon(const float* src, int8_t* dst, int size) {
+    constexpr int VEC_SIZE = 4;
+    int i = 0;
+    
+    // Find min/max using vectorized operations
+    float32x4_t min_vec = vld1q_f32(src);
+    float32x4_t max_vec = min_vec;
+    
+    for (i = VEC_SIZE; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        float32x4_t vals = vld1q_f32(src + i);
+        min_vec = vminq_f32(min_vec, vals);
+        max_vec = vmaxq_f32(max_vec, vals);
+    }
+    
+    // Horizontal min/max
+    float min_vals[4], max_vals[4];
+    vst1q_f32(min_vals, min_vec);
+    vst1q_f32(max_vals, max_vec);
+    float global_min = min_vals[0], global_max = max_vals[0];
+    for (int j = 1; j < 4 && j < size; j++) {
+        global_min = std::min(global_min, min_vals[j]);
+        global_max = std::max(global_max, max_vals[j]);
+    }
+    
+    for (; i < size; i++) {
+        global_min = std::min(global_min, src[i]);
+        global_max = std::max(global_max, src[i]);
+    }
+    
+    if (global_max - global_min < 1e-5f) {
+        global_min = -1.0f;
+        global_max = 1.0f;
+    }
+    
+    float scale = 127.0f / (global_max - global_min);
+    float offset = -global_min * scale;
+    
+    float32x4_t scale_vec = vdupq_n_f32(scale);
+    float32x4_t offset_vec = vdupq_n_f32(offset);
+    float32x4_t zero_vec = vdupq_n_f32(0.0f);
+    float32x4_t max_vec128 = vdupq_n_f32(127.0f);
+    
+    // Quantize
+    i = 0;
+    for (; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        for (int j = 0; j < 4; j++) {
+            float32x4_t vals = vld1q_f32(src + i + j * VEC_SIZE);
+            float32x4_t scaled = vaddq_f32(vmulq_n_f32(vals, scale), offset_vec);
+            scaled = vminq_f32(max_vec128, vmaxq_f32(zero_vec, scaled));
+            vst1q_f32(src + i + j * VEC_SIZE, scaled);
+        }
+        for (int j = 0; j < VEC_SIZE * 4; j++) {
+            dst[i + j] = static_cast<int8_t>(src[i + j]);
+        }
+    }
+    
+    for (; i < size; i++) {
+        float val = std::max(0.0f, std::min(127.0f, src[i] * scale + offset));
+        dst[i] = static_cast<int8_t>(val);
+    }
+}
+
+// Cross-platform alias
+#if IS_X86_PLATFORM
+#define quantize_vectorized quantize_vectorized_avx2
+#else
+#define quantize_vectorized quantize_vectorized_neon
+#endif
+
+// ==================== Cache-Friendly Matrix Transpose ====================
+
+FORCE_INLINE void matrix_transpose_cache_friendly(const float* src, float* dst,
+                                                   int rows, int cols) {
+    constexpr int BLOCK_SIZE = 32;
+    
+    // Blocked transpose for better cache utilization
+    for (int i = 0; i < rows; i += BLOCK_SIZE) {
+        int i_end = std::min(i + BLOCK_SIZE, rows);
+        for (int j = 0; j < cols; j += BLOCK_SIZE) {
+            int j_end = std::min(j + BLOCK_SIZE, cols);
+            
+            // Transpose block
+            for (int ii = i; ii < i_end; ii++) {
+                for (int jj = j; jj < j_end; jj++) {
+                    dst[jj * rows + ii] = src[ii * cols + jj];
+                }
+            }
+        }
+    }
+}
+
+// ==================== SIMD-Accelerated Matrix Transpose ====================
+
+#if IS_X86_PLATFORM
+FORCE_INLINE void matrix_transpose_avx2(float* dst, int dst_stride, int n) {
+    // In-place transpose using AVX2 loads/stores
+    for (int i = 0; i < n; i += 8) {
+        for (int j = i; j < n; j += 8) {
+            // Load 8x8 block
+            __m256 row0 = _mm256_loadu_ps(dst + i * dst_stride + j);
+            __m256 row1 = _mm256_loadu_ps(dst + (i + 1) * dst_stride + j);
+            __m256 row2 = _mm256_loadu_ps(dst + (i + 2) * dst_stride + j);
+            __m256 row3 = _mm256_loadu_ps(dst + (i + 3) * dst_stride + j);
+            __m256 row4 = _mm256_loadu_ps(dst + (i + 4) * dst_stride + j);
+            __m256 row5 = _mm256_loadu_ps(dst + (i + 5) * dst_stride + j);
+            __m256 row6 = _mm256_loadu_ps(dst + (i + 6) * dst_stride + j);
+            __m256 row7 = _mm256_loadu_ps(dst + (i + 7) * dst_stride + j);
+            
+            // Transpose (using unpcklpd/unckphd)
+            __m256 t0 = _mm256_unpacklo_ps(row0, row1);
+            __m256 t1 = _mm256_unpackhi_ps(row0, row1);
+            __m256 t2 = _mm256_unpacklo_ps(row2, row3);
+            __m256 t3 = _mm256_unpackhi_ps(row2, row3);
+            __m256 t4 = _mm256_unpacklo_ps(row4, row5);
+            __m256 t5 = _mm256_unpackhi_ps(row4, row5);
+            __m256 t6 = _mm256_unpacklo_ps(row6, row7);
+            __m256 t7 = _mm256_unpackhi_ps(row6, row7);
+            
+            __m256 u0 = _mm256_unpacklo_pd(t0, t2);
+            __m256 u1 = _mm256_unpackhi_pd(t0, t2);
+            __m256 u2 = _mm256_unpacklo_pd(t1, t3);
+            __m256 u3 = _mm256_unpackhi_pd(t1, t3);
+            __m256 u4 = _mm256_unpacklo_pd(t4, t6);
+            __m256 u5 = _mm256_unpackhi_pd(t4, t6);
+            __m256 u6 = _mm256_unpacklo_pd(t5, t7);
+            __m256 u7 = _mm256_unpackhi_pd(t5, t7);
+            
+            // Store transposed block
+            _mm256_storeu_ps(dst + i * dst_stride + j, _mm256_permute2f128_ps(u0, u4, 0x20));
+            _mm256_storeu_ps(dst + (i + 1) * dst_stride + j, _mm256_permute2f128_ps(u1, u5, 0x20));
+            _mm256_storeu_ps(dst + (i + 2) * dst_stride + j, _mm256_permute2f128_ps(u2, u6, 0x20));
+            _mm256_storeu_ps(dst + (i + 3) * dst_stride + j, _mm256_permute2f128_ps(u3, u7, 0x20));
+            _mm256_storeu_ps(dst + (i + 4) * dst_stride + j, _mm256_permute2f128_ps(u0, u4, 0x31));
+            _mm256_storeu_ps(dst + (i + 5) * dst_stride + j, _mm256_permute2f128_ps(u1, u5, 0x31));
+            _mm256_storeu_ps(dst + (i + 6) * dst_stride + j, _mm256_permute2f128_ps(u2, u6, 0x31));
+            _mm256_storeu_ps(dst + (i + 7) * dst_stride + j, _mm256_permute2f128_ps(u3, u7, 0x31));
+        }
+    }
+}
+#endif  // IS_X86_PLATFORM
+
+// ==================== Ring Buffer for Streaming KV Cache ====================
+
+struct RingBuffer {
+    float* data;
+    int capacity;
+    int stride;
+    int write_pos;
+    int read_pos;
+    bool full;
+    
+    RingBuffer(int cap, int stride_bytes) : capacity(cap), stride(stride_bytes) {
+        posix_memalign(reinterpret_cast<void**>(&data), CACHE_LINE_SIZE,
+                       sizeof(float) * capacity * stride);
+        std::memset(data, 0, sizeof(float) * capacity * stride);
+        write_pos = 0;
+        read_pos = 0;
+        full = false;
+    }
+    
+    ~RingBuffer() {
+        free(data);
+    }
+    
+    FORCE_INLINE void write(const float* src) {
+        std::memcpy(data + write_pos * stride, src, sizeof(float) * stride);
+        write_pos = (write_pos + 1) % capacity;
+        if (write_pos == read_pos) {
+            full = true;
+        }
+    }
+    
+    FORCE_INLINE void read(float* dst, int offset) {
+        int pos = (read_pos + offset) % capacity;
+        std::memcpy(dst, data + pos * stride, sizeof(float) * stride);
+    }
+    
+    FORCE_INLINE void advance(int n) {
+        read_pos = (read_pos + n) % capacity;
+        full = false;
+    }
+    
+    FORCE_INLINE int size() const {
+        return full ? capacity : (write_pos - read_pos + capacity) % capacity;
+    }
+};
+
+// ==================== Streaming KV Cache Manager ====================
+
+struct KVCacheManager {
+    RingBuffer key_cache;
+    RingBuffer value_cache;
+    int num_layers;
+    int num_heads;
+    int head_dim;
+    int max_seq_len;
+    
+    KVCacheManager(int layers, int heads, int dim, int max_len)
+        : key_cache(max_len, dim), value_cache(max_len, dim),
+          num_layers(layers), num_heads(heads), head_dim(dim), max_seq_len(max_len) {}
+    
+    FORCE_INLINE void write_key(int layer, int head, int pos, const float* key) {
+        int offset = ((layer * num_heads + head) * max_seq_len + pos) * head_dim;
+        key_cache.write(key + offset);
+    }
+    
+    FORCE_INLINE void write_value(int layer, int head, int pos, const float* value) {
+        int offset = ((layer * num_heads + head) * max_seq_len + pos) * head_dim;
+        value_cache.write(value + offset);
+    }
+    
+    FORCE_INLINE void read_keys(int layer, int head, float* keys, int start, int count) {
+        int base_offset = ((layer * num_heads + head) * max_seq_len) * head_dim;
+        for (int i = 0; i < count; i++) {
+            key_cache.read(keys + i * head_dim, start + i);
+        }
+    }
+    
+    FORCE_INLINE void read_values(int layer, int head, float* values, int start, int count) {
+        for (int i = 0; i < count; i++) {
+            value_cache.read(values + i * head_dim, start + i);
+        }
+    }
+};
+
+// ==================== Improved Sigmoid Lookup Table ====================
+
+constexpr int SIGMOID_LUT_SIZE = 256;
+constexpr float SIGMOID_LUT_SCALE = 20.0f;  // Range [-20, 20]
+
+static float sigmoid_lut[SIGMOID_LUT_SIZE];
+
+FORCE_INLINE void init_sigmoid_lut() {
+    for (int i = 0; i < SIGMOID_LUT_SIZE; i++) {
+        float x = (2.0f * i / SIGMOID_LUT_SIZE - 1.0f) * SIGMOID_LUT_SCALE;
+        sigmoid_lut[i] = 1.0f / (1.0f + std::exp(-x));
+    }
+}
+
+FORCE_INLINE float sigmoid_lut_lookup(float x) {
+    // Clamp to LUT range
+    if (x <= -SIGMOID_LUT_SCALE) return 0.0f;
+    if (x >= SIGMOID_LUT_SCALE) return 1.0f;
+    
+    // Linear interpolation in LUT
+    float idx_f = (x + SIGMOID_LUT_SCALE) / (2.0f * SIGMOID_LUT_SCALE) * SIGMOID_LUT_SIZE;
+    int idx = static_cast<int>(idx_f);
+    float frac = idx_f - idx;
+    
+    return sigmoid_lut[idx] * (1.0f - frac) + sigmoid_lut[idx + 1] * frac;
+}
+
+// ==================== Vectorized Sigmoid with LUT (AVX2) ====================
+
+#if IS_X86_PLATFORM
+FORCE_INLINE void sigmoid_lut_avx2(const float* src, float* dst, int size) {
+    constexpr int VEC_SIZE = 8;
+    const __m256 scale = _mm256_set1_ps(SIGMOID_LUT_SIZE / (2.0f * SIGMOID_LUT_SCALE));
+    const __m256 offset = _mm256_set1_ps(SIGMOID_LUT_SCALE);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 lut_scale = _mm256_set1_ps(2.0f * SIGMOID_LUT_SCALE / SIGMOID_LUT_SIZE);
+    
+    int i = 0;
+    for (; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        __m256 x = _mm256_loadu_ps(src + i);
+        
+        // Clamp
+        __m256 ge_mask = _mm256_cmp_ps(x, offset, _CMP_GE_OQ);
+        __m256 le_mask = _mm256_cmp_ps(x, _mm256_xor_ps(offset, _mm256_set1_ps(-0.0f)), _CMP_LE_OQ);
+        x = _mm256_blendv_ps(_mm256_blendv_ps(x, offset, ge_mask), zero, le_mask);
+        
+        // LUT lookup index
+        __m256 idx_f = _mm256_mul_ps(_mm256_add_ps(x, offset), scale);
+        __m256i idx = _mm256_cvtps_epi32(idx_f);
+        
+        // Linear interpolation
+        __m256 lut_vals[8];
+        for (int j = 0; j < VEC_SIZE; j++) {
+            int i0 = _mm256_extract_epi32(idx, j);
+            int i1 = std::min(i0 + 1, SIGMOID_LUT_SIZE - 1);
+            float f = idx_f[j] - i0;
+            lut_vals[j] = _mm256_set1_ps(sigmoid_lut[i0] * (1.0f - f) + sigmoid_lut[i1] * f);
+        }
+        
+        __m256 result = _mm256_setzero_ps();
+        for (int j = 0; j < VEC_SIZE; j++) {
+            result = _mm256_blend_ps(result, lut_vals[j], 1 << j);
+        }
+        
+        _mm256_storeu_ps(dst + i, result);
+    }
+    
+    // Remainder
+    for (; i < size; i++) {
+        dst[i] = sigmoid_lut_lookup(src[i]);
+    }
+}
+#endif  // IS_X86_PLATFORM
+
+// ==================== Ultra-Optimized Memory Copy ====================
+
+FORCE_INLINE void memory_copy_fast(void* dst, const void* src, size_t size) {
+    constexpr size_t AVX_SIZE = 32;  // 256 bits = 32 bytes
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    const uint8_t* s = const_cast<const uint8_t*>(src);
+    
+    // Copy by cache lines for better performance
+    size_t i = 0;
+    
+    // Align to 32 bytes if possible
+    size_t align_offset = (32 - reinterpret_cast<size_t>(s) % 32) % 32;
+    for (; i < std::min(size, align_offset); i++) {
+        d[i] = s[i];
+    }
+    
+    // AVX2 bulk copy
+    for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + AVX_SIZE));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + AVX_SIZE * 2));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + AVX_SIZE * 3));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i + AVX_SIZE), v1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i + AVX_SIZE * 2), v2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i + AVX_SIZE * 3), v3);
+    }
+    
+    // Remaining
+    for (; i < size; i++) {
+        d[i] = s[i];
+    }
+}
+
+// ==================== Improved Softmax with Numerical Stability ====================
+
+FORCE_INLINE void softmax_stable(const float* src, float* dst, int size) {
+    constexpr int VEC_SIZE = 8;
+    int i = 0;
+    
+    // Find max (vectorized)
+    __m256 max_vec = _mm256_loadu_ps(src);
+    for (i = VEC_SIZE; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        __m256 vals = _mm256_loadu_ps(src + i);
+        max_vec = _mm256_max_ps(max_vec, vals);
+    }
+    
+    // Horizontal max
+    float max_vals[8];
+    _mm256_storeu_ps(max_vals, max_vec);
+    float global_max = max_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) {
+        global_max = std::max(global_max, max_vals[j]);
+    }
+    for (; i < size; i++) {
+        global_max = std::max(global_max, src[i]);
+    }
+    
+    // Compute exp and sum (vectorized)
+    __m256 max_scalar = _mm256_set1_ps(global_max);
+    __m256 sum_vec = _mm256_setzero_ps();
+    i = 0;
+    
+    for (i = 0; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        for (int j = 0; j < 4; j++) {
+            __m256 vals = _mm256_loadu_ps(src + i + j * VEC_SIZE);
+            __m256 exp_vals = _mm256_exp_ps(_mm256_sub_ps(vals, max_scalar));
+            sum_vec = _mm256_add_ps(sum_vec, exp_vals);
+            _mm256_storeu_ps(dst + i + j * VEC_SIZE, exp_vals);
+        }
+    }
+    
+    // Horizontal sum
+    float sum_vals[8];
+    _mm256_storeu_ps(sum_vals, sum_vec);
+    float sum = 0.0f;
+    for (int j = 0; j < 8 && (i + j) < size; j++) {
+        sum += sum_vals[j];
+    }
+    for (; i < size; i++) {
+        float exp_val = std::exp(src[i] - global_max);
+        dst[i] = exp_val;
+        sum += exp_val;
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    
+    i = 0;
+    for (i = 0; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        for (int j = 0; j < 4; j++) {
+            __m256 vals = _mm256_loadu_ps(dst + i + j * VEC_SIZE);
+            _mm256_storeu_ps(dst + i + j * VEC_SIZE, _mm256_mul_ps(vals, inv_vec));
+        }
+    }
+    for (; i < size; i++) {
+        dst[i] *= inv_sum;
+    }
+}
+
+// ============================================================================
+// Cross-Platform Aliases for Session 47
+// ============================================================================
+
+#if IS_X86_PLATFORM
+#define matrix_transpose matrix_transpose_avx2
+#define sigmoid_vectorized sigmoid_lut_avx2
+#else
+#define matrix_transpose matrix_transpose_cache_friendly
+#define sigmoid_vectorized sigmoid_neon
+#endif
+
+// ============================================================================
+// End of Session 47 Optimizations
 // ============================================================================
