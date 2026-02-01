@@ -30,18 +30,16 @@ Changes not staged for commit:
 	modified:   scheduler.log
 
 no changes added to commit (use "git add" and/or "git commit -a")
- (Bit2Matrix, matmul_2bit)
-- ✅ 添加内存池 (MemoryPool类)
-- ✅ 添加GELU查找表 (256-entry LUT)
-- ✅ 添加超优化1-bit MatMul
-- ✅ 添加融合注意力机制
-- ✅ 添加平台检测
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   experiments/OPTIMIZATION_LOG.md
 
-**跨平台修复**:
-- ✅ 添加条件编译 (#if defined(__x86_64__) / __aarch64__)
-- ✅ 修复头文件包含 (immintrin.h / arm_neon.h)
-- ✅ 添加前向声明
-- ⚠️ ARM64编译问题待修复
+no changes added to commit (use "git add" and/or "git commit -a")
+[main c905618] Perf: Round 1769907269 - 2026-02-01 08:54:29
+ 1 file changed, 62 insertions(+)
+��问题待修复
 
 **提交记录**:
 - dfdec3d Session 8: 2-bit quantization + memory pool + LUT optimization

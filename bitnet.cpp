@@ -11247,6 +11247,383 @@ void matmul_hyperthreading_neon(const float* A, const float* B, float* C,
 
 // ==================== End of Session 30 ====================
 
+// ==================== Session 29: 4-bit Quantization & KV Cache Compression ====================
+
+#if IS_X86_PLATFORM
+
+// ==================== 4-bit Quantization ====================
+
+struct Bit4Matrix {
+    unsigned char* data;  // 2 values per byte
+    int rows;
+    int cols;
+    int stride_bytes;     // cols / 2 (rounded up)
+    float* scale;         // Per-row scale factor
+    float* zero_point;    // Per-row zero point
+    
+    Bit4Matrix(int r = 0, int c = 0) : rows(r), cols(c) {
+        stride_bytes = (cols + 1) / 2;  // 2 values per byte
+        posix_memalign(reinterpret_cast<void**>(&data), CACHE_LINE_SIZE,
+                       sizeof(unsigned char) * rows * stride_bytes);
+        posix_memalign(reinterpret_cast<void**>(&scale), CACHE_LINE_SIZE,
+                       sizeof(float) * rows);
+        posix_memalign(reinterpret_cast<void**>(&zero_point), CACHE_LINE_SIZE,
+                       sizeof(float) * rows);
+        std::memset(data, 0, sizeof(unsigned char) * rows * stride_bytes);
+        std::memset(scale, 0, sizeof(float) * rows);
+        std::memset(zero_point, 0, sizeof(float) * rows);
+    }
+    
+    ~Bit4Matrix() {
+        free(data);
+        free(scale);
+        free(zero_point);
+    }
+};
+
+// Quantize float matrix to 4-bit
+void quantize_4bit(const float* src, Bit4Matrix& dst) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < dst.rows; i++) {
+        const float* row = src + i * dst.cols;
+        
+        // Find min/max for per-row quantization
+        __m256 min_vec = _mm256_set1_ps(INFINITY);
+        __m256 max_vec = _mm256_set1_ps(-INFINITY);
+        
+        int j = 0;
+        for (; j + AVX_SIZE <= dst.cols; j += AVX_SIZE) {
+            __m256 vals = _mm256_loadu_ps(&row[j]);
+            min_vec = _mm256_min_ps(min_vec, vals);
+            max_vec = _mm256_max_ps(max_vec, vals);
+        }
+        for (; j < dst.cols; j++) {
+            min_vec = _mm256_min_ps(min_vec, _mm256_set1_ps(row[j]));
+            max_vec = _mm256_max_ps(max_vec, _mm256_set1_ps(row[j]));
+        }
+        
+        float row_min = _mm256_reduce_min_ps(min_vec);
+        float row_max = _mm256_reduce_max_ps(max_vec);
+        for (; j < dst.cols; j++) {
+            row_min = std::min(row_min, row[j]);
+            row_max = std::max(row_max, row[j]);
+        }
+        
+        dst.scale[i] = (row_max - row_min) / 15.0f;  // 16 values (0-15)
+        dst.zero_point[i] = row_min;
+        
+        if (dst.scale[i] < 1e-6f) {
+            dst.scale[i] = 1.0f;
+            dst.zero_point[i] = 0.0f;
+        }
+        
+        // Quantize and pack
+        float inv_scale = 1.0f / dst.scale[i];
+        __m256 inv_scale_vec = _mm256_set1_ps(inv_scale);
+        __m256 zp_vec = _mm256_set1_ps(dst.zero_point[i]);
+        
+        for (j = 0; j + 16 <= dst.cols; j += 16) {
+            // Process 16 elements, pack into 8 bytes
+            __m256 v0 = _mm256_loadu_ps(&row[j]);
+            __m256 v1 = _mm256_loadu_ps(&row[j + 8]);
+            
+            // Normalize to 0-15
+            __m256 n0 = _mm256_round_ps(_mm256_mul_ps(_mm256_sub_ps(v0, zp_vec), inv_scale_vec), 
+                                        _MM_ROUND_MODE_NEAREST);
+            __m256 n1 = _mm256_round_ps(_mm256_mul_ps(_mm256_sub_ps(v1, zp_vec), inv_scale_vec), 
+                                        _MM_ROUND_MODE_NEAREST);
+            
+            // Convert to int and pack
+            __m256i i0 = _mm256_cvtps_epi32(n0);
+            __m256i i1 = _mm256_cvtps_epi32(n1);
+            
+            // Pack 16 int8 into 8 bytes (2 per byte)
+            for (int k = 0; k < 8; k++) {
+                int v0_k = _mm256_extract_epi32(i0, k);
+                int v1_k = _mm256_extract_epi32(i1, k);
+                v0_k = std::max(0, std::min(15, v0_k));
+                v1_k = std::max(0, std::min(15, v1_k));
+                dst.data[i * dst.stride_bytes + j / 2 + k] = (unsigned char)((v1_k << 4) | v0_k);
+            }
+        }
+        
+        // Handle remainder
+        for (; j < dst.cols; j++) {
+            int q = std::max(0, std::min(15, (int)std::round((row[j] - dst.zero_point[i]) * inv_scale)));
+            if (j % 2 == 0) {
+                dst.data[i * dst.stride_bytes + j / 2] = q;
+            } else {
+                dst.data[i * dst.stride_bytes + j / 2] |= (q << 4);
+            }
+        }
+    }
+}
+
+// 4-bit matrix multiplication with dequantization on-the-fly
+void matmul_4bit(const Bit4Matrix& A, const float* B, float* C,
+                 int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    
+    for (int i = 0; i < M; i++) {
+        const unsigned char* A_row = A.data + i * A.stride_bytes;
+        float a_scale = A.scale[i];
+        float a_zp = A.zero_point[i];
+        
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            __m256 sum_vec = _mm256_setzero_ps();
+            
+            int k = 0;
+            for (; k + 16 <= K; k += 16) {
+                // Load 16 4-bit values, dequantize
+                __m256i packed = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(&A_row[k / 2]));
+                
+                // Extract and dequantize first 8 values
+                for (int u = 0; u < 8; u++) {
+                    unsigned char byte = _mm256_extract_epi8(packed, u);
+                    unsigned char v0 = byte & 0x0F;
+                    unsigned char v1 = byte >> 4;
+                    
+                    float d0 = (float)v0 * a_scale + a_zp;
+                    float d1 = (float)v1 * a_scale + a_zp;
+                    
+                    const float* B_k = B + (k + u * 2) * N;
+                    sum += d0 * B_k[j] + d1 * B_k[j + N];
+                }
+            }
+            
+            // Remainder
+            for (; k < K; k++) {
+                unsigned char byte = A_row[k / 2];
+                unsigned char v = (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                float d = (float)v * a_scale + a_zp;
+                sum += d * B[k * N + j];
+            }
+            
+            C[i * N + j] = sum;
+        }
+    }
+}
+
+// ==================== KV Cache Compression ====================
+
+struct KVCache {
+    float* keys;      // [num_layers, seq_len, num_heads, head_dim]
+    float* values;    // [num_layers, seq_len, num_heads, head_dim]
+    int num_layers;
+    int num_heads;
+    int head_dim;
+    int max_seq_len;
+    int current_len;
+    float* compressed_keys;    // Compressed key cache
+    float* compressed_values;  // Compressed value cache
+    int compression_factor;    // e.g., 4 means 4x compression
+    
+    KVCache(int nl, int nh, int hd, int max_len, int cf = 4)
+        : num_layers(nl), num_heads(nh), head_dim(hd), 
+          max_seq_len(max_len), current_len(0), compression_factor(cf) {
+        int total_size = num_layers * max_seq_len * num_heads * head_dim;
+        posix_memalign(reinterpret_cast<void**>(&keys), CACHE_LINE_SIZE,
+                       sizeof(float) * total_size);
+        posix_memalign(reinterpret_cast<void**>(&values), CACHE_LINE_SIZE,
+                       sizeof(float) * total_size);
+        
+        int comp_size = total_size / compression_factor;
+        posix_memalign(reinterpret_cast<void**>(&compressed_keys), CACHE_LINE_SIZE,
+                       sizeof(float) * comp_size);
+        posix_memalign(reinterpret_cast<void**>(&compressed_values), CACHE_LINE_SIZE,
+                       sizeof(float) * comp_size);
+        
+        std::memset(keys, 0, sizeof(float) * total_size);
+        std::memset(values, 0, sizeof(float) * total_size);
+        std::memset(compressed_keys, 0, sizeof(float) * comp_size);
+        std::memset(compressed_values, 0, sizeof(float) * comp_size);
+    }
+    
+    ~KVCache() {
+        free(keys);
+        free(values);
+        free(compressed_keys);
+        free(compressed_values);
+    }
+};
+
+// Compress KV cache using block-wise quantization
+void compress_kv_cache(KVCache& cache) {
+    int block_size = cache.compression_factor * 16;  // Compress 64 floats to 16
+    int total_blocks = (cache.num_layers * cache.max_seq_len * 
+                        cache.num_heads * cache.head_dim) / block_size;
+    
+    for (int b = 0; b < total_blocks; b++) {
+        int start = b * block_size;
+        
+        // Find min/max for block
+        float block_min = cache.keys[start];
+        float block_max = cache.keys[start];
+        for (int i = 1; i < block_size; i++) {
+            block_min = std::min(block_min, cache.keys[start + i]);
+            block_max = std::max(block_max, cache.keys[start + i]);
+        }
+        for (int i = 0; i < block_size; i++) {
+            block_min = std::min(block_min, cache.values[start + i]);
+            block_max = std::max(block_max, cache.values[start + i]);
+        }
+        
+        float scale = (block_max - block_min) / 255.0f;
+        float zp = block_min;
+        
+        if (scale < 1e-6f) {
+            scale = 1.0f;
+            zp = 0.0f;
+        }
+        
+        // Store metadata
+        cache.compressed_keys[b * 2] = scale;
+        cache.compressed_keys[b * 2 + 1] = zp;
+        
+        // Quantize and store
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < block_size; i++) {
+            unsigned char qk = (unsigned char)std::max(0, std::min(255,
+                (int)std::round((cache.keys[start + i] - zp) * inv_scale)));
+            unsigned char qv = (unsigned char)std::max(0, std::min(255,
+                (int)std::round((cache.values[start + i] - zp) * inv_scale)));
+            cache.compressed_values[b * block_size + i] = (qk << 8) | qv;
+        }
+    }
+}
+
+// Decompress KV cache for attention computation
+void decompress_kv_cache(const KVCache& cache, int layer, int seq_len,
+                          float* keys_out, float* values_out) {
+    int block_size = cache.compression_factor * 16;
+    int start_block = layer * cache.max_seq_len * cache.num_heads * cache.head_dim / block_size;
+    int num_blocks = seq_len * cache.num_heads * cache.head_dim / block_size;
+    
+    for (int b = 0; b < num_blocks; b++) {
+        int block_idx = start_block + b;
+        float scale = cache.compressed_keys[block_idx * 2];
+        float zp = cache.compressed_keys[block_idx * 2 + 1];
+        
+        int start = b * block_size;
+        for (int i = 0; i < block_size; i++) {
+            unsigned char packed = cache.compressed_values[block_idx * block_size + i];
+            keys_out[start + i] = (float)(packed >> 8) * scale + zp;
+            values_out[start + i] = (float)(packed & 0xFF) * scale + zp;
+        }
+    }
+}
+
+#endif  // x86 platform
+
+// ==================== ARM NEON 4-bit Quantization ====================
+
+#if IS_ARM_PLATFORM
+
+struct Bit4MatrixArm {
+    unsigned char* data;
+    int rows;
+    int cols;
+    int stride_bytes;
+    float* scale;
+    float* zero_point;
+    
+    Bit4MatrixArm(int r = 0, int c = 0) : rows(r), cols(c) {
+        stride_bytes = (cols + 1) / 2;
+        posix_memalign(reinterpret_cast<void**>(&data), CACHE_LINE_SIZE,
+                       sizeof(unsigned char) * rows * stride_bytes);
+        posix_memalign(reinterpret_cast<void**>(&scale), CACHE_LINE_SIZE,
+                       sizeof(float) * rows);
+        posix_memalign(reinterpret_cast<void**>(&zero_point), CACHE_LINE_SIZE,
+                       sizeof(float) * rows);
+    }
+    
+    ~Bit4MatrixArm() {
+        free(data);
+        free(scale);
+        free(zero_point);
+    }
+};
+
+void quantize_4bit_neon(const float* src, Bit4MatrixArm& dst) {
+    constexpr int NEON_SIZE = 4;
+    
+    for (int i = 0; i < dst.rows; i++) {
+        const float* row = src + i * dst.cols;
+        
+        // Find min/max
+        float32x4_t min_vec = vdupq_n_f32(INFINITY);
+        float32x4_t max_vec = vdupq_n_f32(-INFINITY);
+        
+        int j = 0;
+        for (; j + NEON_SIZE <= dst.cols; j += NEON_SIZE) {
+            float32x4_t vals = vld1q_f32(&row[j]);
+            min_vec = vminq_f32(min_vec, vals);
+            max_vec = vmaxq_f32(max_vec, vals);
+        }
+        
+        float row_min = min_vec[0], row_max = max_vec[0];
+        for (; j < dst.cols; j++) {
+            row_min = std::min(row_min, row[j]);
+            row_max = std::max(row_max, row[j]);
+        }
+        
+        dst.scale[i] = (row_max - row_min) / 15.0f;
+        dst.zero_point[i] = row_min;
+        
+        if (dst.scale[i] < 1e-6f) {
+            dst.scale[i] = 1.0f;
+            dst.zero_point[i] = 0.0f;
+        }
+        
+        // Quantize
+        float inv_scale = 1.0f / dst.scale[i];
+        float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
+        float32x4_t zp_vec = vdupq_n_f32(dst.zero_point[i]);
+        
+        for (j = 0; j + 8 <= dst.cols; j += 8) {
+            float32x4_t v0 = vld1q_f32(&row[j]);
+            float32x4_t v1 = vld1q_f32(&row[j + 4]);
+            
+            float32x4_t n0 = vmulq_f32(vsubq_f32(v0, zp_vec), inv_scale_vec);
+            float32x4_t n1 = vmulq_f32(vsubq_f32(v1, zp_vec), inv_scale_vec);
+            
+            // Pack 8 values into 4 bytes
+            for (int k = 0; k < 4; k++) {
+                int q0 = (int)vgetq_lane_f32(n0, k);
+                int q1 = (int)vgetq_lane_f32(n1, k);
+                q0 = std::max(0, std::min(15, q0));
+                q1 = std::max(0, std::min(15, q1));
+                dst.data[i * dst.stride_bytes + j / 2 + k] = (unsigned char)((q1 << 4) | q0);
+            }
+        }
+        
+        // Remainder
+        for (; j < dst.cols; j++) {
+            int q = std::max(0, std::min(15, 
+                (int)std::round((row[j] - dst.zero_point[i]) * inv_scale)));
+            if (j % 2 == 0) {
+                dst.data[i * dst.stride_bytes + j / 2] = q;
+            } else {
+                dst.data[i * dst.stride_bytes + j / 2] |= (q << 4);
+            }
+        }
+    }
+}
+
+#endif  // ARM platform
+
+// ==================== Cross-Platform 4-bit Alias ====================
+
+#if IS_ARM_PLATFORM
+#define quantize_4bit quantize_4bit_neon
+#define Bit4Matrix Bit4MatrixArm
+#endif
+
+// ==================== End of Session 29 ====================
+
 // ==================== End of File ====================
 
 // ==================== Quantized Matrix Multiplication ====================
