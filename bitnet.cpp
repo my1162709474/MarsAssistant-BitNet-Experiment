@@ -15452,6 +15452,10 @@ void matmul_mega_batch(const float* A_batch, const float* B, float* C_batch,
 // ============================================================================
 // Target: 2-3x speedup on 1-bit operations using 512-bit wide popcount
 
+// Forward declaration
+void matmul_1bit_dynamic(const unsigned char* A_packed, const unsigned char* B_packed, 
+                         float* C, int M, int N, int K, int num_threads);
+
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
 
 // Ultra-wide 1-bit matrix multiplication using AVX-512
@@ -15496,12 +15500,12 @@ void matmul_1bit_ultra_avx512(const unsigned char* A_packed,
 
 // 1-bit matrix multiplication with dynamic precision
 void matmul_1bit_dynamic(const unsigned char* A_packed, const unsigned char* B_packed, 
-                         float* C, int M, int N, int K, int num_threads) {
+                         float* C, int M, int N, int int K, int num_threads) {
+    const int K_words = (K + 31) / 32;
 #if IS_X86_PLATFORM && defined(__AVX512VPOPCNTDQ__)
     matmul_1bit_ultra_avx512(A_packed, B_packed, C, M, N, K);
 #else
     // Fallback to standard 1-bit matmul
-    const int K_words = (K + 31) / 32;
     for (int i = 0; i < M; i++) {
         const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
         for (int j = 0; j < N; j++) {
@@ -15597,7 +15601,31 @@ void matmul_1bit_ultra_avx512_batched(const unsigned char* A_packed,
         }
     }
 }
+#endif  // AVX-512
+
+// ============================================================================
+// Universal 1-bit matmul (always available)
+// ============================================================================
+
+void matmul_1bit_dynamic(const unsigned char* A_packed, const unsigned char* B_packed, 
+                         float* C, int M, int N, int K, int num_threads) {
+    const int K_words = (K + 31) / 32;
+#if IS_X86_PLATFORM && defined(__AVX512VPOPCNTDQ__)
+    matmul_1bit_ultra_avx512(A_packed, B_packed, C, M, N, K);
+#else
+    for (int i = 0; i < M; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            int diff_count = 0;
+            for (int w = 0; w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+        }
+    }
 #endif
+}
 
 // ============================================================================
 // Session 40: Hyper-Optimized Quantization with Parallel Bit Packing
@@ -15713,6 +15741,7 @@ FORCE_INLINE void relu_ultra(float* data, int size) {
 // Single-pass: all operations fused into one kernel
 // ============================================================================
 
+#if IS_X86_PLATFORM
 FORCE_INLINE void fused_multi_head_attention(
     const float* Q,           // [batch, num_heads, seq_len, head_dim]
     const float* K,           // [batch, num_heads, seq_len, head_dim]
@@ -15824,11 +15853,90 @@ FORCE_INLINE void fused_multi_head_attention(
         }
     }
 }
+#endif  // IS_X86_PLATFORM
+
+// ============================================================================
+// ARM NEON version of fused multi-head attention
+// ============================================================================
+
+#if IS_ARM_PLATFORM
+FORCE_INLINE void fused_multi_head_attention(
+    const float* Q, const float* K, const float* V,
+    float* output, float* attention_scores,
+    int batch, int num_heads, int seq_len, int head_dim) {
+    
+    constexpr int NEON_SIZE = 4;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    
+    for (int b = 0; b < batch; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q + (b * num_heads + h) * seq_len * head_dim;
+            const float* K_head = K + (b * num_heads + h) * seq_len * head_dim;
+            const float* V_head = V + (b * num_heads + h) * seq_len * head_dim;
+            float* O_head = output + (b * num_heads + h) * seq_len * head_dim;
+            float* S_head = attention_scores + (b * num_heads + h) * seq_len * seq_len;
+            
+            // Compute Q * K^T
+            for (int qi = 0; qi < seq_len; qi++) {
+                const float* Q_row = Q_head + qi * head_dim;
+                float* S_row = S_head + qi * seq_len;
+                
+                for (int kj = 0; kj < seq_len; kj++) {
+                    const float* K_row = K_head + kj * head_dim;
+                    
+                    // Dot product with NEON
+                    float32x4_t dot_prod = vdupq_n_f32(0.0f);
+                    for (int d = 0; d + NEON_SIZE <= head_dim; d += NEON_SIZE) {
+                        float32x4_t q_vec = vld1q_f32(&Q_row[d]);
+                        float32x4_t k_vec = vld1q_f32(&K_row[d]);
+                        dot_prod = vfmaq_f32(dot_prod, q_vec, k_vec);
+                    }
+                    
+                    // Horizontal sum
+                    float score = dot_prod[0] + dot_prod[1] + dot_prod[2] + dot_prod[3];
+                    for (int d = head_dim - (head_dim % NEON_SIZE); d < head_dim; d++) {
+                        score += Q_row[d] * K_row[d];
+                    }
+                    
+                    S_row[kj] = score * scale;
+                }
+                
+                // Softmax
+                float row_max = S_row[0];
+                for (int kj = 1; kj < seq_len; kj++) {
+                    row_max = std::max(row_max, S_row[kj]);
+                }
+                
+                float sum = 0.0f;
+                for (int kj = 0; kj < seq_len; kj++) {
+                    S_row[kj] = std::exp(S_row[kj] - row_max);
+                    sum += S_row[kj];
+                }
+                float inv_sum = 1.0f / (sum + 1e-8f);
+                for (int kj = 0; kj < seq_len; kj++) {
+                    S_row[kj] *= inv_sum;
+                }
+                
+                // Output = S * V
+                for (int kj = 0; kj < seq_len; kj++) {
+                    const float* V_row = V_head + kj * head_dim;
+                    float attn_score = S_row[kj];
+                    
+                    for (int d = 0; d < head_dim; d++) {
+                        O_head[qi * head_dim + d] += attn_score * V_row[d];
+                    }
+                }
+            }
+        }
+    }
+}
+#endif  // IS_ARM_PLATFORM
 
 // ============================================================================
 // Memory Subgraph Optimization: Fused Copy + Scale + Add + Clamp
 // ============================================================================
 
+#if IS_X86_PLATFORM
 FORCE_INLINE void memory_fused_copy_scale_add_clamp(
     float* RESTRICT out,
     const float* RESTRICT in1,
@@ -15884,10 +15992,75 @@ FORCE_INLINE void memory_fused_copy_scale_add_clamp(
         out[i] = std::clamp(in1[i] * scale1 + in2[i] * scale2, min_val, max_val);
     }
 }
+#endif  // IS_X86_PLATFORM
+
+// ============================================================================
+// ARM NEON version of memory fused operations
+// ============================================================================
+
+#if IS_ARM_PLATFORM
+FORCE_INLINE void memory_fused_copy_scale_add_clamp(
+    float* RESTRICT out,
+    const float* RESTRICT in1,
+    const float* RESTRICT in2,
+    float scale1, float scale2,
+    float min_val, float max_val,
+    int size) {
+    
+    for (int i = 0; i < size; i++) {
+        float val = in1[i] * scale1 + in2[i] * scale2;
+        out[i] = val < min_val ? min_val : (val > max_val ? max_val : val);
+    }
+}
+#endif  // IS_ARM_PLATFORM
 
 // ============================================================================
 // Ultra-Optimized Gather/Scatter for Strided Access Patterns
 // ============================================================================
+
+#if IS_X86_PLATFORM
+FORCE_INLINE void gather_floats_avx2(float* RESTRICT dest,
+                                     const float* RESTRICT src,
+                                     const int* RESTRICT indices,
+                                     int count) {
+    constexpr int AVX_SIZE = 8;
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= count; i += AVX_SIZE) {
+        // Gather 8 elements using mask-based approach
+        __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&indices[i]));
+        
+        // Manual gather since AVX2 gather is slow on many CPUs
+        float vals[AVX_SIZE];
+        for (int j = 0; j < AVX_SIZE; j++) {
+            vals[j] = src[indices[i + j]];
+        }
+        __m256 gathered = _mm256_loadu_ps(vals);
+        _mm256_storeu_ps(&dest[i], gathered);
+    }
+    for (; i < count; i++) {
+        dest[i] = src[indices[i]];
+    }
+}
+
+FORCE_INLINE void scatter_floats_avx2(float* RESTRICT dest,
+                                      const float* RESTRICT src,
+                                      const int* RESTRICT indices,
+                                      int count) {
+    constexpr int AVX_SIZE = 8;
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= count; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&src[i]);
+        for (int j = 0; j < AVX_SIZE; j++) {
+            dest[indices[i + j]] = vals[j];
+        }
+    }
+    for (; i < count; i++) {
+        dest[indices[i]] = src[i];
+    }
+}
+#endif  // IS_X86_PLATFORM
 
 FORCE_INLINE void gather_floats_avx2(float* RESTRICT dest,
                                      const float* RESTRICT src,
@@ -17959,6 +18132,7 @@ FORCE_INLINE void memory_set_zero_neon(float* ptr, size_t size) {
 
 // ==================== Ultra-Fast Vector Quantization (AVX2) ====================
 
+#if IS_X86_PLATFORM
 FORCE_INLINE void quantize_vectorized_avx2(const float* src, int8_t* dst, int size) {
     constexpr int VEC_SIZE = 8;
     int i = 0;
@@ -18088,6 +18262,73 @@ FORCE_INLINE void quantize_vectorized_neon(const float* src, int8_t* dst, int si
         dst[i] = static_cast<int8_t>(val);
     }
 }
+#endif  // IS_X86_PLATFORM
+
+// ==================== Ultra-Fast Vector Quantization (NEON) ====================
+
+#if IS_ARM_PLATFORM
+FORCE_INLINE void quantize_vectorized_neon(const float* src, int8_t* dst, int size) {
+    constexpr int VEC_SIZE = 4;
+    int i = 0;
+    
+    // Find min/max using vectorized operations
+    float32x4_t min_vec = vld1q_f32(src);
+    float32x4_t max_vec = min_vec;
+    
+    for (i = VEC_SIZE; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        float32x4_t vals = vld1q_f32(src + i);
+        min_vec = vminq_f32(min_vec, vals);
+        max_vec = vmaxq_f32(max_vec, vals);
+    }
+    
+    // Horizontal min/max
+    float min_vals[4], max_vals[4];
+    vst1q_f32(min_vals, min_vec);
+    vst1q_f32(max_vals, max_vec);
+    float global_min = min_vals[0], global_max = max_vals[0];
+    for (int j = 1; j < 4 && j < size; j++) {
+        global_min = std::min(global_min, min_vals[j]);
+        global_max = std::max(global_max, max_vals[j]);
+    }
+    
+    for (; i < size; i++) {
+        global_min = std::min(global_min, src[i]);
+        global_max = std::max(global_max, src[i]);
+    }
+    
+    if (global_max - global_min < 1e-5f) {
+        global_min = -1.0f;
+        global_max = 1.0f;
+    }
+    
+    float scale = 127.0f / (global_max - global_min);
+    float offset = -global_min * scale;
+    
+    float32x4_t scale_vec = vdupq_n_f32(scale);
+    float32x4_t offset_vec = vdupq_n_f32(offset);
+    float32x4_t zero_vec = vdupq_n_f32(0.0f);
+    float32x4_t max_vec128 = vdupq_n_f32(127.0f);
+    
+    // Quantize
+    i = 0;
+    for (; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        for (int j = 0; j < 4; j++) {
+            float32x4_t vals = vld1q_f32(src + i + j * VEC_SIZE);
+            float32x4_t scaled = vaddq_f32(vmulq_n_f32(vals, scale), offset_vec);
+            scaled = vminq_f32(max_vec128, vmaxq_f32(zero_vec, scaled));
+            vst1q_f32(src + i + j * VEC_SIZE, scaled);
+        }
+        for (int j = 0; j < VEC_SIZE * 4; j++) {
+            dst[i + j] = static_cast<int8_t>(src[i + j]);
+        }
+    }
+    
+    for (; i < size; i++) {
+        float val = std::max(0.0f, std::min(127.0f, src[i] * scale + offset));
+        dst[i] = static_cast<int8_t>(val);
+    }
+}
+#endif  // IS_ARM_PLATFORM
 
 // Cross-platform alias
 #if IS_X86_PLATFORM
