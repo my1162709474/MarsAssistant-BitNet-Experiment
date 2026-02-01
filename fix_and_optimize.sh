@@ -1,3 +1,11 @@
+#!/bin/bash
+# Fix compilation errors in bitnet.cpp
+# Fix: Missing #endif for x86-specific code causing redefinition errors
+
+cd /Users/mars/.openclaw/workspace/MarsAssistant-BitNet-Experiment
+
+# First, let's create a clean version that properly guards x86 code
+cat > bitnet.cpp.fixed << 'ENDOFFILE'
 /**
  * BitNet: 1-bit Transformer Networks
  * Performance Optimized Implementation
@@ -714,3 +722,18 @@ int main() {
     std::cout << "\nCompilation successful!\n";
     return 0;
 }
+ENDOFFILE
+
+mv bitnet.cpp bitnet.cpp.backup2
+mv bitnet.cpp.fixed bitnet.cpp
+
+echo "Fixed bitnet.cpp. Compiling..."
+clang++ -O3 -march=native -ffast-math -funroll-loops -ftree-vectorize \
+    bitnet.cpp -o bitnet_test_session50 -pthread 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "✅ Compilation successful!"
+    ./bitnet_test_session50
+else
+    echo "❌ Compilation failed"
+fi
