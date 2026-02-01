@@ -190,6 +190,10 @@ void relu_neon(float* data, int size);
 #define matmul_1bit_avx512 matmul_1bit_parallel
 #endif
 
+// Thread data structure and thread function (forward declarations for all platforms)
+struct ThreadData;
+void* matmul_thread(void* arg);
+
 // ==================== AVX-512 Support (Conditional) ====================
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -1921,6 +1925,15 @@ FORCE_INLINE void scale_add_fused(float* RESTRICT dst,
 
 // ==================== NEW: Thread Affinity & NUMA Optimization ====================
 
+// Thread data structure (redefined here with full definition)
+struct ThreadData {
+    const float* A;
+    const float* B;
+    float* C;
+    int M, N, K;
+    int start_row, end_row;
+};
+
 void matmul_parallel_affinity(const float* A, const float* B, float* C,
                               int M, int N, int K, int num_threads) {
     pthread_t threads[64];
@@ -2569,6 +2582,8 @@ void matmul_cache_oblivious(float* A, float* B, float* C,
 
 // ==================== NEW: Hyper-Optimized GEMM ====================
 
+#if defined(__x86_64__) || defined(__i386__)
+
 void matmul_gemm_optimized(const float* A, const float* B, float* C,
                            int M, int N, int K) {
     constexpr int BLOCK_M = 64;
@@ -2612,6 +2627,8 @@ void matmul_gemm_optimized(const float* A, const float* B, float* C,
 }
 
 // ==================== NEW: Tile-Based Micro-Architecture Optimization ====================
+
+#if defined(__x86_64__) || defined(__i386__)
 
 void matmul_tile_optimized(const float* A, const float* B, float* C,
                            int M, int N, int K) {
@@ -2667,6 +2684,8 @@ void matmul_tile_optimized(const float* A, const float* B, float* C,
         }
     }
 }
+
+#endif  // x86/ARM platforms
 
 // ==================== NEW: BF16/FP32 Hybrid Precision MatMul ====================
 // Uses AVX-512 BF16 VNNI instructions for 2x speedup
