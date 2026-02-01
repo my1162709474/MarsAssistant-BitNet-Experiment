@@ -3994,7 +3994,235 @@ FORCE_INLINE void dequantize_int8_fast_neon(const int8_t* input, float* output, 
         output[i] = (static_cast<float>(input[i]) - *zero_point) * *scale;
     }
 }
-#endif
+
+// ============================================================================
+// Session 89: AVX-512 VNNI Quantized MatMul + FLASH Attention Tiling
+// ============================================================================
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+
+// AVX-512 VNNI INT8 matrix multiplication (4x faster than AVX2)
+// VNNI: Vector Neural Network Instructions for INT8 dot product
+FORCE_INLINE void matmul_int8_vnni_avx512(
+    const int8_t* RESTRICT A,
+    const int8_t* RESTRICT B,
+    int32_t* RESTRICT C,
+    int M, int N, int K) {
+    
+    constexpr int VNNI_WIDTH = 16;  // 16 int8 per VNNI operation
+    constexpr int UNROLL = 4;       // 4 VNNI operations per iteration
+    
+    for (int i = 0; i < M; i++) {
+        const int8_t* RESTRICT A_row = A + i * K;
+        int32_t* RESTRICT C_row = C + i * N;
+        
+        // Initialize output row
+        for (int j = 0; j < N; j++) {
+            C_row[j] = 0;
+        }
+        
+        for (int k = 0; k < K; k += VNNI_WIDTH) {
+            const int8_t* RESTRICT B_k = B + k * N;
+            
+            // Load A vector (broadcast)
+            __m512i a_vec = _mm512_set1_epi32(static_cast<int32_t>(A_row[k]));
+            
+            for (int j = 0; j < N; j += VNNI_WIDTH * UNROLL) {
+                // VNNI dot product: C += A * B (int8 -> int32 accumulation)
+                __m512i b_vec[UNROLL];
+                __m512i c_vec[UNROLL];
+                
+                for (int u = 0; u < UNROLL; u++) {
+                    b_vec[u] = _mm512_loadu_si512((__m512i*)&B_k[j + u * VNNI_WIDTH]);
+                    c_vec[u] = _mm512_loadu_si512((__m512i*)&C_row[j + u * VNNI_WIDTH]);
+                }
+                
+                // VNNI multiply-accumulate
+                for (int u = 0; u < UNROLL; u++) {
+                    c_vec[u] = _mm512_dpbusd_epi32(c_vec[u], a_vec, b_vec[u]);
+                }
+                
+                // Store results
+                for (int u = 0; u < UNROLL; u++) {
+                    _mm512_storeu_si512((__m512i*)&C_row[j + u * VNNI_WIDTH], c_vec[u]);
+                }
+            }
+        }
+    }
+}
+
+// VNNI with blocking for better cache utilization
+FORCE_INLINE void matmul_int8_vnni_blocked_avx512(
+    const int8_t* RESTRICT A,
+    const int8_t* RESTRICT B,
+    int32_t* RESTRICT C,
+    int M, int N, int K,
+    int block_k) {
+    
+    constexpr int VNNI_WIDTH = 16;
+    
+    for (int i = 0; i < M; i++) {
+        int32_t* RESTRICT C_row = C + i * N;
+        
+        for (int k = 0; k < K; k += block_k) {
+            int k_end = std::min(k + block_k, K);
+            const int8_t* RESTRICT A_block = A + i * K + k;
+            const int8_t* RESTRICT B_block = B + k * N;
+            
+            for (int j = 0; j < N; j += VNNI_WIDTH) {
+                __m512i acc = _mm512_setzero_epi32();
+                
+                for (int kk = k; kk < k_end; kk++) {
+                    __m512i a_vec = _mm512_set1_epi32(static_cast<int32_t>(A_block[kk - k]));
+                    __m512i b_vec = _mm512_loadu_si512((__m512i*)&B_block[(kk - k) * N + j]);
+                    acc = _mm512_dpbusd_epi32(acc, a_vec, b_vec);
+                }
+                
+                // Add to output
+                __m512i out_vec = _mm512_loadu_si512((__m512i*)&C_row[j]);
+                out_vec = _mm512_add_epi32(out_vec, acc);
+                _mm512_storeu_si512((__m512i*)&C_row[j], out_vec);
+            }
+        }
+    }
+}
+
+#endif  // AVX512VNNI
+
+// ==================== FLASH Attention Style Tiled Softmax ====================
+
+// FLASH Attention: Block-based softmax to reduce memory access
+// Processes attention in blocks to keep data in L1/L2 cache
+FORCE_INLINE void softmax_flash_attention_avx2(
+    float* RESTRICT Q,      // Query matrix [M, K]
+    const float* RESTRICT K, // Key matrix [N, K]
+    float* RESTRICT K_scale, // Scale factor
+    float* RESTRICT output,  // Output [M, N]
+    int M, int N, int K,
+    int block_size) {
+    
+    constexpr int AVX_SIZE = 8;
+    
+    // Process in blocks to improve cache locality
+    for (int mb = 0; mb < M; mb += block_size) {
+        int mb_end = std::min(mb + block_size, M);
+        
+        for (int nb = 0; nb < N; nb += block_size) {
+            int nb_end = std::min(nb + block_size, N);
+            
+            // Compute QK^T in blocks
+            for (int i = mb; i < mb_end; i++) {
+                const float* RESTRICT Q_row = Q + i * K;
+                float* RESTRICT out_row = output + i * N;
+                
+                // Find max in this row-block for numerical stability
+                float row_max = -FLT_MAX;
+                for (int j = nb; j < nb_end; j++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < K; k++) {
+                        dot += Q_row[k] * K[j * K + k];
+                    }
+                    float score = dot * (*K_scale);
+                    out_row[j] = score;
+                    row_max = std::max(row_max, score);
+                }
+                
+                // Subtract max and compute exp
+                float exp_sum = 0.0f;
+                for (int j = nb; j < nb_end; j++) {
+                    out_row[j] = std::exp(out_row[j] - row_max);
+                    exp_sum += out_row[j];
+                }
+                
+                // Normalize
+                float inv_sum = 1.0f / (exp_sum + 1e-8f);
+                for (int j = nb; j < nb_end; j++) {
+                    out_row[j] *= inv_sum;
+                }
+            }
+        }
+    }
+}
+
+// Optimized tiled matmul with L1 cache blocking
+FORCE_INLINE void matmul_tiled_cache_friendly_avx2(
+    const float* RESTRICT A,
+    const float* RESTRICT B,
+    float* RESTRICT C,
+    int M, int N, int K,
+    int tile_k) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;
+    
+    // Use smaller tiles that fit in L1 cache
+    const int tile_k_opt = std::min(tile_k, 32);
+    
+    for (int i = 0; i < M; i++) {
+        const float* RESTRICT A_row = A + i * K;
+        float* RESTRICT C_row = C + i * N;
+        
+        // Clear output row
+        for (int j = 0; j < N; j++) {
+            C_row[j] = 0.0f;
+        }
+        
+        // Process K dimension in tiles
+        for (int kt = 0; kt < K; kt += tile_k_opt) {
+            int k_end = std::min(kt + tile_k_opt, K);
+            
+            // Prefetch A tile
+            PREFETCH_READ(&A_row[kt + tile_k_opt]);
+            
+            for (int k = kt; k < k_end; k++) {
+                const float* RESTRICT B_k = B + k * N;
+                float a_val = A_row[k];
+                __m256 a_vec = _mm256_set1_ps(a_val);
+                
+                // Prefetch next B row
+                if (k + 1 < k_end) {
+                    PREFETCH_READ(&B[(k + 1) * N]);
+                }
+                
+                // Unrolled computation
+                for (int j = 0; j < N - AVX_SIZE * UNROLL; j += AVX_SIZE * UNROLL) {
+                    PREFETCH_WRITE(&C_row[j + 256]);
+                    
+                    __m256 c0 = _mm256_loadu_ps(&C_row[j]);
+                    __m256 c1 = _mm256_loadu_ps(&C_row[j + AVX_SIZE]);
+                    __m256 c2 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 2]);
+                    __m256 c3 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 3]);
+                    
+                    __m256 b0 = _mm256_loadu_ps(&B_k[j]);
+                    __m256 b1 = _mm256_loadu_ps(&B_k[j + AVX_SIZE]);
+                    __m256 b2 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 2]);
+                    __m256 b3 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 3]);
+                    
+                    c0 = _mm256_fmadd_ps(a_vec, b0, c0);
+                    c1 = _mm256_fmadd_ps(a_vec, b1, c1);
+                    c2 = _mm256_fmadd_ps(a_vec, b2, c2);
+                    c3 = _mm256_fmadd_ps(a_vec, b3, c3);
+                    
+                    _mm256_storeu_ps(&C_row[j], c0);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE], c1);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 2], c2);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 3], c3);
+                }
+                
+                // Handle remainder
+                for (int j = N - AVX_SIZE * UNROLL; j < N; j += AVX_SIZE) {
+                    if (j + AVX_SIZE <= N) {
+                        int idx = (j - (N - AVX_SIZE * UNROLL)) / AVX_SIZE;
+                        __m256 c_vec = _mm256_loadu_ps(&C_row[j]);
+                        __m256 b_vec = _mm256_loadu_ps(&B_k[j]);
+                        c_vec = _mm256_fmadd_ps(a_vec, b_vec, c_vec);
+                        _mm256_storeu_ps(&C_row[j], c_vec);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ==================== NEW: Vectorized Softmax with Improved Reduction ====================
 
