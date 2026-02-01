@@ -20061,6 +20061,7 @@ void matmul_batch_cache_aware(const float* A_batch, const float* B, float* C_bat
 }
 
 // 3. Vectorized LayerNorm with SIMD Reduction
+#if IS_X86_PLATFORM
 void layernorm_avx2(float* output, const float* input, const float* weight,
                     const float* bias, int size) {
     constexpr int VEC_SIZE = 8;
@@ -20203,8 +20204,10 @@ void layernorm_neon(float* output, const float* input, const float* weight,
         output[i] = val;
     }
 }
+#endif // IS_X86_PLATFORM
 
 // 4. Optimized Attention Score Computation
+#if IS_X86_PLATFORM
 void attention_scores_optimized(const float* Q, const float* K, float* scores,
                                 int B, int T, int d, float scale) {
     const int head_dim = d;
@@ -20265,6 +20268,7 @@ void attention_scores_optimized(const float* Q, const float* K, float* scores,
         }
     }
 }
+#endif // IS_X86_PLATFORM
 
 // 5. Parallel Batch Processing with OpenMP
 #ifdef _OPENMP
