@@ -4163,51 +4163,96 @@ void attention_fused(const float* Q, const float* K, const float* V,
                      int seq_len, int head_dim) {
     constexpr int AVX_SIZE = 8;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const int head_stride = seq_len * head_dim;
+
+    // Allocate once outside the hot loops
+    std::vector<float> attn_scores(seq_len);
+    std::vector<float> out_vec(head_dim);
 
     for (int b = 0; b < batch; b++) {
+        const float* Q_base = Q + b * num_heads * head_stride;
+        const float* K_base = K + b * num_heads * head_stride;
+        const float* V_base = V + b * num_heads * head_stride;
+        float* O_base = output + b * num_heads * head_stride;
+        
         for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q_base + h * head_stride;
+            const float* K_head = K_base + h * head_stride;
+            const float* V_head = V_base + h * head_stride;
+            float* O_head = O_base + h * head_stride;
+            
             for (int i = 0; i < seq_len; i++) {
                 float max_val = -FLT_MAX;
-                std::vector<float> attn_scores(seq_len);
+                const float* q_row = Q_head + i * head_dim;
+
+                // Prefetch q_row for next iteration
+                if (i + 1 < seq_len) {
+                    _mm_prefetch(reinterpret_cast<const char*>(Q_head + (i + 1) * head_dim), _MM_HINT_T0);
+                }
 
                 for (int j = 0; j < seq_len; j++) {
                     float dot = 0;
-                    const float* q_row = Q + (b * num_heads + h) * seq_len * head_dim + i * head_dim;
-                    const float* k_row = K + (b * num_heads + h) * seq_len * head_dim + j * head_dim;
+                    const float* k_row = K_head + j * head_dim;
 
-                    for (int d = 0; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
+                    // Prefetch next k_row
+                    if (j + 1 < seq_len) {
+                        _mm_prefetch(reinterpret_cast<const char*>(K_head + (j + 1) * head_dim), _MM_HINT_T0);
+                    }
+
+                    int d = 0;
+                    for (; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
                         __m256 q_vec = _mm256_loadu_ps(q_row + d);
                         __m256 k_vec = _mm256_loadu_ps(k_row + d);
                         __m256 prod = _mm256_mul_ps(q_vec, k_vec);
-                        float arr[8];
-                        _mm256_storeu_ps(arr, prod);
-                        for (int k = 0; k < 8; k++) dot += arr[k];
+                        
+                        // Horizontal sum using hadd
+                        __m256 sum_pair = _mm256_hadd_ps(prod, _mm256_setzero_ps());
+                        __m128 sum_high = _mm256_extractf128_ps(sum_pair, 1);
+                        __m128 sum_low = _mm256_castps256_ps128(sum_pair);
+                        dot += _mm_cvtss_f32(_mm_add_ss(sum_low, sum_high));
                     }
-                    for (int d = (head_dim / AVX_SIZE) * AVX_SIZE; d < head_dim; d++) {
+                    for (; d < head_dim; d++) {
                         dot += q_row[d] * k_row[d];
                     }
 
                     attn_scores[j] = dot * scale;
-                    max_val = std::max(max_val, attn_scores[j]);
+                    if (attn_scores[j] > max_val) max_val = attn_scores[j];
                 }
 
+                // Softmax with in-place exp
                 float sum = 0;
                 for (int j = 0; j < seq_len; j++) {
                     attn_scores[j] = std::exp(attn_scores[j] - max_val);
                     sum += attn_scores[j];
                 }
-                for (int j = 0; j < seq_len; j++) attn_scores[j] /= sum;
+                float inv_sum = 1.0f / sum;
+                for (int j = 0; j < seq_len; j++) attn_scores[j] *= inv_sum;
 
-                std::vector<float> out_vec(head_dim, 0.0f);
+                // Initialize out_vec to zero
+                std::fill(out_vec.begin(), out_vec.end(), 0.0f);
+                
                 for (int j = 0; j < seq_len; j++) {
-                    const float* v_row = V + (b * num_heads + h) * seq_len * head_dim + j * head_dim;
-                    for (int d = 0; d < head_dim; d++) {
-                        out_vec[d] += attn_scores[j] * v_row[d];
+                    const float* v_row = V_head + j * head_dim;
+                    float score = attn_scores[j];
+                    __m256 score_vec = _mm256_set1_ps(score);
+                    
+                    int d = 0;
+                    for (; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
+                        __m256 out_vals = _mm256_loadu_ps(&out_vec[d]);
+                        __m256 v_vals = _mm256_loadu_ps(v_row + d);
+                        _mm256_storeu_ps(&out_vec[d], _mm256_fmadd_ps(score_vec, v_vals, out_vals));
+                    }
+                    for (; d < head_dim; d++) {
+                        out_vec[d] += score * v_row[d];
                     }
                 }
 
-                float* out_ptr = output + (b * num_heads + h) * seq_len * head_dim + i * head_dim;
-                for (int d = 0; d < head_dim; d++) out_ptr[d] = out_vec[d];
+                // Store output
+                float* out_ptr = O_head + i * head_dim;
+                _mm256_storeu_ps(out_ptr, _mm256_loadu_ps(out_vec.data()));
+                for (int d = AVX_SIZE; d < head_dim; d++) {
+                    out_ptr[d] = out_vec[d];
+                }
             }
         }
     }
@@ -15652,8 +15697,47 @@ void matmul_1bit_dynamic(const unsigned char* A_packed, const unsigned char* B_p
     const int K_words = (K + 31) / 32;
 #if IS_X86_PLATFORM && defined(__AVX512VPOPCNTDQ__)
     matmul_1bit_ultra_avx512(A_packed, B_packed, C, M, N, K);
+#elif IS_X86_PLATFORM && defined(__AVX2__)
+    // AVX2 optimized fallback (8 x 32-bit words per iteration)
+    constexpr int AVX2_SIZE = 8;
+    const int vec_words = K_words / AVX2_SIZE;
+    
+    for (int i = 0; i < M; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            
+            // Use 256-bit accumulator for popcount sum
+            __m256i diff_sum = _mm256_setzero_si256();
+            
+            // Process 8 x 32-bit words per AVX2 iteration
+            for (int w = 0; w < vec_words * AVX2_SIZE; w += AVX2_SIZE) {
+                __m256i a_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&A_words[w]));
+                __m256i b_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&B_words[w]));
+                __m256i diff = _mm256_xor_si256(a_vec, b_vec);
+                __m256i popcnt = _mm256_popcnt_epi32(diff);
+                diff_sum = _mm256_add_epi32(diff_sum, popcnt);
+            }
+            
+            // Horizontal reduction of 8 popcount sums
+            uint32_t sum_arr[8];
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(sum_arr), diff_sum);
+            int diff_count = 0;
+            for (int k = 0; k < 8; k++) {
+                diff_count += sum_arr[k];
+            }
+            
+            // Process remaining words
+            for (int w = vec_words * AVX2_SIZE; w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+        }
+    }
 #else
-    // Fallback to standard 1-bit matmul
+    // Standard fallback for non-SIMD platforms
     for (int i = 0; i < M; i++) {
         const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
         for (int j = 0; j < N; j++) {
