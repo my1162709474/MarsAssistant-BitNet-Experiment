@@ -168,6 +168,275 @@ void matmul_avx2(const float* A, const float* B, float* C,
 
 #endif // IS_ARM_PLATFORM
 
+// ==================== Session 51: x86 AVX2 Ultra Optimizations ====================
+// Date: 2026-02-01 18:10
+
+#if IS_X86_PLATFORM
+
+// 1. AVX2 Matrix Multiply with 8x Unrolling
+void matmul_avx2_8x_unroll(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 8;
+
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+
+        int num_vec = N / AVX_SIZE;
+        int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+
+        // Initialize output
+        for (int j = 0; j < unrolled * AVX_SIZE; j += UNROLL_FACTOR * AVX_SIZE) {
+            for (int u = 0; u < UNROLL_FACTOR; u++) {
+                _mm256_storeu_ps(&C_row[j + u * AVX_SIZE], _mm256_setzero_ps());
+            }
+        }
+        for (int j = unrolled * AVX_SIZE; j < N; j++) {
+            C_row[j] = 0.0f;
+        }
+
+        // Main loop with 8x unrolling
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+
+            // Prefetch
+            if (k + 4 < K) {
+                PREFETCH_READ(&A_row[k + 4]);
+            }
+
+            for (int j = 0; j < unrolled; j += UNROLL_FACTOR) {
+                // Load 8 AVX vectors
+                __m256 b0 = _mm256_loadu_ps(&B_k[(j + 0) * AVX_SIZE]);
+                __m256 b1 = _mm256_loadu_ps(&B_k[(j + 1) * AVX_SIZE]);
+                __m256 b2 = _mm256_loadu_ps(&B_k[(j + 2) * AVX_SIZE]);
+                __m256 b3 = _mm256_loadu_ps(&B_k[(j + 3) * AVX_SIZE]);
+                __m256 b4 = _mm256_loadu_ps(&B_k[(j + 4) * AVX_SIZE]);
+                __m256 b5 = _mm256_loadu_ps(&B_k[(j + 5) * AVX_SIZE]);
+                __m256 b6 = _mm256_loadu_ps(&B_k[(j + 6) * AVX_SIZE]);
+                __m256 b7 = _mm256_loadu_ps(&B_k[(j + 7) * AVX_SIZE]);
+
+                // Load accumulators
+                __m256 c0 = _mm256_loadu_ps(&C_row[(j + 0) * AVX_SIZE]);
+                __m256 c1 = _mm256_loadu_ps(&C_row[(j + 1) * AVX_SIZE]);
+                __m256 c2 = _mm256_loadu_ps(&C_row[(j + 2) * AVX_SIZE]);
+                __m256 c3 = _mm256_loadu_ps(&C_row[(j + 3) * AVX_SIZE]);
+                __m256 c4 = _mm256_loadu_ps(&C_row[(j + 4) * AVX_SIZE]);
+                __m256 c5 = _mm256_loadu_ps(&C_row[(j + 5) * AVX_SIZE]);
+                __m256 c6 = _mm256_loadu_ps(&C_row[(j + 6) * AVX_SIZE]);
+                __m256 c7 = _mm256_loadu_ps(&C_row[(j + 7) * AVX_SIZE]);
+
+                // FMA operations (fused multiply-add)
+                c0 = _mm256_fmadd_ps(a_val, b0, c0);
+                c1 = _mm256_fmadd_ps(a_val, b1, c1);
+                c2 = _mm256_fmadd_ps(a_val, b2, c2);
+                c3 = _mm256_fmadd_ps(a_val, b3, c3);
+                c4 = _mm256_fmadd_ps(a_val, b4, c4);
+                c5 = _mm256_fmadd_ps(a_val, b5, c5);
+                c6 = _mm256_fmadd_ps(a_val, b6, c6);
+                c7 = _mm256_fmadd_ps(a_val, b7, c7);
+
+                // Store
+                _mm256_storeu_ps(&C_row[(j + 0) * AVX_SIZE], c0);
+                _mm256_storeu_ps(&C_row[(j + 1) * AVX_SIZE], c1);
+                _mm256_storeu_ps(&C_row[(j + 2) * AVX_SIZE], c2);
+                _mm256_storeu_ps(&C_row[(j + 3) * AVX_SIZE], c3);
+                _mm256_storeu_ps(&C_row[(j + 4) * AVX_SIZE], c4);
+                _mm256_storeu_ps(&C_row[(j + 5) * AVX_SIZE], c5);
+                _mm256_storeu_ps(&C_row[(j + 6) * AVX_SIZE], c6);
+                _mm256_storeu_ps(&C_row[(j + 7) * AVX_SIZE], c7);
+            }
+        }
+    }
+}
+
+// 2. AVX2 Vectorized ReLU
+void relu_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 zero = _mm256_setzero_ps();
+
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_max_ps(vals, zero);
+        _mm256_storeu_ps(&data[i], vals);
+    }
+
+    // Handle remainder
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        data[i] = std::max(0.0f, data[i]);
+    }
+}
+
+// 3. AVX2 Vectorized GELU (7-term polynomial)
+FORCE_INLINE float gelu_avx2_poly(float x) {
+    const float a0 = 0.99999988f;
+    const float a1 = 0.99996151f;
+    const float a2 = 0.24991058f;
+    const float a3 = 0.03324052f;
+    const float a4 = 0.00358906f;
+    const float a5 = 0.00025026f;
+    const float a6 = 0.00000693f;
+
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float x4 = x2 * x2;
+    float x5 = x4 * x;
+    float x6 = x4 * x2;
+    float x7 = x6 * x;
+
+    return a0 * x - a1 * x3 / 6.0f + a2 * x5 / 120.0f - a3 * x7 / 5040.0f
+           + a4 * x2 / 24.0f - a5 * x4 / 720.0f + a6 * x6 / 40320.0f;
+}
+
+void gelu_avx2_vectorized(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        float x_vals[8];
+        _mm256_storeu_ps(x_vals, x);
+
+        for (int j = 0; j < 8 && i + j < size; j++) {
+            x_vals[j] = gelu_avx2_poly(x_vals[j]);
+        }
+
+        _mm256_storeu_ps(&data[i], _mm256_loadu_ps(x_vals));
+    }
+
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        data[i] = gelu_avx2_poly(data[i]);
+    }
+}
+
+// 4. AVX2 Hyper-Parallel Softmax
+void softmax_avx2_hyper(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+
+    // Find max (vectorized)
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        max_vec = _mm256_max_ps(max_vec, vals);
+    }
+
+    // Horizontal max reduction
+    float row_max = max_vec[0];
+    for (int i = 8; i < size; i++) {
+        row_max = std::max(row_max, data[i]);
+    }
+
+    max_vec = _mm256_set1_ps(row_max);
+
+    // Exp and sum (vectorized)
+    __m256 sum_vec = _mm256_setzero_ps();
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_sub_ps(vals, max_vec);
+        vals = _mm256_exp_ps(vals);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+        _mm256_storeu_ps(&data[i], vals);
+    }
+
+    // Horizontal sum
+    float row_sum = 0.0f;
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    for (int j = 0; j < 8; j++) {
+        row_sum += sum_arr[j];
+    }
+    for (int i = 8; i < size; i++) {
+        row_sum += data[i];
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / (row_sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_mul_ps(vals, inv_vec);
+        _mm256_storeu_ps(&data[i], vals);
+    }
+
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        data[i] *= inv_sum;
+    }
+}
+
+// 5. AVX2 Fused LayerNorm + GELU
+void fused_layernorm_gelu_avx2(float* data, const float* weight,
+                                const float* bias, int size) {
+    // Compute mean
+    __m256 sum_vec = _mm256_setzero_ps();
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+    }
+
+    float mean = 0.0f;
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    for (int j = 0; j < 8; j++) {
+        mean += sum_arr[j];
+    }
+    for (int i = 8; i < size; i++) {
+        mean += data[i];
+    }
+    mean /= size;
+
+    // Compute variance
+    __m256 mean_vec = _mm256_set1_ps(mean);
+    __m256 var_vec = _mm256_setzero_ps();
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_sub_ps(vals, mean_vec);
+        vals = _mm256_mul_ps(vals, vals);
+        var_vec = _mm256_add_ps(var_vec, vals);
+    }
+
+    float var = 0.0f;
+    _mm256_storeu_ps(sum_arr, var_vec);
+    for (int j = 0; j < 8; j++) {
+        var += sum_arr[j];
+    }
+    for (int i = 8; i < size; i++) {
+        float diff = data[i] - mean;
+        var += diff * diff;
+    }
+    var /= size;
+
+    // Normalize, apply GELU, weight, and bias
+    float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+    __m256 scale_vec = _mm256_set1_ps(inv_std);
+    __m256 w_vec = _mm256_set1_ps(weight ? weight[0] : 1.0f);
+    __m256 b_vec = _mm256_set1_ps(bias ? bias[0] : 0.0f);
+
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_sub_ps(vals, mean_vec);
+        vals = _mm256_mul_ps(vals, scale_vec);
+
+        float vals_f[8];
+        _mm256_storeu_ps(vals_f, vals);
+        for (int j = 0; j < 8 && i + j < size; j++) {
+            vals_f[j] = gelu_avx2_poly(vals_f[j]);
+        }
+        vals = _mm256_loadu_ps(vals_f);
+
+        if (weight) {
+            vals = _mm256_mul_ps(vals, w_vec);
+        }
+        if (bias) {
+            vals = _mm256_add_ps(vals, b_vec);
+        }
+
+        _mm256_storeu_ps(&data[i], vals);
+    }
+}
+
+#endif // IS_X86_PLATFORM
+
 // 2. NEON Vectorized ReLU Activation
 #if IS_ARM_PLATFORM
 
