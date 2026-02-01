@@ -1571,9 +1571,9 @@ void matmul_1bit_neon(const unsigned char* A, const unsigned char* B,
 
 // ==================== NEW: Advanced Prefetch & Cache Optimization ====================
 
-#if IS_X86_PLATFORM
+#if defined(__x86_64__) || defined(__i386__)
 
-// Multi-level blocking for L1/L2/L3 cache hierarchy
+// Multi-level blocking for L1/L2/L3 cache hierarchy (x86 AVX2)
 void matmul_multi_level_blocked(const float* A, const float* B, float* C,
                                 int M, int N, int K) {
     constexpr int L1_BLOCK = 32;
@@ -1581,33 +1581,24 @@ void matmul_multi_level_blocked(const float* A, const float* B, float* C,
     constexpr int L3_BLOCK = 512;
     constexpr int AVX_SIZE = 8;
 
-    // Process L3 blocks
     for (int i3 = 0; i3 < M; i3 += L3_BLOCK) {
         for (int j3 = 0; j3 < N; j3 += L3_BLOCK) {
             for (int k3 = 0; k3 < K; k3 += L3_BLOCK) {
-
-                // Process L2 blocks within L3
                 for (int i2 = i3; i2 < std::min(i3 + L3_BLOCK, M); i2 += L2_BLOCK) {
                     for (int j2 = j3; j2 < std::min(j3 + L3_BLOCK, N); j2 += L2_BLOCK) {
                         for (int k2 = k3; k2 < std::min(k3 + L3_BLOCK, K); k2 += L2_BLOCK) {
-
-                            // Process L1 blocks (SIMD optimized)
                             for (int i = i2; i < std::min(i2 + L2_BLOCK, M); i += L1_BLOCK) {
                                 for (int j = j2; j < std::min(j2 + L2_BLOCK, N); j += L1_BLOCK) {
                                     for (int k = k2; k < std::min(k2 + L2_BLOCK, K); k++) {
-
-                                        // Vectorized computation for L1 block
                                         const float* A_row = A + i * K;
                                         const float* B_k = B + k * N;
-
                                         int num_vec = (std::min(j + L1_BLOCK, j2 + L2_BLOCK) - j) / AVX_SIZE;
                                         for (int jj = 0; jj < num_vec; jj++) {
                                             int col = j + jj * AVX_SIZE;
                                             __m256 a = _mm256_set1_ps(A_row[k]);
                                             __m256 b = _mm256_loadu_ps(&B_k[col]);
                                             __m256 c = _mm256_loadu_ps(&C[i * N + col]);
-                                            _mm256_storeu_ps(&C[i * N + col],
-                                                             _mm256_fmadd_ps(a, b, c));
+                                            _mm256_storeu_ps(&C[i * N + col], _mm256_fmadd_ps(a, b, c));
                                         }
                                     }
                                 }
@@ -1619,6 +1610,51 @@ void matmul_multi_level_blocked(const float* A, const float* B, float* C,
         }
     }
 }
+
+#endif  // x86
+
+// ARM NEON version (always defined for ARM platforms)
+#if defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+
+void matmul_multi_level_blocked(const float* A, const float* B, float* C,
+                                int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j += NEON_SIZE) {
+            float32x4_t c_vec = vdupq_n_f32(0.0f);
+            for (int k = 0; k < K; k++) {
+                float32x4_t a_val = vdupq_n_f32(A[i * K + k]);
+                float32x4_t b_vec = vld1q_f32(&B[k * N + j]);
+                c_vec = vfmaq_f32(c_vec, a_val, b_vec);
+            }
+            vst1q_f32(&C[i * N + j], c_vec);
+        }
+    }
+}
+
+void matmul_aggressive_prefetch(const float* A, const float* B, float* C,
+                                int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+
+            for (int j = 0; j < N; j += NEON_SIZE) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j]);
+                float32x4_t c_vec = vld1q_f32(&C_row[j]);
+                vst1q_f32(&C_row[j], vfmaq_f32(c_vec, a_val, b_vec));
+            }
+        }
+    }
+}
+
+#endif  // ARM
 
 // Sequential prefetch hint
 inline void prefetch_read(const void* ptr, int distance = 3) {
