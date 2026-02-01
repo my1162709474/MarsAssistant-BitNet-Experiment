@@ -1674,11 +1674,11 @@ inline void prefetch_write(const void* ptr, int distance = 3) {
 #endif
 }
 
-// Optimized matmul with aggressive prefetching
+// Optimized matmul with aggressive prefetching - ENHANCED
 void matmul_aggressive_prefetch(const float* A, const float* B, float* C,
                                 int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
-    constexpr int PREFETCH_AHEAD = 4;
+    constexpr int PREFETCH_AHEAD = 8;  // Increased from 4 for better latency hiding
     constexpr int PREFETCH_STRIDE = 64;
 
     for (int i = 0; i < M; i++) {
@@ -1692,17 +1692,28 @@ void matmul_aggressive_prefetch(const float* A, const float* B, float* C,
         }
 
         for (int k = 0; k < K; k++) {
-            // Prefetch next A element
+            // Prefetch next A element - multi-line prefetch for better cache coverage
             if (k + PREFETCH_AHEAD < K) {
                 prefetch_read(A_row + k + PREFETCH_AHEAD);
+                if (k + PREFETCH_AHEAD + 1 < K) {
+                    prefetch_read(A_row + k + PREFETCH_AHEAD + 1);
+                }
             }
 
             __m256 a_val = _mm256_set1_ps(A_row[k]);
             const float* B_k = B + k * N;
 
-            // Prefetch next B row
+            // Prefetch next B rows - multiple ahead for bandwidth optimization
             if (k + PREFETCH_AHEAD < K) {
-                prefetch_read(B + (k + PREFETCH_AHEAD) * N, PREFETCH_STRIDE);
+                const float* B_next = B + (k + PREFETCH_AHEAD) * N;
+                prefetch_read(B_next, PREFETCH_STRIDE);
+                prefetch_read(B_next + AVX_SIZE, PREFETCH_STRIDE);
+                prefetch_read(B_next + 2 * AVX_SIZE, PREFETCH_STRIDE);
+            }
+
+            // Prefetch C row for next iteration
+            if (k + 1 < K) {
+                prefetch_write(C_row);
             }
 
             for (int j = 0; j < num_vec; j++) {
@@ -1748,14 +1759,30 @@ void matmul_multi_level_blocked(const float* A, const float* B, float* C,
 void matmul_aggressive_prefetch(const float* A, const float* B, float* C,
                                 int M, int N, int K) {
     constexpr int NEON_SIZE = 4;
+    constexpr int PREFETCH_AHEAD = 8;
 
     for (int i = 0; i < M; i++) {
         const float* A_row = A + i * K;
         float* C_row = C + i * N;
 
         for (int k = 0; k < K; k++) {
+            // Enhanced prefetch for A
+            if (k + PREFETCH_AHEAD < K) {
+                __builtin_prefetch(A_row + k + PREFETCH_AHEAD, 0, 3);
+                __builtin_prefetch(A_row + k + PREFETCH_AHEAD + 1, 0, 3);
+            }
+
             float32x4_t a_val = vdupq_n_f32(A_row[k]);
             const float* B_k = B + k * N;
+
+            // Enhanced prefetch for B
+            if (k + PREFETCH_AHEAD < K) {
+                __builtin_prefetch(B + (k + PREFETCH_AHEAD) * N, 0, 3);
+                __builtin_prefetch(B + (k + PREFETCH_AHEAD) * N + NEON_SIZE, 0, 3);
+            }
+
+            // Prefetch C
+            __builtin_prefetch(C_row, 1, 3);
 
             for (int j = 0; j < N; j += NEON_SIZE) {
                 float32x4_t b_vec = vld1q_f32(&B_k[j]);
@@ -1767,6 +1794,130 @@ void matmul_aggressive_prefetch(const float* A, const float* B, float* C,
 }
 
 #endif  // IS_X86_PLATFORM
+
+// ==================== NEW: Hyper-Optimized Double-Buffer MatMul ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Double-buffering for maximum memory throughput
+void matmul_double_buffer(const float* A, const float* B, float* C,
+                          int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 8;
+    constexpr int BUFFER_K = 4;  // Process K in chunks of 4
+
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+
+        // Double-buffered accumulators
+        __m256 c_buffers[2][64];
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_buffers[0][j] = _mm256_setzero_ps();
+            c_buffers[1][j] = _mm256_setzero_ps();
+        }
+
+        int buf_idx = 0;
+        int k = 0;
+
+        for (; k + BUFFER_K < K; k += BUFFER_K) {
+            // Prefetch next A block
+            if (k + BUFFER_K + PREFETCH_DIST < K) {
+                prefetch_read(A_row + k + BUFFER_K + PREFETCH_DIST);
+            }
+
+            // Prefetch next B blocks
+            for (int bk = 0; bk < BUFFER_K; bk++) {
+                if (k + bk + PREFETCH_DIST < K) {
+                    prefetch_read(B + (k + bk + PREFETCH_DIST) * N);
+                }
+            }
+
+            // Process current buffer
+            for (int bk = 0; bk < BUFFER_K; bk++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k + bk]);
+                const float* B_k = B + (k + bk) * N;
+
+                for (int j = 0; j < num_vec; j++) {
+                    __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                    c_buffers[buf_idx][j] = _mm256_fmadd_ps(a_val, b_vec, c_buffers[buf_idx][j]);
+                }
+            }
+
+            // Switch buffer
+            buf_idx ^= 1;
+
+            // Clear next buffer
+            if (k + BUFFER_K < K) {
+                for (int j = 0; j < num_vec; j++) {
+                    c_buffers[buf_idx][j] = _mm256_setzero_ps();
+                }
+            }
+        }
+
+        // Process remaining elements
+        for (; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_buffers[buf_idx][j] = _mm256_fmadd_ps(a_val, b_vec, c_buffers[buf_idx][j]);
+            }
+        }
+
+        // Combine buffers if needed and store
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_buffers[0][j]);
+        }
+    }
+}
+
+#endif  // x86
+
+// ==================== NEW: Ultra-Fast Scale and Add (FMA fusion) ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Fused scale + add with minimal memory traffic
+FORCE_INLINE void scale_add_fused(float* RESTRICT dst,
+                                   const float* RESTRICT src,
+                                   float scale, int size) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 scale_vec = _mm256_set1_ps(scale);
+
+    int i = 0;
+    // Process 4 AVX vectors (32 floats) per iteration for maximum throughput
+    for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+        __m256 s0 = _mm256_loadu_ps(&src[i]);
+        __m256 s1 = _mm256_loadu_ps(&src[i + AVX_SIZE]);
+        __m256 s2 = _mm256_loadu_ps(&src[i + AVX_SIZE * 2]);
+        __m256 s3 = _mm256_loadu_ps(&src[i + AVX_SIZE * 3]);
+
+        __m256 d0 = _mm256_loadu_ps(&dst[i]);
+        __m256 d1 = _mm256_loadu_ps(&dst[i + AVX_SIZE]);
+        __m256 d2 = _mm256_loadu_ps(&dst[i + AVX_SIZE * 2]);
+        __m256 d3 = _mm256_loadu_ps(&dst[i + AVX_SIZE * 3]);
+
+        d0 = _mm256_fmadd_ps(s0, scale_vec, d0);
+        d1 = _mm256_fmadd_ps(s1, scale_vec, d1);
+        d2 = _mm256_fmadd_ps(s2, scale_vec, d2);
+        d3 = _mm256_fmadd_ps(s3, scale_vec, d3);
+
+        _mm256_storeu_ps(&dst[i], d0);
+        _mm256_storeu_ps(&dst[i + AVX_SIZE], d1);
+        _mm256_storeu_ps(&dst[i + AVX_SIZE * 2], d2);
+        _mm256_storeu_ps(&dst[i + AVX_SIZE * 3], d3);
+    }
+
+    // Remainder
+    for (; i < size; i++) {
+        dst[i] += src[i] * scale;
+    }
+}
+
+#endif  // x86
 
 // ==================== NEW: Thread Affinity & NUMA Optimization ====================
 
