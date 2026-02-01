@@ -15252,5 +15252,368 @@ FORCE_INLINE void relu_ultra(float* data, int size) {
 }
 
 // ============================================================================
-// End of Session 40 Optimizations
+// Session 41: Ultimate Operator Fusion & Memory Subgraph Optimization
+// ============================================================================
+
+// ============================================================================
+// Ultimate Fused Multi-Head Attention (Q*K^T + softmax + V)
+// Single-pass: all operations fused into one kernel
+// ============================================================================
+
+FORCE_INLINE void fused_multi_head_attention(
+    const float* Q,           // [batch, num_heads, seq_len, head_dim]
+    const float* K,           // [batch, num_heads, seq_len, head_dim]
+    const float* V,           // [batch, num_heads, seq_len, head_dim]
+    float* output,            // [batch, num_heads, seq_len, head_dim]
+    float* attention_scores,  // [batch, num_heads, seq_len, seq_len] (scratch)
+    int batch, int num_heads, int seq_len, int head_dim) {
+    
+    constexpr int AVX_SIZE = 8;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const __m256 scale_vec = _mm256_set1_ps(scale);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 neg_inf = _mm256_set1_ps(-1e30f);
+    
+    for (int b = 0; b < batch; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q + (b * num_heads + h) * seq_len * head_dim;
+            const float* K_head = K + (b * num_heads + h) * seq_len * head_dim;
+            const float* V_head = V + (b * num_heads + h) * seq_len * head_dim;
+            float* O_head = output + (b * num_heads + h) * seq_len * head_dim;
+            float* S_head = attention_scores + (b * num_heads + h) * seq_len * seq_len;
+            
+            // Compute Q * K^T with scaling
+            for (int qi = 0; qi < seq_len; qi++) {
+                const float* Q_row = Q_head + qi * head_dim;
+                float* S_row = S_head + qi * seq_len;
+                
+                // Compute attention scores
+                for (int kj = 0; kj < seq_len; kj++) {
+                    const float* K_row = K_head + kj * head_dim;
+                    
+                    // Dot product with AVX2
+                    __m256 dot_prod = _mm256_setzero_ps();
+                    for (int d = 0; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
+                        __m256 q_vec = _mm256_loadu_ps(&Q_row[d]);
+                        __m256 k_vec = _mm256_loadu_ps(&K_row[d]);
+                        dot_prod = _mm256_fmadd_ps(q_vec, k_vec, dot_prod);
+                    }
+                    
+                    // Horizontal sum
+                    float score = _mm256_reduce_add_ps(dot_prod);
+                    for (int d = head_dim - (head_dim % AVX_SIZE); d < head_dim; d++) {
+                        score += Q_row[d] * K_row[d];
+                    }
+                    
+                    S_row[kj] = score * scale;
+                }
+                
+                // Softmax (in-place, fused)
+                __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+                for (int kj = 0; kj + AVX_SIZE <= seq_len; kj += AVX_SIZE) {
+                    __m256 s_vec = _mm256_loadu_ps(&S_row[kj]);
+                    max_vec = _mm256_max_ps(max_vec, s_vec);
+                }
+                float row_max = _mm256_reduce_max_ps(max_vec);
+                for (int kj = seq_len - (seq_len % AVX_SIZE); kj < seq_len; kj++) {
+                    row_max = std::max(row_max, S_row[kj]);
+                }
+                
+                // exp and sum
+                __m256 sum_vec = _mm256_setzero_ps();
+                __m256 max_broadcast = _mm256_set1_ps(row_max);
+                for (int kj = 0; kj + AVX_SIZE <= seq_len; kj += AVX_SIZE) {
+                    __m256 s_vec = _mm256_loadu_ps(&S_row[kj]);
+                    s_vec = _mm256_sub_ps(s_vec, max_broadcast);
+                    s_vec = _mm256_exp_ps(s_vec);
+                    sum_vec = _mm256_add_ps(sum_vec, s_vec);
+                    _mm256_storeu_ps(&S_row[kj], s_vec);
+                }
+                float row_sum = _mm256_reduce_add_ps(sum_vec);
+                for (int kj = seq_len - (seq_len % AVX_SIZE); kj < seq_len; kj++) {
+                    S_row[kj] = std::exp(S_row[kj] - row_max);
+                    row_sum += S_row[kj];
+                }
+                
+                // Normalize
+                float inv_sum = 1.0f / (row_sum + 1e-8f);
+                __m256 inv_vec = _mm256_set1_ps(inv_sum);
+                for (int kj = 0; kj + AVX_SIZE <= seq_len; kj += AVX_SIZE) {
+                    __m256 s_vec = _mm256_loadu_ps(&S_row[kj]);
+                    s_vec = _mm256_mul_ps(s_vec, inv_vec);
+                    _mm256_storeu_ps(&S_row[kj], s_vec);
+                }
+                for (int kj = seq_len - (seq_len % AVX_SIZE); kj < seq_len; kj++) {
+                    S_row[kj] *= inv_sum;
+                }
+                
+                // Compute output: S * V (single pass)
+                float* O_row = O_head + qi * head_dim;
+                std::memset(O_row, 0, head_dim * sizeof(float));
+                
+                for (int kj = 0; kj < seq_len; kj++) {
+                    const float* V_row = V_head + kj * head_dim;
+                    float attn_score = S_row[kj];
+                    
+                    // Fused multiply-add
+                    for (int d = 0; d + AVX_SIZE <= head_dim; d += AVX_SIZE) {
+                        __m256 o_vec = _mm256_loadu_ps(&O_row[d]);
+                        __m256 v_vec = _mm256_loadu_ps(&V_row[d]);
+                        __m256 a_vec = _mm256_set1_ps(attn_score);
+                        o_vec = _mm256_fmadd_ps(a_vec, v_vec, o_vec);
+                        _mm256_storeu_ps(&O_row[d], o_vec);
+                    }
+                    for (int d = head_dim - (head_dim % AVX_SIZE); d < head_dim; d++) {
+                        O_row[d] += attn_score * V_row[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Memory Subgraph Optimization: Fused Copy + Scale + Add + Clamp
+// ============================================================================
+
+FORCE_INLINE void memory_fused_copy_scale_add_clamp(
+    float* RESTRICT out,
+    const float* RESTRICT in1,
+    const float* RESTRICT in2,
+    float scale1, float scale2,
+    float min_val, float max_val,
+    int size) {
+    
+    constexpr int AVX_SIZE = 8;
+    const __m256 scale1_vec = _mm256_set1_ps(scale1);
+    const __m256 scale2_vec = _mm256_set1_ps(scale2);
+    const __m256 min_vec = _mm256_set1_ps(min_val);
+    const __m256 max_vec = _mm256_set1_ps(max_val);
+    
+    int i = 0;
+    // 4x unrolling for maximum throughput
+    for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+        __m256 i1_0 = _mm256_loadu_ps(&in1[i]);
+        __m256 i1_1 = _mm256_loadu_ps(&in1[i + AVX_SIZE]);
+        __m256 i1_2 = _mm256_loadu_ps(&in1[i + AVX_SIZE * 2]);
+        __m256 i1_3 = _mm256_loadu_ps(&in1[i + AVX_SIZE * 3]);
+        
+        __m256 i2_0 = _mm256_loadu_ps(&in2[i]);
+        __m256 i2_1 = _mm256_loadu_ps(&in2[i + AVX_SIZE]);
+        __m256 i2_2 = _mm256_loadu_ps(&in2[i + AVX_SIZE * 2]);
+        __m256 i2_3 = _mm256_loadu_ps(&in2[i + AVX_SIZE * 3]);
+        
+        __m256 o0 = _mm256_fmadd_ps(i1_0, scale1_vec, _mm256_mul_ps(i2_0, scale2_vec));
+        __m256 o1 = _mm256_fmadd_ps(i1_1, scale1_vec, _mm256_mul_ps(i2_1, scale2_vec));
+        __m256 o2 = _mm256_fmadd_ps(i1_2, scale1_vec, _mm256_mul_ps(i2_2, scale2_vec));
+        __m256 o3 = _mm256_fmadd_ps(i1_3, scale1_vec, _mm256_mul_ps(i2_3, scale2_vec));
+        
+        o0 = _mm256_min_ps(_mm256_max_ps(o0, min_vec), max_vec);
+        o1 = _mm256_min_ps(_mm256_max_ps(o1, min_vec), max_vec);
+        o2 = _mm256_min_ps(_mm256_max_ps(o2, min_vec), max_vec);
+        o3 = _mm256_min_ps(_mm256_max_ps(o3, min_vec), max_vec);
+        
+        _mm256_storeu_ps(&out[i], o0);
+        _mm256_storeu_ps(&out[i + AVX_SIZE], o1);
+        _mm256_storeu_ps(&out[i + AVX_SIZE * 2], o2);
+        _mm256_storeu_ps(&out[i + AVX_SIZE * 3], o3);
+    }
+    
+    // Remainder
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 i1 = _mm256_loadu_ps(&in1[i]);
+        __m256 i2 = _mm256_loadu_ps(&in2[i]);
+        __m256 o = _mm256_fmadd_ps(i1, scale1_vec, _mm256_mul_ps(i2, scale2_vec));
+        o = _mm256_min_ps(_mm256_max_ps(o, min_vec), max_vec);
+        _mm256_storeu_ps(&out[i], o);
+    }
+    for (; i < size; i++) {
+        out[i] = std::clamp(in1[i] * scale1 + in2[i] * scale2, min_val, max_val);
+    }
+}
+
+// ============================================================================
+// Ultra-Optimized Gather/Scatter for Strided Access Patterns
+// ============================================================================
+
+FORCE_INLINE void gather_floats_avx2(float* RESTRICT dest,
+                                     const float* RESTRICT src,
+                                     const int* RESTRICT indices,
+                                     int count) {
+    constexpr int AVX_SIZE = 8;
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= count; i += AVX_SIZE) {
+        // Gather 8 elements using mask-based approach
+        __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&indices[i]));
+        
+        // Manual gather since AVX2 gather is slow on many CPUs
+        float vals[AVX_SIZE];
+        for (int j = 0; j < AVX_SIZE; j++) {
+            vals[j] = src[indices[i + j]];
+        }
+        __m256 gathered = _mm256_loadu_ps(vals);
+        _mm256_storeu_ps(&dest[i], gathered);
+    }
+    for (; i < count; i++) {
+        dest[i] = src[indices[i]];
+    }
+}
+
+FORCE_INLINE void scatter_floats_avx2(float* RESTRICT dest,
+                                      const float* RESTRICT src,
+                                      const int* RESTRICT indices,
+                                      int count) {
+    constexpr int AVX_SIZE = 8;
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= count; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&src[i]);
+        for (int j = 0; j < AVX_SIZE; j++) {
+            dest[indices[i + j]] = vals[j];
+        }
+    }
+    for (; i < count; i++) {
+        dest[indices[i]] = src[i];
+    }
+}
+
+// ============================================================================
+// Hyper-Parallel Reduction with Tree-Based Algorithm
+// ============================================================================
+
+FORCE_INLINE float parallel_reduction_hyper(const float* data, int size, int num_threads) {
+    if (size <= 0) return 0.0f;
+    if (size == 1) return data[0];
+    
+    // Round up to power of 2 for efficient tree reduction
+    int n = 1;
+    while (n < size) n <<= 1;
+    
+    // First level: parallel reduction by threads
+    int chunk_size = (size + num_threads - 1) / num_threads;
+    float* partial_sums = new float[std::max(num_threads, n)];
+    
+    // Thread-local reduction
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; t++) {
+        threads.emplace_back([&data, &partial_sums, t, chunk_size, size, n]() {
+            float local_sum = 0.0f;
+            int start = t * chunk_size;
+            int end = std::min(start + chunk_size, size);
+            
+            for (int i = start; i < end; i++) {
+                local_sum += data[i];
+            }
+            partial_sums[t] = local_sum;
+            
+            // Fill remaining with zeros for power-of-2 alignment
+            for (int i = size + t * chunk_size; i < n; i += num_threads) {
+                partial_sums[i] = 0.0f;
+            }
+        });
+    }
+    
+    for (auto& th : threads) th.join();
+    
+    // Tree reduction on partial sums
+    // Combine: 4-way reduction for better cache efficiency
+    while (n > 1) {
+        int half = n / 2;
+        for (int i = 0; i < half; i++) {
+            partial_sums[i] = partial_sums[i] + partial_sums[i + half];
+        }
+        n = half;
+    }
+    
+    float result = partial_sums[0];
+    delete[] partial_sums;
+    return result;
+}
+
+// ============================================================================
+// Fused LayerNorm + GELU + Residual (3-way fusion)
+// ============================================================================
+
+FORCE_INLINE void fused_layernorm_gelu_residual(
+    float* RESTRICT output,
+    const float* RESTRICT input,
+    const float* RESTRICT residual,
+    const float* RESTRICT gamma,
+    const float* RESTRICT beta,
+    float eps, int size) {
+    
+    constexpr int AVX_SIZE = 8;
+    
+    // Phase 1: Compute mean (input + residual)
+    float mean = 0.0f;
+    for (int i = 0; i < size; i++) {
+        mean += input[i] + residual[i];
+    }
+    mean /= size;
+    
+    // Phase 2: Compute variance and fused GELU
+    float var = 0.0f;
+    for (int i = 0; i < size; i++) {
+        float x = input[i] + residual[i] - mean;
+        float gelu = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
+        output[i] = gelu;
+        float diff = x * x;
+        var += diff;
+    }
+    
+    var = var / size + eps;
+    float inv_std = 1.0f / std::sqrt(var);
+    
+    // Phase 3: Apply LayerNorm
+    const __m256 inv_std_vec = _mm256_set1_ps(inv_std);
+    const __m256 gamma_vec = _mm256_set1_ps(gamma ? gamma[0] : 1.0f);
+    const __m256 beta_vec = _mm256_set1_ps(beta ? beta[0] : 0.0f);
+    
+    int i = 0;
+    for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+        // Load, normalize, and store (fused)
+        __m256 g0 = _mm256_loadu_ps(&output[i]);
+        __m256 g1 = _mm256_loadu_ps(&output[i + AVX_SIZE]);
+        __m256 g2 = _mm256_loadu_ps(&output[i + AVX_SIZE * 2]);
+        __m256 g3 = _mm256_loadu_ps(&output[i + AVX_SIZE * 3]);
+        
+        // Subtract mean and normalize
+        __m256 m0 = _mm256_set1_ps(mean);
+        g0 = _mm256_sub_ps(g0, m0);
+        g1 = _mm256_sub_ps(g1, m0);
+        g2 = _mm256_sub_ps(g2, m0);
+        g3 = _mm256_sub_ps(g3, m0);
+        
+        g0 = _mm256_mul_ps(g0, inv_std_vec);
+        g1 = _mm256_mul_ps(g1, inv_std_vec);
+        g2 = _mm256_mul_ps(g2, inv_std_vec);
+        g3 = _mm256_mul_ps(g3, inv_std_vec);
+        
+        // Apply gamma and beta
+        if (gamma && beta) {
+            for (int j = 0; j < AVX_SIZE * 4; j++) {
+                output[i + j] = (output[i + j] - mean) * inv_std * gamma[j % size] + beta[j % size];
+            }
+        } else {
+            _mm256_storeu_ps(&output[i], _mm256_mul_ps(g0, gamma_vec));
+            _mm256_storeu_ps(&output[i + AVX_SIZE], _mm256_mul_ps(g1, gamma_vec));
+            _mm256_storeu_ps(&output[i + AVX_SIZE * 2], _mm256_mul_ps(g2, gamma_vec));
+            _mm256_storeu_ps(&output[i + AVX_SIZE * 3], _mm256_mul_ps(g3, gamma_vec));
+        }
+    }
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 g = _mm256_loadu_ps(&output[i]);
+        g = _mm256_sub_ps(g, _mm256_set1_ps(mean));
+        g = _mm256_mul_ps(g, inv_std_vec);
+        g = _mm256_mul_ps(g, gamma_vec);
+        _mm256_storeu_ps(&output[i], g);
+    }
+    for (; i < size; i++) {
+        output[i] = (output[i] - mean) * inv_std * (gamma ? gamma[i] : 1.0f) + (beta ? beta[i] : 0.0f);
+    }
+}
+
+// ============================================================================
+// End of Session 41 Optimizations
 // ============================================================================
