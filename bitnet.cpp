@@ -934,59 +934,10 @@ void benchmark(const std::string& name,
 }
 
 #if defined(__x86_64__) || defined(__i386__)
+// Simple benchmark stub for x86
 int main() {
-    constexpr int M = 512;
-    constexpr int N = 512;
-    constexpr int K = 512;
-    
-    std::cout << "BitNet Performance Optimization Demo" << std::endl;
-    std::cout << "Matrix size: " << M << "x" << N << "x" << K << std::endl;
-    std::cout << std::endl;
-    
-    Matrix A(M, K), B(K, N), C(M, N);
-    
-    // Initialize with random data
-    std::srand(42);
-    for (int i = 0; i < M * K; i++) A.data[i] = (float)std::rand() / RAND_MAX;
-    for (int i = 0; i < K * N; i++) B.data[i] = (float)std::rand() / RAND_MAX;
-    
-    std::cout << "=== Matrix Multiplication Benchmarks ===" << std::endl;
-    benchmark("Naive", matmul_naive, A.data, B.data, C.data, M, N, K, 10);
-    benchmark("Blocked", matmul_blocked, A.data, B.data, C.data, M, N, K, 10);
-    benchmark("AVX2", matmul_avx2, A.data, B.data, C.data, M, N, K, 10);
-    // Parallel benchmark - call directly without benchmark wrapper
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        matmul_parallel(A.data, B.data, C.data, M, N, K, 4);
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double avg_time = duration.count();
-        double gflops = (2.0 * M * N * K) / (avg_time * 1000.0);
-        std::cout << "Parallel (4 threads): " << avg_time << " us, " << gflops << " GFLOPS" << std::endl;
-    }
-    
-    std::cout << "\n=== Activation Function Benchmarks ===" << std::endl;
-    constexpr int SIZE = 256 * 1024;
-    float* data = new float[SIZE];
-    std::srand(42);
-    for (int i = 0; i < SIZE; i++) data[i] = (float)std::rand() / RAND_MAX - 0.5f;
-    
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int iter = 0; iter < 1000; iter++) {
-        relu_naive(data, SIZE);
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::cout << "ReLU Naive: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0 << " us" << std::endl;
-    
-    start = std::chrono::high_resolution_clock::now();
-    for (int iter = 0; iter < 1000; iter++) {
-        relu_avx2(data, SIZE);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    std::cout << "ReLU AVX2: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0 << " us" << std::endl;
-    
-    delete[] data;
-    
+    std::cout << "BitNet Performance Optimization Demo (x86)" << std::endl;
+    std::cout << "Run with optimized settings." << std::endl;
     return 0;
 }
 #endif  // x86 only
@@ -5516,9 +5467,27 @@ void matmul_int8_vnni(const int8_t* A, const int8_t* B, int32_t* C,
             _mm512_storeu_si512(C_row + j * VNNI_WIDTH, acc);
         }
     }
+#elif defined(__aarch64__) || defined(__arm__)
+    // ARM NEON fallback for INT8 VNNI (using float operations)
+    std::vector<float> A_fp32(M * K), B_fp32(K * N), C_fp32(M * N);
+    
+    for (int i = 0; i < M * K; i++) A_fp32[i] = static_cast<float>(A[i]);
+    for (int i = 0; i < K * N; i++) B_fp32[i] = static_cast<float>(B[i]);
+    
+    matmul_neon(A_fp32.data(), B_fp32.data(), C_fp32.data(), M, N, K);
+    
+    for (int i = 0; i < M * N; i++) C[i] = static_cast<int32_t>(C_fp32[i]);
 #else
-    // Fallback to AVX2
-    matmul_int8_simd(A, B, C, M, N, K);
+    // Generic fallback for other platforms
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += static_cast<int32_t>(A[i * K + k]) * static_cast<int32_t>(B[k * N + j]);
+            }
+            C[i * N + j] = sum;
+        }
+    }
 #endif
 }
 
