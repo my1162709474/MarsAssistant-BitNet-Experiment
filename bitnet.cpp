@@ -14214,3 +14214,339 @@ void matmul_dynamic_batch(const float* A, const float* B, float* C,
 #endif
 
 // ==================== End of Session 37 ====================
+
+// ============================================================================
+// Session 38: Ultra-Advanced Optimizations (2026-02-01 11:23)
+// ============================================================================
+
+// 64x Ultra Loop Unrolling for maximum ILP
+void matmul_64x_unroll_ultra(const float* A, const float* B, float* C,
+                              int M, int N, int K) {
+#if defined(__AVX2__)
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 8;  // 8 AVX vectors = 64 floats per iteration
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / AVX_SIZE;
+        int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+        
+        __m256 acc[UNROLL_FACTOR];
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            acc[u] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                // Load 8 AVX vectors (64 floats)
+                __m256 b0 = _mm256_load_ps(&B_k[(u + 0) * AVX_SIZE]);
+                __m256 b1 = _mm256_load_ps(&B_k[(u + 1) * AVX_SIZE]);
+                __m256 b2 = _mm256_load_ps(&B_k[(u + 2) * AVX_SIZE]);
+                __m256 b3 = _mm256_load_ps(&B_k[(u + 3) * AVX_SIZE]);
+                __m256 b4 = _mm256_load_ps(&B_k[(u + 4) * AVX_SIZE]);
+                __m256 b5 = _mm256_load_ps(&B_k[(u + 5) * AVX_SIZE]);
+                __m256 b6 = _mm256_load_ps(&B_k[(u + 6) * AVX_SIZE]);
+                __m256 b7 = _mm256_load_ps(&B_k[(u + 7) * AVX_SIZE]);
+                
+                // FMA operations
+                acc[0] = _mm256_fmadd_ps(a_val, b0, acc[0]);
+                acc[1] = _mm256_fmadd_ps(a_val, b1, acc[1]);
+                acc[2] = _mm256_fmadd_ps(a_val, b2, acc[2]);
+                acc[3] = _mm256_fmadd_ps(a_val, b3, acc[3]);
+                acc[4] = _mm256_fmadd_ps(a_val, b4, acc[4]);
+                acc[5] = _mm256_fmadd_ps(a_val, b5, acc[5]);
+                acc[6] = _mm256_fmadd_ps(a_val, b6, acc[6]);
+                acc[7] = _mm256_fmadd_ps(a_val, b7, acc[7]);
+            }
+        }
+        
+        // Store results
+        for (int u = 0; u < unrolled; u++) {
+            _mm256_store_ps(&C_row[u * AVX_SIZE], acc[u]);
+        }
+    }
+#elif defined(__ARM_NEON)
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL_FACTOR = 16;  // 16 NEON vectors = 64 floats
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / NEON_SIZE;
+        int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+        
+        float32x4_t acc[UNROLL_FACTOR];
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            acc[u] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                // Load 16 NEON vectors (64 floats)
+                float32x4_t b0 = vld1q_f32(&B_k[(u + 0) * NEON_SIZE]);
+                float32x4_t b1 = vld1q_f32(&B_k[(u + 1) * NEON_SIZE]);
+                float32x4_t b2 = vld1q_f32(&B_k[(u + 2) * NEON_SIZE]);
+                float32x4_t b3 = vld1q_f32(&B_k[(u + 3) * NEON_SIZE]);
+                float32x4_t b4 = vld1q_f32(&B_k[(u + 4) * NEON_SIZE]);
+                float32x4_t b5 = vld1q_f32(&B_k[(u + 5) * NEON_SIZE]);
+                float32x4_t b6 = vld1q_f32(&B_k[(u + 6) * NEON_SIZE]);
+                float32x4_t b7 = vld1q_f32(&B_k[(u + 7) * NEON_SIZE]);
+                float32x4_t b8 = vld1q_f32(&B_k[(u + 8) * NEON_SIZE]);
+                float32x4_t b9 = vld1q_f32(&B_k[(u + 9) * NEON_SIZE]);
+                float32x4_t b10 = vld1q_f32(&B_k[(u + 10) * NEON_SIZE]);
+                float32x4_t b11 = vld1q_f32(&B_k[(u + 11) * NEON_SIZE]);
+                float32x4_t b12 = vld1q_f32(&B_k[(u + 12) * NEON_SIZE]);
+                float32x4_t b13 = vld1q_f32(&B_k[(u + 13) * NEON_SIZE]);
+                float32x4_t b14 = vld1q_f32(&B_k[(u + 14) * NEON_SIZE]);
+                float32x4_t b15 = vld1q_f32(&B_k[(u + 15) * NEON_SIZE]);
+                
+                // FMA operations
+                acc[0] = vfmaq_f32(acc[0], a_val, b0);
+                acc[1] = vfmaq_f32(acc[1], a_val, b1);
+                acc[2] = vfmaq_f32(acc[2], a_val, b2);
+                acc[3] = vfmaq_f32(acc[3], a_val, b3);
+                acc[4] = vfmaq_f32(acc[4], a_val, b4);
+                acc[5] = vfmaq_f32(acc[5], a_val, b5);
+                acc[6] = vfmaq_f32(acc[6], a_val, b6);
+                acc[7] = vfmaq_f32(acc[7], a_val, b7);
+                acc[8] = vfmaq_f32(acc[8], a_val, b8);
+                acc[9] = vfmaq_f32(acc[9], a_val, b9);
+                acc[10] = vfmaq_f32(acc[10], a_val, b10);
+                acc[11] = vfmaq_f32(acc[11], a_val, b11);
+                acc[12] = vfmaq_f32(acc[12], a_val, b12);
+                acc[13] = vfmaq_f32(acc[13], a_val, b13);
+                acc[14] = vfmaq_f32(acc[14], a_val, b14);
+                acc[15] = vfmaq_f32(acc[15], a_val, b15);
+            }
+        }
+        
+        for (int u = 0; u < unrolled; u++) {
+            vst1q_f32(&C_row[u * NEON_SIZE], acc[u]);
+        }
+    }
+#else
+    // Scalar fallback
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+#endif
+}
+
+// Ultra-fast memory copy with SIMD
+void memcpy_ultra_simd(void* dst, const void* src, size_t size) {
+#if defined(__AVX2__)
+    constexpr size_t AVX_ALIGN = 32;
+    const char* src_ptr = static_cast<const char*>(src);
+    char* dst_ptr = static_cast<char*>(dst);
+    
+    // Align to 32 bytes
+    size_t prefix = (AVX_ALIGN - (reinterpret_cast<uintptr_t>(src_ptr) & (AVX_ALIGN - 1))) & (AVX_ALIGN - 1);
+    prefix = std::min(prefix, size);
+    
+    // Copy prefix with bytes
+    for (size_t i = 0; i < prefix; i++) {
+        dst_ptr[i] = src_ptr[i];
+    }
+    
+    size_t remaining = size - prefix;
+    size_t num_avx = remaining / AVX_ALIGN;
+    
+    // Copy with AVX
+    for (size_t i = 0; i < num_avx; i++) {
+        __m256i data = _mm256_load_si256(reinterpret_cast<const __m256i*>(src_ptr + prefix + i * AVX_ALIGN));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst_ptr + prefix + i * AVX_ALIGN), data);
+    }
+    
+    // Copy suffix
+    size_t suffix_start = prefix + num_avx * AVX_ALIGN;
+    for (size_t i = suffix_start; i < size; i++) {
+        dst_ptr[i] = src_ptr[i];
+    }
+#elif defined(__ARM_NEON)
+    constexpr size_t NEON_ALIGN = 16;
+    const char* src_ptr = static_cast<const char*>(src);
+    char* dst_ptr = static_cast<char*>(dst);
+    
+    size_t prefix = (NEON_ALIGN - (reinterpret_cast<uintptr_t>(src_ptr) & (NEON_ALIGN - 1))) & (NEON_ALIGN - 1);
+    prefix = std::min(prefix, size);
+    
+    for (size_t i = 0; i < prefix; i++) {
+        dst_ptr[i] = src_ptr[i];
+    }
+    
+    size_t remaining = size - prefix;
+    size_t num_neon = remaining / NEON_ALIGN;
+    
+    for (size_t i = 0; i < num_neon; i++) {
+        uint8x16_t data = vld1q_u8(reinterpret_cast<const uint8_t*>(src_ptr + prefix + i * NEON_ALIGN));
+        vst1q_u8(reinterpret_cast<uint8_t*>(dst_ptr + prefix + i * NEON_ALIGN), data);
+    }
+    
+    size_t suffix_start = prefix + num_neon * NEON_ALIGN;
+    for (size_t i = suffix_start; i < size; i++) {
+        dst_ptr[i] = src_ptr[i];
+    }
+#else
+    std::memcpy(dst, src, size);
+#endif
+}
+
+// Ultra-fast memset with SIMD
+void memset_ultra_simd(void* ptr, int value, size_t size) {
+#if defined(__AVX2__)
+    constexpr size_t AVX_ALIGN = 32;
+    char* dst_ptr = static_cast<char*>(ptr);
+    
+    size_t prefix = (AVX_ALIGN - (reinterpret_cast<uintptr_t>(dst_ptr) & (AVX_ALIGN - 1))) & (AVX_ALIGN - 1);
+    prefix = std::min(prefix, size);
+    
+    for (size_t i = 0; i < prefix; i++) {
+        dst_ptr[i] = static_cast<char>(value);
+    }
+    
+    size_t remaining = size - prefix;
+    size_t num_avx = remaining / AVX_ALIGN;
+    __m256i val_vec = _mm256_set1_epi8(static_cast<char>(value));
+    
+    for (size_t i = 0; i < num_avx; i++) {
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst_ptr + prefix + i * AVX_ALIGN), val_vec);
+    }
+    
+    size_t suffix_start = prefix + num_avx * AVX_ALIGN;
+    for (size_t i = suffix_start; i < size; i++) {
+        dst_ptr[i] = static_cast<char>(value);
+    }
+#elif defined(__ARM_NEON)
+    constexpr size_t NEON_ALIGN = 16;
+    char* dst_ptr = static_cast<char*>(ptr);
+    
+    size_t prefix = (NEON_ALIGN - (reinterpret_cast<uintptr_t>(dst_ptr) & (NEON_ALIGN - 1))) & (NEON_ALIGN - 1);
+    prefix = std::min(prefix, size);
+    
+    for (size_t i = 0; i < prefix; i++) {
+        dst_ptr[i] = static_cast<char>(value);
+    }
+    
+    size_t remaining = size - prefix;
+    size_t num_neon = remaining / NEON_ALIGN;
+    uint8x16_t val_vec = vdupq_n_u8(static_cast<uint8_t>(value));
+    
+    for (size_t i = 0; i < num_neon; i++) {
+        vst1q_u8(reinterpret_cast<uint8_t*>(dst_ptr + prefix + i * NEON_ALIGN), val_vec);
+    }
+    
+    size_t suffix_start = prefix + num_neon * NEON_ALIGN;
+    for (size_t i = suffix_start; i < size; i++) {
+        dst_ptr[i] = static_cast<char>(value);
+    }
+#else
+    std::memset(ptr, value, size);
+#endif
+}
+
+// Vectorized clamp with AVX2/NEON
+void clamp_ultra_simd(float* data, int size, float min_val, float max_val) {
+#if defined(__AVX2__)
+    constexpr int AVX_SIZE = 8;
+    __m256 min_vec = _mm256_set1_ps(min_val);
+    __m256 max_vec = _mm256_set1_ps(max_val);
+    
+    int num_avx = size / AVX_SIZE;
+    for (int i = 0; i < num_avx; i++) {
+        __m256 val = _mm256_load_ps(data + i * AVX_SIZE);
+        val = _mm256_max_ps(min_vec, _mm256_min_ps(max_vec, val));
+        _mm256_store_ps(data + i * AVX_SIZE, val);
+    }
+    
+    for (int i = num_avx * AVX_SIZE; i < size; i++) {
+        data[i] = std::max(min_val, std::min(max_val, data[i]));
+    }
+#elif defined(__ARM_NEON)
+    constexpr int NEON_SIZE = 4;
+    float32x4_t min_vec = vdupq_n_f32(min_val);
+    float32x4_t max_vec = vdupq_n_f32(max_val);
+    
+    int num_neon = size / NEON_SIZE;
+    for (int i = 0; i < num_neon; i++) {
+        float32x4_t val = vld1q_f32(data + i * NEON_SIZE);
+        val = vmaxq_f32(min_vec, vminq_f32(max_vec, val));
+        vst1q_f32(data + i * NEON_SIZE, val);
+    }
+    
+    for (int i = num_neon * NEON_SIZE; i < size; i++) {
+        data[i] = std::max(min_val, std::min(max_val, data[i]));
+    }
+#else
+    for (int i = 0; i < size; i++) {
+        data[i] = std::max(min_val, std::min(max_val, data[i]));
+    }
+#endif
+}
+
+// Optimized sum reduction with SIMD
+float sum_reduction_ultra(const float* data, int size) {
+#if defined(__AVX2__)
+    constexpr int AVX_SIZE = 8;
+    __m256 sum_vec = _mm256_setzero_ps();
+    
+    int num_avx = size / AVX_SIZE;
+    for (int i = 0; i < num_avx; i++) {
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_load_ps(data + i * AVX_SIZE));
+    }
+    
+    // Horizontal sum
+    __m128 sum_high = _mm256_extractf128_ps(sum_vec, 1);
+    __m128 sum_low = _mm256_castps256_ps128(sum_vec);
+    __m128 sum = _mm_add_ps(sum_high, sum_low);
+    
+    float result = _mm_cvtss_f32(_mm_add_ss(sum, _mm_movehl_ps(sum, sum)));
+    
+    for (int i = num_avx * AVX_SIZE; i < size; i++) {
+        result += data[i];
+    }
+    
+    return result;
+#elif defined(__ARM_NEON)
+    constexpr int NEON_SIZE = 4;
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    
+    int num_neon = size / NEON_SIZE;
+    for (int i = 0; i < num_neon; i++) {
+        sum_vec = vaddq_f32(sum_vec, vld1q_f32(data + i * NEON_SIZE));
+    }
+    
+    float32x2_t sum_half = vpadd_f32(vget_low_f32(sum_vec), vget_high_f32(sum_vec));
+    float result = vget_lane_f32(vpadd_f32(sum_half, sum_half), 0);
+    
+    for (int i = num_neon * NEON_SIZE; i < size; i++) {
+        result += data[i];
+    }
+    
+    return result;
+#else
+    float result = 0.0f;
+    for (int i = 0; i < size; i++) {
+        result += data[i];
+    }
+    return result;
+#endif
+}
+
+// ============================================================================
+// End of Session 38 Optimizations
+// ============================================================================
