@@ -5140,19 +5140,20 @@ void matmul_vnni_int8(const int8_t* A, const int8_t* B, int32_t* C,
 #endif
 
 // Non-temporal stores for streaming writes (bypass cache)
-HOT_FUNC inline void nt_store_ps(float* dst, __m256 val) {
 #if defined(__AVX__)
+HOT_FUNC inline void nt_store_ps(float* dst, __m256 val) {
     _mm256_stream_ps(dst, val);
-#endif
 }
+#endif
 
-HOT_FUNC inline void nt_store_ps512(float* dst, __m512 val) {
 #if defined(__AVX512F__)
+HOT_FUNC inline void nt_store_ps512(float* dst, __m512 val) {
     _mm512_stream_ps(dst, val);
-#endif
 }
+#endif
 
-// Cache-bypassing memory copy for large buffers
+// Cache-bypassing memory copy for large buffers (x86 only)
+#if defined(__x86_64__) || defined(__i386__)
 void memcpy_nt(float* dst, const float* src, size_t n) {
     constexpr size_t AVX_SIZE = sizeof(__m256);
     constexpr size_t AVX512_SIZE = sizeof(__m512);
@@ -5174,7 +5175,8 @@ void memcpy_nt(float* dst, const float* src, size_t n) {
         _mm512_stream_ps(dst + i + 48, v3);
     }
 #endif
-    
+
+#if defined(__AVX__)
     for (; i + AVX_SIZE * 8 <= n; i += AVX_SIZE * 8) {
         __m256 v0 = _mm256_loadu_ps(src + i);
         __m256 v1 = _mm256_loadu_ps(src + i + 8);
@@ -5185,52 +5187,57 @@ void memcpy_nt(float* dst, const float* src, size_t n) {
         _mm256_stream_ps(dst + i + 16, v2);
         _mm256_stream_ps(dst + i + 24, v3);
     }
-    
+#endif
+
     for (; i < n; i++) {
         dst[i] = src[i];
     }
 }
+#endif // x86 only
 
 // Ultra-aggressive loop unrolling (32x unroll factor)
 #define UNROLL_32(x) \
     x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x
 
-// 32x unrolled matrix multiplication
+// 32x unrolled matrix multiplication (x86 AVX2 only)
+#if defined(__AVX__)
 void matmul_unroll32(const float* A, const float* B, float* C,
                      int M, int N, int K) {
     constexpr int UNROLL = 32;
     constexpr int AVX_SIZE = 8;
-    
+
     for (int i = 0; i < M; i++) {
         const float* A_row = A + i * K;
         float* C_row = C + i * N;
-        
+
         for (int j = 0; j < N; j += UNROLL) {
             __m256 acc[UNROLL / AVX_SIZE];
             for (int u = 0; u < UNROLL / AVX_SIZE; u++) {
                 acc[u] = _mm256_setzero_ps();
             }
-            
+
             for (int k = 0; k < K; k++) {
                 __m256 a_val = _mm256_set1_ps(A_row[k]);
                 const float* B_k = B + k * N;
-                
+
                 #define LOAD_AND_FMA(u) \
                     __m256 b##u = _mm256_loadu_ps(&B_k[j + u * AVX_SIZE]); \
                     acc[u] = _mm256_fmadd_ps(a_val, b##u, acc[u]);
-                
+
                 UNROLL_32(LOAD_AND_FMA)
                 #undef LOAD_AND_FMA
             }
-            
+
             for (int u = 0; u < UNROLL / AVX_SIZE; u++) {
                 _mm256_storeu_ps(&C_row[j + u * AVX_SIZE], acc[u]);
             }
         }
     }
 }
+#endif
 
-// Software pipelining optimization
+// Software pipelining optimization (x86 AVX2 only)
+#if defined(__AVX__)
 void matmul_software_pipelined(const float* A, const float* B, float* C,
                                int M, int N, int K) {
     constexpr int PIPELINE_DEPTH = 4;
@@ -5289,6 +5296,7 @@ void matmul_software_pipelined(const float* A, const float* B, float* C,
         }
     }
 }
+#endif // AVX only
 
 // Memory compression for sparse activations
 struct CompressedActivation {
