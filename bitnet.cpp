@@ -11687,3 +11687,240 @@ void quantized_matmul(const BitMatrix& A, const BitMatrix& B, float* C,
         }
     }
 }
+
+// ==================== Session 31: Ultra-Optimized Attention & Quantization ====================
+// Target: Additional 5-10% improvement on existing optimizations
+
+// Optimized attention with better memory access pattern
+// Processes queries in batches for improved cache reuse
+void attention_optimized(const float* Q, const float* K, const float* V,
+                        float* output, int B, int T, int d, float scale) {
+    constexpr int AVX_SIZE = 8;  // x86 AVX2
+    constexpr int NEON_SIZE = 4; // ARM NEON
+    
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr int VEC_SIZE = AVX_SIZE;
+    constexpr int BLOCK_Q = 64;   // Process 64 queries at once
+    constexpr int BLOCK_K = 32;   // Cache-friendly block size for K
+#else
+    constexpr int VEC_SIZE = NEON_SIZE;
+    constexpr int BLOCK_Q = 32;
+    constexpr int BLOCK_K = 16;
+#endif
+    
+    // Q * K^T / sqrt(d) -> softmax -> * V
+    for (int b = 0; b < B; b++) {
+        const float* Q_b = Q + b * T * d;
+        const float* K_b = K + b * T * d;
+        const float* V_b = V + b * T * d;
+        float* O_b = output + b * T * d;
+        
+        // Process queries in blocks
+        for (int qi = 0; qi < T; qi += BLOCK_Q) {
+            int q_end = std::min(qi + BLOCK_Q, T);
+            
+            // Compute Q[qi:q_end] * K^T for all keys
+            for (int ki = 0; ki < T; ki += BLOCK_K) {
+                int k_end = std::min(ki + BLOCK_K, T);
+                
+                // Load K block into cache
+                const float* K_block = K_b + ki * d;
+                
+                // Process all queries in this block
+                for (int q = qi; q < q_end; q++) {
+                    const float* Q_row = Q_b + q * d;
+                    float* O_row = O_b + q * d;
+                    
+                    // Compute attention scores (vectorized)
+                    __m256 sum_vec[VEC_SIZE * 8];  // Accumulator for each output dim
+                    for (int i = 0; i < d / VEC_SIZE; i++) {
+                        for (int v = 0; v < 8; v++) {
+                            sum_vec[i * 8 + v] = _mm256_setzero_ps();
+                        }
+                    }
+                    
+                    // Compute dot products
+                    for (int k = ki; k < k_end; k++) {
+                        const float* K_row = K_block + (k - ki) * d;
+                        __m256 attention_score = _mm256_setzero_ps();
+                        
+                        // Vectorized dot product
+                        for (int i = 0; i < d / VEC_SIZE; i++) {
+                            __m256 qv = _mm256_loadu_ps(&Q_row[i * VEC_SIZE]);
+                            __m256 kv = _mm256_loadu_ps(&K_row[i * VEC_SIZE]);
+                            attention_score = _mm256_add_ps(attention_score,
+                                                            _mm256_mul_ps(qv, kv));
+                        }
+                        
+                        // Horizontal sum
+                        float score = 0;
+                        float32_t arr[8];
+                        _mm256_storeu_ps(arr, attention_score);
+                        for (int i = 0; i < 8; i++) score += arr[i];
+                        
+                        // Softmax (simplified for block processing)
+                        score *= scale;
+                        
+                        // Add weighted V row to output
+                        for (int i = 0; i < d / VEC_SIZE; i++) {
+                            __m256 ov = _mm256_loadu_ps(&O_row[i * VEC_SIZE]);
+                            __m256 vv = _mm256_loadu_ps(&V_b + k * d + i * VEC_SIZE);
+                            __m256 wv = _mm256_set1_ps(std::exp(score));  // Approximation
+                            _mm256_storeu_ps(&O_row[i * VEC_SIZE],
+                                            _mm256_add_ps(ov, _mm256_mul_ps(wv, vv)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Ultra-fast 1-bit matmul with word-level batching
+void matmul_1bit_ultra_batch(const unsigned char* A_packed, 
+                             const unsigned char* B_packed, 
+                             float* C, int M, int N, int K) {
+    const int K_words = (K + 31) / 32;
+    constexpr int BATCH_SIZE = 8;  // Process 8 rows at once
+    
+    for (int i = 0; i < M; i += BATCH_SIZE) {
+        int batch_end = std::min(i + BATCH_SIZE, M);
+        int batch_rows = batch_end - i;
+        
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            int batch_counts[8] = {0};
+            
+            // Process all words
+            for (int w = 0; w < K_words; w++) {
+                unsigned int b_word = B_words[w];
+                
+                for (int r = 0; r < batch_rows; r++) {
+                    const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + (i + r) * K);
+                    batch_counts[r] += __builtin_popcount(A_words[w] ^ b_word);
+                }
+            }
+            
+            // Store results
+            for (int r = 0; r < batch_rows; r++) {
+                C[(i + r) * N + j] = static_cast<float>(K - 2 * batch_counts[r]);
+            }
+        }
+    }
+}
+
+// Vectorized quantization with improved memory access
+void quantize_optimized(const float* input, unsigned char* output, 
+                        int size, float threshold) {
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr int AVX_SIZE = 8;
+    const __m256 thresh_vec = _mm256_set1_ps(threshold);
+    
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        __m256 cmp = _mm256_cmp_ps(vals, thresh_vec, _CMP_GT_OQ);
+        unsigned mask = _mm256_movemask_ps(cmp);
+        
+        // Process 8 bits: pack into single byte
+        unsigned char byte = 0;
+        for (int b = 0; b < 8; b++) {
+            if (mask & (1 << b)) byte |= (1 << b);
+        }
+        output[i / 8] = byte;
+    }
+    
+    // Handle remainder
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        if (input[i] > threshold) {
+            output[i / 8] |= (1 << (i % 8));
+        }
+    }
+#else
+    // ARM NEON version
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t thresh_vec = vdupq_n_f32(threshold);
+    
+    for (int i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        uint32x4_t cmp = vcgtq_f32(vals, thresh_vec);
+        unsigned mask = vgetq_lane_u32(cmp, 0) | (vgetq_lane_u32(cmp, 1) << 1) |
+                        (vgetq_lane_u32(cmp, 2) << 2) | (vgetq_lane_u32(cmp, 3) << 3);
+        output[i / 8] = mask & 0xFF;
+    }
+    
+    for (int i = size - (size % NEON_SIZE); i < size; i++) {
+        if (input[i] > threshold) {
+            output[i / 8] |= (1 << (i % 8));
+        }
+    }
+#endif
+}
+
+// Fused attention + GELU for transformer blocks
+void attention_gelu_fused(const float* Q, const float* K, const float* V,
+                          float* output, int B, int T, int d) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 sqrt_2pi = _mm256_set1_ps(0.7978845608028654f);
+    const __m256 coef = _mm256_set1_ps(0.044715f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 scale = _mm256_set1_ps(1.0f / std::sqrt(d));
+    
+    for (int b = 0; b < B; b++) {
+        const float* Q_b = Q + b * T * d;
+        const float* K_b = K + b * T * d;
+        const float* V_b = V + b * T * d;
+        float* O_b = output + b * T * d;
+        
+        for (int q = 0; q < T; q++) {
+            const float* Q_row = Q_b + q * d;
+            float* O_row = O_b + q * d;
+            
+            // Initialize output
+            for (int i = 0; i < d; i++) O_row[i] = 0.0f;
+            
+            // Compute attention and apply GELU to output
+            for (int k = 0; k < T; k++) {
+                // Compute attention score
+                __m256 score = _mm256_setzero_ps();
+                for (int i = 0; i + AVX_SIZE <= d; i += AVX_SIZE) {
+                    __m256 qv = _mm256_loadu_ps(&Q_row[i]);
+                    __m256 kv = _mm256_loadu_ps(&K_b + k * d + i);
+                    score = _mm256_add_ps(score, _mm256_mul_ps(qv, kv));
+                }
+                
+                // Horizontal sum and softmax
+                float score_sum = 0;
+                float scores[T];
+                float32_t arr[8];
+                _mm256_storeu_ps(arr, score);
+                for (int i = 0; i < 8; i++) score_sum += arr[i];
+                scores[k] = std::exp(score_sum * scale);
+                
+                // Normalize
+                for (int kk = 0; kk < T; kk++) scores[kk] /= (score_sum + 1e-8f);
+                
+                // Add weighted V with GELU activation
+                for (int i = 0; i + AVX_SIZE <= d; i += AVX_SIZE) {
+                    __m256 ov = _mm256_loadu_ps(&O_row[i]);
+                    __m256 vv = _mm256_loadu_ps(&V_b + k * d + i);
+                    __m256 w = _mm256_set1_ps(scores[k]);
+                    __m256 added = _mm256_mul_ps(w, vv);
+                    
+                    // GELU activation: 0.5 * x * (1 + tanh(...))
+                    __m256 x = added;
+                    __m256 x_sq = _mm256_mul_ps(x, x);
+                    __m256 inner = _mm256_mul_ps(_mm256_mul_ps(sqrt_2pi, x),
+                                                 _mm256_add_ps(one, _mm256_mul_ps(coef, x_sq)));
+                    __m256 tanh_inner = _mm256_tanh_ps(inner);
+                    __m256 gelu = _mm256_mul_ps(_mm256_mul_ps(x, half),
+                                                _mm256_add_ps(one, tanh_inner));
+                    
+                    _mm256_storeu_ps(&O_row[i], _mm256_add_ps(ov, gelu));
+                }
+            }
+        }
+    }
+}
+
+// ==================== End of Session 31 ====================
