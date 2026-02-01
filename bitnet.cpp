@@ -714,3 +714,63 @@ int main() {
     std::cout << "\nCompilation successful!\n";
     return 0;
 }
+
+// ==================== ARM NEON Optimization ====================
+#ifdef __ARM_NEON
+
+void matmul_neon(const float* A, const float* B, float* C,
+                 int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;  // 128-bit / 32-bit
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / NEON_SIZE;
+        float32x4_t c_vec[128] = {};
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < num_vec; j++) {
+                float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+        }
+    }
+}
+
+// NEON dot product for 1-bit quantization
+int dot_product_neon(const unsigned char* a, const unsigned char* b, int len) {
+    int count = 0;
+    int i = 0;
+    
+    for (; i + 15 < len; i += 16) {
+        uint8x16_t va = vld1q_u8(a + i);
+        uint8x16_t vb = vld1q_u8(b + i);
+        
+        // Population count
+        uint8x16_t xored = veorq_u8(va, vb);
+        uint8x16_t masked = vmvnq_u8(xored);
+        
+        // Sum bits (popcount)
+        uint16x8_t sum1 = vpaddlq_u8(vpaddlq_u4(vpaddlq_u1(masked)));
+        count += vgetq_lane_s16(sum1, 0) + vgetq_lane_s16(sum1, 4);
+    }
+    
+    // Handle remainder
+    for (; i < len; i++) {
+        if ((a[i >> 3] >> (i & 7)) == (b[i >> 3] >> (i & 7))) {
+            count++;
+        }
+    }
+    
+    return count;
+}
+
+#endif
