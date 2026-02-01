@@ -19134,5 +19134,208 @@ void attention_optimized(const float* Q, const float* K, const float* V,
 }
 
 // ============================================================================
+// Session 48: Ultra-Optimized Reduction & Strided Prefetch
+// ============================================================================
+
+// Ultra-Fast Vectorized Horizontal Sum (8-way tree reduction)
+FORCE_INLINE float horizontal_sum_avx2(__m256 vec) {
+    __m128 low = _mm256_castps256_ps128(vec);
+    __m128 high = _mm256_extractf128_ps(vec, 1);
+    __m128 sum = _mm_add_ps(low, high);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+// 16-way horizontal sum (2x AVX2 unrolling)
+FORCE_INLINE float horizontal_sum_16_avx2(__m256 vec0, __m256 vec1) {
+    __m128 low0 = _mm256_castps256_ps128(vec0);
+    __m128 high0 = _mm256_extractf128_ps(vec0, 1);
+    __m128 low1 = _mm256_castps256_ps128(vec1);
+    __m128 high1 = _mm256_extractf128_ps(vec1, 1);
+    __m128 sum0 = _mm_add_ps(low0, high0);
+    __m128 sum1 = _mm_add_ps(low1, high1);
+    __m128 sum = _mm_add_ps(sum0, sum1);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+// NEON horizontal sum (4-way)
+FORCE_INLINE float horizontal_sum_neon(float32x4_t vec) {
+    float32x2_t low = vget_low_f32(vec);
+    float32x2_t high = vget_high_f32(vec);
+    float32x2_t sum = vpadd_f32(low, high);
+    sum = vpadd_f32(sum, sum);
+    return vget_lane_f32(sum, 0);
+}
+
+// Ultra-Strided Prefetch Matrix Multiply (Maximum Memory Throughput)
+FORCE_INLINE void matmul_strided_prefetch(const float* A, const float* B, float* C,
+                                           int M, int N, int K) {
+    constexpr int BLOCK_I = 64;
+    constexpr int BLOCK_J = 64;
+    constexpr int BLOCK_K = 8;
+    constexpr int PREFETCH_DIST = 3;  // Cache lines ahead
+
+#if defined(__x86_64__) || defined(__i386__)
+    for (int i = 0; i < M; i += BLOCK_I) {
+        int i_end = std::min(i + BLOCK_I, M);
+        for (int j = 0; j < N; j += BLOCK_J) {
+            int j_end = std::min(j + BLOCK_J, N);
+
+            // Prefetch B block ahead
+            const float* B_pref = B + (j + PREFETCH_DIST * BLOCK_J) * K;
+            if (j + PREFETCH_DIST * BLOCK_J < N) {
+                for (int kk = 0; kk < K; kk += 64) {
+                    int k_end = std::min(kk + 64, K);
+                    for (int kkj = j; kkj < j_end && kkj < N; kkj += 8) {
+                        _mm_prefetch((const char*)(B + kkj * K + kk), _MM_HINT_T0);
+                    }
+                }
+            }
+
+            for (int kk = 0; kk < K; kk += BLOCK_K) {
+                int k_end = std::min(kk + BLOCK_K, K);
+
+                for (int ii = i; ii < i_end; ii++) {
+                    const float* A_row = A + ii * K + kk;
+                    float* C_row = C + ii * N + j;
+
+                    // Prefetch next A row
+                    if (ii + 1 < i_end) {
+                        _mm_prefetch((const char*)(A + (ii + 1) * K + kk), _MM_HINT_T0);
+                    }
+
+                    // Prefetch C row
+                    _mm_prefetch((const char*)(C_row), _MM_HINT_T0);
+
+                    for (int jj = j; jj < j_end; jj += 8) {
+                        __m256 c_vec = _mm256_loadu_ps(C_row + jj);
+                        __m256 a_val = _mm256_set1_ps(A_row[jj - j]);
+
+                        for (int kkj = kk; kkj < k_end; kkj++) {
+                            __m256 b_vec = _mm256_loadu_ps(B + kkj * N + jj);
+                            c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                        }
+
+                        _mm256_storeu_ps(C_row + jj, c_vec);
+                    }
+                }
+            }
+        }
+    }
+#elif defined(__aarch64__) || defined(__arm__)
+    for (int i = 0; i < M; i += BLOCK_I) {
+        int i_end = std::min(i + BLOCK_I, M);
+        for (int j = 0; j < N; j += BLOCK_J) {
+            int j_end = std::min(j + BLOCK_J, N);
+
+            for (int kk = 0; kk < K; kk += BLOCK_K) {
+                int k_end = std::min(kk + BLOCK_K, K);
+
+                for (int ii = i; ii < i_end; ii++) {
+                    const float* A_row = A + ii * K + kk;
+                    float* C_row = C + ii * N + j;
+
+                    for (int jj = j; jj < j_end; jj += 4) {
+                        float32x4_t c_vec = vld1q_f32(C_row + jj);
+                        float a_val = A_row[jj - j];
+                        float32x4_t a_vec = vdupq_n_f32(a_val);
+
+                        for (int kkj = kk; kkj < k_end; kkj++) {
+                            float32x4_t b_vec = vld1q_f32(B + kkj * N + jj);
+                            c_vec = vfmaq_f32(c_vec, a_vec, b_vec);
+                        }
+
+                        vst1q_f32(C_row + jj, c_vec);
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Vectorized Scale and Add (Fused multiply-add)
+FORCE_INLINE void scale_add_vectorized(float* dst, const float* src,
+                                         float scale, size_t size) {
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr int VEC_SIZE = 8;
+    __m256 scale_vec = _mm256_set1_ps(scale);
+    size_t i = 0;
+
+    for (; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        __m256 s0 = _mm256_loadu_ps(src + i);
+        __m256 d0 = _mm256_loadu_ps(dst + i);
+        __m256 r0 = _mm256_fmadd_ps(s0, scale_vec, d0);
+        _mm256_storeu_ps(dst + i, r0);
+
+        __m256 s1 = _mm256_loadu_ps(src + i + VEC_SIZE);
+        __m256 d1 = _mm256_loadu_ps(dst + i + VEC_SIZE);
+        __m256 r1 = _mm256_fmadd_ps(s1, scale_vec, d1);
+        _mm256_storeu_ps(dst + i + VEC_SIZE, r1);
+
+        __m256 s2 = _mm256_loadu_ps(src + i + VEC_SIZE * 2);
+        __m256 d2 = _mm256_loadu_ps(dst + i + VEC_SIZE * 2);
+        __m256 r2 = _mm256_fmadd_ps(s2, scale_vec, d2);
+        _mm256_storeu_ps(dst + i + VEC_SIZE * 2, r2);
+
+        __m256 s3 = _mm256_loadu_ps(src + i + VEC_SIZE * 3);
+        __m256 d3 = _mm256_loadu_ps(dst + i + VEC_SIZE * 3);
+        __m256 r3 = _mm256_fmadd_ps(s3, scale_vec, d3);
+        _mm256_storeu_ps(dst + i + VEC_SIZE * 3, r3);
+    }
+
+    for (; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        __m256 s = _mm256_loadu_ps(src + i);
+        __m256 d = _mm256_loadu_ps(dst + i);
+        __m256 r = _mm256_fmadd_ps(s, scale_vec, d);
+        _mm256_storeu_ps(dst + i, r);
+    }
+
+    for (; i < size; i++) {
+        dst[i] += src[i] * scale;
+    }
+#elif defined(__aarch64__) || defined(__arm__)
+    constexpr int VEC_SIZE = 4;
+    float32x4_t scale_vec = vdupq_n_f32(scale);
+    size_t i = 0;
+
+    for (; i + VEC_SIZE * 4 <= size; i += VEC_SIZE * 4) {
+        float32x4_t s0 = vld1q_f32(src + i);
+        float32x4_t d0 = vld1q_f32(dst + i);
+        vst1q_f32(dst + i, vfmaq_f32(d0, s0, scale_vec));
+
+        float32x4_t s1 = vld1q_f32(src + i + VEC_SIZE);
+        float32x4_t d1 = vld1q_f32(dst + i + VEC_SIZE);
+        vst1q_f32(dst + i + VEC_SIZE, vfmaq_f32(d1, s1, scale_vec));
+
+        float32x4_t s2 = vld1q_f32(src + i + VEC_SIZE * 2);
+        float32x4_t d2 = vld1q_f32(dst + i + VEC_SIZE * 2);
+        vst1q_f32(dst + i + VEC_SIZE * 2, vfmaq_f32(d2, s2, scale_vec));
+
+        float32x4_t s3 = vld1q_f32(src + i + VEC_SIZE * 3);
+        float32x4_t d3 = vld1q_f32(dst + i + VEC_SIZE * 3);
+        vst1q_f32(dst + i + VEC_SIZE * 3, vfmaq_f32(d3, s3, scale_vec));
+    }
+
+    for (; i + VEC_SIZE <= size; i += VEC_SIZE) {
+        float32x4_t s = vld1q_f32(src + i);
+        float32x4_t d = vld1q_f32(dst + i);
+        vst1q_f32(dst + i, vfmaq_f32(d, s, scale_vec));
+    }
+
+    for (; i < size; i++) {
+        dst[i] += src[i] * scale;
+    }
+#else
+    for (size_t i = 0; i < size; i++) {
+        dst[i] += src[i] * scale;
+    }
+#endif
+}
+
+// ============================================================================
 // End of Session 48 Optimizations
 // ============================================================================
