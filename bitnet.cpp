@@ -10927,9 +10927,9 @@ void softmax_neon(float* data, int size) {
     
     // Horizontal max reduction
     float row_max = vgetq_lane_f32(max_vec, 0);
-    for (int j = 1; j < 4; j++) {
-        row_max = std::max(row_max, vgetq_lane_f32(max_vec, j));
-    }
+    row_max = std::max(row_max, vgetq_lane_f32(max_vec, 1));
+    row_max = std::max(row_max, vgetq_lane_f32(max_vec, 2));
+    row_max = std::max(row_max, vgetq_lane_f32(max_vec, 3));
     for (; i < size; i++) {
         row_max = std::max(row_max, data[i]);
     }
@@ -10955,9 +10955,9 @@ void softmax_neon(float* data, int size) {
     
     // Horizontal sum reduction
     float row_sum = vgetq_lane_f32(sum_vec, 0);
-    for (int j = 1; j < 4; j++) {
-        row_sum += vgetq_lane_f32(sum_vec, j);
-    }
+    row_sum += vgetq_lane_f32(sum_vec, 1);
+    row_sum += vgetq_lane_f32(sum_vec, 2);
+    row_sum += vgetq_lane_f32(sum_vec, 3);
     for (; i < size; i++) {
         data[i] = std::exp(data[i] - row_max);
         row_sum += data[i];
