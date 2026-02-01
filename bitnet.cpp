@@ -16811,6 +16811,387 @@ void tanh_hyper_2x(float* data, int size) {
 #endif
 
 // ============================================================================
-// End of Session 43 Optimizations
+// Session 44: Hyper Memory Prefetch + Ultra Parallelization + Aggressive Unroll
 // ============================================================================
+
+#if IS_X86_PLATFORM
+
+// Hyper-aggressive prefetch matmul: 4-way prefetch with 128-byte stride
+void matmul_hyper_prefetch_avx2(
+    const float* RESTRICT A, 
+    const float* RESTRICT B, 
+    float* RESTRICT C, 
+    int M, int N, int K) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 8;  // 8 AVX vectors = 64 floats per iteration
+    constexpr int PREFETCH_DIST = 512;  // Prefetch 512 bytes ahead
+    
+    for (int i = 0; i < M; i++) {
+        const float* RESTRICT A_row = A + i * K;
+        float* RESTRICT C_row = C + i * N;
+        
+        // Initialize result vectors
+        __m256 c_vec[UNROLL];
+        for (int u = 0; u < UNROLL; u++) {
+            c_vec[u] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            const float* RESTRICT B_k = B + k * N;
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            
+            // Prefetch next iteration's B data (aggressive 4-way)
+            if (k + 1 < K) {
+                const float* RESTRICT B_next = B + (k + 1) * N;
+                for (int u = 0; u < UNROLL; u += 2) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&B_next[u * AVX_SIZE * 4]), _MM_HINT_T0);
+                }
+            }
+            
+            // Unrolled multiply-accumulate with 8 AVX vectors
+            for (int j = 0; j < N - AVX_SIZE * UNROLL + 1; j += AVX_SIZE * UNROLL) {
+                // Prefetch C output
+                _mm_prefetch(reinterpret_cast<const char*>(&C_row[j + 128]), _MM_HINT_T0);
+                
+                // 8-way unrolled FMA
+                c_vec[0] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j]), c_vec[0]);
+                c_vec[1] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE]), c_vec[1]);
+                c_vec[2] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 2]), c_vec[2]);
+                c_vec[3] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 3]), c_vec[3]);
+                c_vec[4] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 4]), c_vec[4]);
+                c_vec[5] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 5]), c_vec[5]);
+                c_vec[6] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 6]), c_vec[6]);
+                c_vec[7] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j + AVX_SIZE * 7]), c_vec[7]);
+            }
+            
+            // Handle remainder
+            for (int j = N - AVX_SIZE * UNROLL; j < N; j += AVX_SIZE) {
+                if (j + AVX_SIZE <= N) {
+                    int idx = (j - (N - AVX_SIZE * UNROLL)) / AVX_SIZE;
+                    c_vec[idx] = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(&B_k[j]), c_vec[idx]);
+                }
+            }
+        }
+        
+        // Store result
+        for (int u = 0; u < UNROLL; u++) {
+            int j = u * AVX_SIZE;
+            if (j < N) {
+                _mm256_storeu_ps(&C_row[j], c_vec[u]);
+            }
+        }
+    }
+}
+
+// Softmax with 4-way SIMD unrolling and horizontal reduction
+FORCE_INLINE void softmax_hyper_4x_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;  // 4-way unrolling
+    
+    // Find max and compute exp in unrolled manner
+    float row_max = -FLT_MAX;
+    for (int i = 0; i < size; i++) {
+        row_max = std::max(row_max, data[i]);
+    }
+    
+    __m256 max_vec = _mm256_set1_ps(row_max);
+    __m256 sum_vec = _mm256_setzero_ps();
+    
+    // Unrolled exp and sum
+    for (int i = 0; i < size - AVX_SIZE * UNROLL + 1; i += AVX_SIZE * UNROLL) {
+        __m256 x[UNROLL];
+        __m256 exp_x[UNROLL];
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x[u] = _mm256_loadu_ps(&data[i + u * AVX_SIZE]);
+            x[u] = _mm256_sub_ps(x[u], max_vec);
+            exp_x[u] = _mm256_exp_ps(x[u]);  // AVX2 exp
+            sum_vec = _mm256_add_ps(sum_vec, exp_x[u]);
+        }
+        
+        // Store exp values
+        for (int u = 0; u < UNROLL; u++) {
+            _mm256_storeu_ps(&data[i + u * AVX_SIZE], exp_x[u]);
+        }
+    }
+    
+    // Horizontal sum reduction
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    float exp_sum = sum_arr[0];
+    for (int i = 1; i < 8; i++) exp_sum += sum_arr[i];
+    
+    // Handle remainder
+    for (int i = size - AVX_SIZE * UNROLL; i < size; i++) {
+        data[i] = std::exp(data[i] - row_max);
+        exp_sum += data[i];
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / (exp_sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    
+    for (int i = 0; i < size - AVX_SIZE * UNROLL + 1; i += AVX_SIZE * UNROLL) {
+        for (int u = 0; u < UNROLL; u++) {
+            __m256 x = _mm256_loadu_ps(&data[i + u * AVX_SIZE]);
+            x = _mm256_mul_ps(x, inv_vec);
+            _mm256_storeu_ps(&data[i + u * AVX_SIZE], x);
+        }
+    }
+    
+    for (int i = size - AVX_SIZE * UNROLL; i < size; i++) {
+        data[i] *= inv_sum;
+    }
+}
+
+// Hyper-vectorized GELU with 4x unrolling
+FORCE_INLINE void gelu_hyper_4x_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;
+    
+    constexpr float SQRT_2_OVER_PI = 0.79788456f;
+    constexpr float COEFF = 0.044715f;
+    
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 sqrt_2_over_pi = _mm256_set1_ps(SQRT_2_OVER_PI);
+    const __m256 coeff = _mm256_set1_ps(COEFF);
+    
+    for (int i = 0; i < size - AVX_SIZE * UNROLL + 1; i += AVX_SIZE * UNROLL) {
+        __m256 x[UNROLL];
+        __m256 x2[UNROLL];
+        __m256 x3[UNROLL];
+        __m256 inner[UNROLL];
+        __m256 tanh_inner[UNROLL];
+        __m256 result[UNROLL];
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x[u] = _mm256_loadu_ps(&data[i + u * AVX_SIZE]);
+        }
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x2[u] = _mm256_mul_ps(x[u], x[u]);
+            x3[u] = _mm256_mul_ps(x2[u], x[u]);
+            inner[u] = _mm256_mul_ps(sqrt_2_over_pi,
+                                    _mm256_add_ps(x[u], _mm256_mul_ps(coeff, x3[u])));
+            tanh_inner[u] = _mm256_tanh_ps(inner[u]);
+            result[u] = _mm256_mul_ps(_mm256_mul_ps(half, x[u]),
+                                      _mm256_add_ps(one, tanh_inner[u]));
+        }
+        
+        for (int u = 0; u < UNROLL; u++) {
+            _mm256_storeu_ps(&data[i + u * AVX_SIZE], result[u]);
+        }
+    }
+    
+    // Handle remainder
+    for (int i = size - AVX_SIZE * UNROLL; i < size; i++) {
+        float x = data[i];
+        float x2 = x * x;
+        float x3 = x2 * x;
+        float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
+        data[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+#if IS_ARM_PLATFORM
+
+// Hyper prefetch NEON: 4-way prefetch with aggressive unrolling
+void matmul_hyper_prefetch_neon(
+    const float* RESTRICT A, 
+    const float* RESTRICT B, 
+    float* RESTRICT C, 
+    int M, int N, int K) {
+    
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL = 8;  // 8 NEON vectors = 32 floats per iteration
+    constexpr int PREFETCH_DIST = 512;
+    
+    for (int i = 0; i < M; i++) {
+        const float* RESTRICT A_row = A + i * K;
+        float* RESTRICT C_row = C + i * N;
+        
+        float32x4_t c_vec[UNROLL];
+        for (int u = 0; u < UNROLL; u++) {
+            c_vec[u] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < K; k++) {
+            const float* RESTRICT B_k = B + k * N;
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            
+            // Prefetch next iteration
+            if (k + 1 < K) {
+                const float* RESTRICT B_next = B + (k + 1) * N;
+                for (int u = 0; u < UNROLL; u += 2) {
+                    __builtin_prefetch(&B_next[u * NEON_SIZE * 4], 0, 3);
+                }
+            }
+            
+            // 8-way unrolled NEON FMA
+            for (int j = 0; j < N - NEON_SIZE * UNROLL + 1; j += NEON_SIZE * UNROLL) {
+                __builtin_prefetch(&C_row[j + 128], 1, 3);
+                
+                c_vec[0] = vfmaq_f32(c_vec[0], a_val, vld1q_f32(&B_k[j]));
+                c_vec[1] = vfmaq_f32(c_vec[1], a_val, vld1q_f32(&B_k[j + NEON_SIZE]));
+                c_vec[2] = vfmaq_f32(c_vec[2], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 2]));
+                c_vec[3] = vfmaq_f32(c_vec[3], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 3]));
+                c_vec[4] = vfmaq_f32(c_vec[4], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 4]));
+                c_vec[5] = vfmaq_f32(c_vec[5], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 5]));
+                c_vec[6] = vfmaq_f32(c_vec[6], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 6]));
+                c_vec[7] = vfmaq_f32(c_vec[7], a_val, vld1q_f32(&B_k[j + NEON_SIZE * 7]));
+            }
+        }
+        
+        // Store results
+        for (int u = 0; u < UNROLL; u++) {
+            int j = u * NEON_SIZE;
+            if (j < N) {
+                vst1q_f32(&C_row[j], c_vec[u]);
+            }
+        }
+    }
+}
+
+// NEON softmax with 4x unrolling
+FORCE_INLINE void softmax_hyper_4x_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL = 4;
+    
+    // Find max
+    float row_max = -FLT_MAX;
+    for (int i = 0; i < size; i++) {
+        row_max = std::max(row_max, data[i]);
+    }
+    
+    float32x4_t max_vec = vdupq_n_f32(row_max);
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    
+    // Unrolled exp and sum
+    for (int i = 0; i < size - NEON_SIZE * UNROLL + 1; i += NEON_SIZE * UNROLL) {
+        float32x4_t x[UNROLL];
+        float32x4_t exp_x[UNROLL];
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x[u] = vld1q_f32(&data[i + u * NEON_SIZE]);
+            x[u] = vsubq_f32(x[u], max_vec);
+            // Manual exp for NEON (approximation)
+            float32x4_t half_x = vmulq_n_f32(x[u], 0.5f);
+            float32x4_t exp_pos = vexpq_f32(half_x);
+            exp_x[u] = vdivq_f32(exp_pos, vaddq_f32(exp_pos, vdupq_n_f32(1.0f)));
+            exp_x[u] = vmulq_n_f32(exp_x[u], 2.0f);  // exp(x) = 2 * sigmoid(2x)
+            exp_x[u] = vsubq_f32(exp_x[u], vdupq_n_f32(1.0f));
+            sum_vec = vaddq_f32(sum_vec, exp_x[u]);
+        }
+        
+        for (int u = 0; u < UNROLL; u++) {
+            vst1q_f32(&data[i + u * NEON_SIZE], exp_x[u]);
+        }
+    }
+    
+    // Horizontal sum
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    float exp_sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    
+    for (int i = size - NEON_SIZE * UNROLL; i < size; i++) {
+        data[i] = std::exp(data[i] - row_max);
+        exp_sum += data[i];
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / (exp_sum + 1e-8f);
+    float32x4_t inv_vec = vdupq_n_f32(inv_sum);
+    
+    for (int i = 0; i < size - NEON_SIZE * UNROLL + 1; i += NEON_SIZE * UNROLL) {
+        for (int u = 0; u < UNROLL; u++) {
+            float32x4_t x = vld1q_f32(&data[i + u * NEON_SIZE]);
+            x = vmulq_f32(x, inv_vec);
+            vst1q_f32(&data[i + u * NEON_SIZE], x);
+        }
+    }
+    
+    for (int i = size - NEON_SIZE * UNROLL; i < size; i++) {
+        data[i] *= inv_sum;
+    }
+}
+
+// NEON GELU with 4x unrolling
+FORCE_INLINE void gelu_hyper_4x_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL = 4;
+    
+    constexpr float SQRT_2_OVER_PI = 0.79788456f;
+    constexpr float COEFF = 0.044715f;
+    
+    float32x4_t half = vdupq_n_f32(0.5f);
+    float32x4_t one = vdupq_n_f32(1.0f);
+    float32x4_t sqrt_2_over_pi = vdupq_n_f32(SQRT_2_OVER_PI);
+    float32x4_t coeff = vdupq_n_f32(COEFF);
+    
+    for (int i = 0; i < size - NEON_SIZE * UNROLL + 1; i += NEON_SIZE * UNROLL) {
+        float32x4_t x[UNROLL];
+        float32x4_t x2[UNROLL];
+        float32x4_t x3[UNROLL];
+        float32x4_t inner[UNROLL];
+        float32x4_t tanh_inner[UNROLL];
+        float32x4_t result[UNROLL];
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x[u] = vld1q_f32(&data[i + u * NEON_SIZE]);
+        }
+        
+        for (int u = 0; u < UNROLL; u++) {
+            x2[u] = vmulq_f32(x[u], x[u]);
+            x3[u] = vmulq_f32(x2[u], x[u]);
+            inner[u] = vmulq_f32(sqrt_2_over_pi,
+                                vaddq_f32(x[u], vmulq_f32(coeff, x3[u])));
+            
+            // Manual tanh for NEON
+            float inner_arr[4];
+            vst1q_f32(inner_arr, inner[u]);
+            for (int j = 0; j < 4 && i + u * NEON_SIZE + j < size; j++) {
+                inner_arr[j] = std::tanh(inner_arr[j]);
+            }
+            tanh_inner[u] = vld1q_f32(inner_arr);
+            
+            result[u] = vmulq_f32(vmulq_f32(half, x[u]),
+                                  vaddq_f32(one, tanh_inner[u]));
+        }
+        
+        for (int u = 0; u < UNROLL; u++) {
+            vst1q_f32(&data[i + u * NEON_SIZE], result[u]);
+        }
+    }
+    
+    for (int i = size - NEON_SIZE * UNROLL; i < size; i++) {
+        float x = data[i];
+        float x2 = x * x;
+        float x3 = x2 * x;
+        float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
+        data[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+}
+
+#endif  // IS_ARM_PLATFORM
+
+// ============================================================================
+// Cross-Platform Aliases
+// ============================================================================
+
+#if IS_X86_PLATFORM
+#define matmul_hyper_prefetch matmul_hyper_prefetch_avx2
+#define softmax_hyper_4x softmax_hyper_4x_avx2
+#define gelu_hyper_4x gelu_hyper_4x_avx2
+#else
+#define matmul_hyper_prefetch matmul_hyper_prefetch_neon
+#define softmax_hyper_4x softmax_hyper_4x_neon
+#define gelu_hyper_4x gelu_hyper_4x_neon
+#endif
+
+// ============================================================================
+// End of Session 44 Optimizations
 // ============================================================================
