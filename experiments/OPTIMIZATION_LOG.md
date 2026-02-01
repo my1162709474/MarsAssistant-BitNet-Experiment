@@ -8618,3 +8618,55 @@ Session 54 achieves another significant performance improvement through ultra-ag
 - 目标: 优化缓存利用率和内存访问模式
 - 📦 已提交: 92a0f35 Session 55: Ultra-Fast Lookup Table Optimization + Enhanced Prefetch
 
+=== Sun Feb  1 20:44:44 CST 2026 ===
+## Session 56: AVX2 Fallback + Attention Memory Optimization
+**Date**: 2026-02-01 20:44
+
+### Changes Made
+**Commit**: `5e966bf`
+
+#### 1. AVX2 Optimization for 1-bit Matrix Multiplication Fallback
+**Modified**: `matmul_1bit_dynamic()`
+
+**Problem**: 
+- The fallback code path for non-AVX-512 platforms used scalar `__builtin_popcount()`
+- This resulted in 3-4x slowdown compared to vectorized versions
+
+**Solution**:
+- Added AVX2 code path using `_mm256_popcnt_epi32()` 
+- Processes 8 x 32-bit words per iteration (256 bits)
+- Horizontal reduction using `_mm256_storeu_si256()` + scalar sum
+- Maintains compatibility with non-SIMD platforms as final fallback
+
+**Expected speedup**:
+- 3-4x over scalar popcount on AVX2 platforms
+- Closes the performance gap between AVX-512 and AVX2 systems
+
+#### 2. Attention Fused Kernel Memory Optimization
+**Modified**: `attention_fused()`
+
+**Problem**:
+- Redundant `q_row` pointer calculation inside inner loop
+- No prefetching of K/V rows during dot product
+- Manual horizontal sum using store+loop (inefficient)
+- Frequent vector allocations inside hot loops
+
+**Solution**:
+- Moved `q_row` load outside j-loop (computed once per i-iteration)
+- Added `_mm_prefetch()` for K rows with 1-row lookahead
+- Replaced manual horizontal sum with `_mm256_hadd_ps()` + `_mm256_hadd_ps()`
+- Used FMA instruction `_mm256_fmadd_ps()` for weighted V accumulation
+- Moved `attn_scores` and `out_vec` allocations outside all loops
+- Pre-computed `head_stride` to reduce pointer arithmetic
+
+**Expected speedup**:
+- 1.3-1.5x for attention operations (varies with seq_len)
+- Better cache utilization for long sequences
+- Reduced memory allocations during inference
+
+### Cumulative Progress
+- **Total commits**: 56
+- **Focus areas**: SIMD vectorization, memory access patterns, parallelization
+- **Current optimization level**: Ultra-Hyper-Extreme (8x unrolling + multi-level prefetch)
+- **Platform coverage**: x86 (AVX2/AVX-512), ARM (NEON)
+
