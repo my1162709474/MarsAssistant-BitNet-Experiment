@@ -17193,5 +17193,397 @@ FORCE_INLINE void gelu_hyper_4x_neon(float* data, int size) {
 #endif
 
 // ============================================================================
-// End of Session 44 Optimizations
+// Session 45: Ultra-Extreme Optimizations (Maximum Performance)
+// ============================================================================
+
+// ==================== Ultra-Extreme 64x64 Microkernel (Maximum Register Blocking) ====================
+
+#if IS_X86_PLATFORM
+
+// Ultra-extreme 64x64 microkernel with maximum register utilization
+// Uses 64 accumulators for maximum instruction-level parallelism
+FORCE_INLINE void matmul_ultra_extreme_64x64(const float* RESTRICT A,
+                                             const float* RESTRICT B,
+                                             float* RESTRICT C,
+                                             int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    constexpr int UNROLL_N = 8;  // 64 floats per iteration
+
+    int max_i = (M / TILE_M) * TILE_M;
+    int max_j = (N / TILE_N) * TILE_N;
+
+    for (int ii = 0; ii < max_i; ii += TILE_M) {
+        for (int jj = 0; jj < max_j; jj += TILE_N) {
+            // Process 64x64 tile with 64 accumulators
+            __m256 acc[TILE_M * UNROLL_N] = {0};
+
+            for (int k = 0; k < K; k++) {
+                const float* A_tile = A + (ii + 0) * K + k;
+                const float* B_tile = B + k * N + jj;
+
+                // Prefetch A row for next iteration
+                if (k + 2 < K) {
+                    PREFETCH_READ(A + (ii + 8) * K + k + 2);
+                }
+
+                // Prefetch B row for next iteration
+                if (k + 1 < K) {
+                    PREFETCH_READ(B + (k + 1) * N + jj);
+                }
+
+                // Maximum unrolling: process 64 floats at once
+                for (int i_offset = 0; i_offset < TILE_M; i_offset++) {
+                    __m256 a_val = _mm256_set1_ps(A_tile[i_offset * K]);
+
+                    for (int v = 0; v < UNROLL_N; v++) {
+                        int j_offset = v * AVX_SIZE;
+                        __m256 b_vec = _mm256_loadu_ps(&B_tile[j_offset]);
+                        acc[i_offset * UNROLL_N + v] = _mm256_fmadd_ps(a_val, b_vec, acc[i_offset * UNROLL_N + v]);
+                    }
+                }
+            }
+
+            // Store results
+            for (int i_offset = 0; i_offset < TILE_M; i_offset++) {
+                float* C_tile = C + (ii + i_offset) * N + jj;
+                for (int v = 0; v < UNROLL_N; v++) {
+                    int j_offset = v * AVX_SIZE;
+                    _mm256_storeu_ps(&C_tile[j_offset], acc[i_offset * UNROLL_N + v]);
+                }
+            }
+        }
+    }
+
+    // Handle remainder M
+    for (int i = max_i; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+
+        for (int j = 0; j < N; j += AVX_SIZE) {
+            __m256 c_vec = _mm256_setzero_ps();
+            for (int k = 0; k < K; k++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k]);
+                __m256 b_vec = _mm256_loadu_ps(&B[k * N + j]);
+                c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+            }
+            _mm256_storeu_ps(&C_row[j], c_vec);
+        }
+    }
+
+    // Handle remainder N
+    for (int i = 0; i < max_i; i++) {
+        for (int j = max_j; j < N; j++) {
+            float sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ==================== ARM NEON Ultra-Extreme 32x32 Microkernel ====================
+
+#if IS_ARM_PLATFORM
+
+FORCE_INLINE void matmul_ultra_extreme_32x32_neon(const float* RESTRICT A,
+                                                   const float* RESTRICT B,
+                                                   float* RESTRICT C,
+                                                   int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int TILE_M = 32;
+    constexpr int TILE_N = 32;
+    constexpr int UNROLL_N = 8;  // 32 floats per iteration
+
+    int max_i = (M / TILE_M) * TILE_M;
+    int max_j = (N / TILE_N) * TILE_N;
+
+    for (int ii = 0; ii < max_i; ii += TILE_M) {
+        for (int jj = 0; jj < max_j; jj += TILE_N) {
+            // Process 32x32 tile with 32 accumulators
+            float32x4_t acc[TILE_M * UNROLL_N] = {0};
+
+            for (int k = 0; k < K; k++) {
+                const float* A_tile = A + (ii + 0) * K + k;
+                const float* B_tile = B + k * N + jj;
+
+                // Prefetch for next iteration
+                if (k + 2 < K) {
+                    __builtin_prefetch(A + (ii + 8) * K + k + 2, 0, 3);
+                }
+
+                // Maximum unrolling: process 32 floats at once
+                for (int i_offset = 0; i_offset < TILE_M; i_offset++) {
+                    float32x4_t a_val = vdupq_n_f32(A_tile[i_offset * K]);
+
+                    for (int v = 0; v < UNROLL_N; v++) {
+                        int j_offset = v * NEON_SIZE;
+                        float32x4_t b_vec = vld1q_f32(&B_tile[j_offset]);
+                        acc[i_offset * UNROLL_N + v] = vfmaq_f32(acc[i_offset * UNROLL_N + v], a_val, b_vec);
+                    }
+                }
+            }
+
+            // Store results
+            for (int i_offset = 0; i_offset < TILE_M; i_offset++) {
+                float* C_tile = C + (ii + i_offset) * N + jj;
+                for (int v = 0; v < UNROLL_N; v++) {
+                    int j_offset = v * NEON_SIZE;
+                    vst1q_f32(&C_tile[j_offset], acc[i_offset * UNROLL_N + v]);
+                }
+            }
+        }
+    }
+
+    // Handle remainder (scalar fallback)
+    for (int i = max_i; i < M; i++) {
+        for (int j = max_j; j < N; j++) {
+            float sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+}
+
+#endif  // IS_ARM_PLATFORM
+
+// ==================== Ultra-Fast RoPE with Precomputed Tables ====================
+
+#if IS_X86_PLATFORM
+
+// Precomputed rotation angles for common head dimensions
+static float cos_table_128[128];
+static float sin_table_128[128];
+static bool tables_initialized = false;
+
+FORCE_INLINE void init_rope_tables() {
+    if (tables_initialized) return;
+    tables_initialized = true;
+
+    constexpr float PI = 3.141592653589793f;
+    constexpr int HEAD_DIM = 128;
+
+    for (int i = 0; i < HEAD_DIM / 2; i++) {
+        float freq = 1.0f / std::pow(10000.0f, 2.0f * i / HEAD_DIM);
+        for (int pos = 0; pos < HEAD_DIM; pos++) {
+            float theta = pos * freq * PI;
+            cos_table_128[pos * (HEAD_DIM / 2) + i] = std::cos(theta);
+            sin_table_128[pos * (HEAD_DIM / 2) + i] = std::sin(theta);
+        }
+    }
+}
+
+// Ultra-fast RoPE with precomputed tables
+FORCE_INLINE void apply_rope_ultra_fast(float* q, float* k, int head_dim, int seq_len) {
+    init_rope_tables();
+
+    constexpr int AVX_SIZE = 8;
+    int half_dim = head_dim / 2;
+
+    for (int pos = 0; pos < seq_len; pos++) {
+        float* q_pos = q + pos * head_dim;
+        float* k_pos = k + pos * head_dim;
+
+        // Process in 8-element chunks using precomputed tables
+        for (int i = 0; i < half_dim; i += AVX_SIZE) {
+            // Load cos/sin values
+            const float* cos_ptr = &cos_table_128[pos * half_dim + i];
+            const float* sin_ptr = &sin_table_128[pos * half_dim + i];
+            __m256 cos_v = _mm256_loadu_ps(cos_ptr);
+            __m256 sin_v = _mm256_loadu_ps(sin_ptr);
+
+            // Load q values
+            __m256 q0 = _mm256_loadu_ps(q_pos + i);
+            __m256 q1 = _mm256_loadu_ps(q_pos + i + half_dim);
+
+            // Apply rotation
+            __m256 q_rotated = _mm256_shuffle_ps(q1, q1, _MM_SHUFFLE(2, 3, 0, 1));
+            __m256 q_new = _mm256_sub_ps(_mm256_mul_ps(q0, cos_v),
+                                         _mm256_mul_ps(q_rotated, sin_v));
+
+            // Store rotated q
+            _mm256_storeu_ps(q_pos + i, q_new);
+            _mm256_storeu_ps(q_pos + i + half_dim,
+                             _mm256_add_ps(_mm256_mul_ps(q0, sin_v),
+                                           _mm256_mul_ps(q_rotated, cos_v)));
+
+            // Apply same rotation to k
+            __m256 k0 = _mm256_loadu_ps(k_pos + i);
+            __m256 k1 = _mm256_loadu_ps(k_pos + i + half_dim);
+
+            __m256 k_rotated = _mm256_shuffle_ps(k1, k1, _MM_SHUFFLE(2, 3, 0, 1));
+            __m256 k_new = _mm256_sub_ps(_mm256_mul_ps(k0, cos_v),
+                                         _mm256_mul_ps(k_rotated, sin_v));
+
+            _mm256_storeu_ps(k_pos + i, k_new);
+            _mm256_storeu_ps(k_pos + i + half_dim,
+                             _mm256_add_ps(_mm256_mul_ps(k0, sin_v),
+                                           _mm256_mul_ps(k_rotated, cos_v)));
+        }
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ==================== Ultra-Vectorized Attention with Extreme Unrolling ====================
+
+#if IS_X86_PLATFORM
+
+FORCE_INLINE void attention_ultra_extreme(const float* Q, const float* K, const float* V,
+                                          float* O, int batch, int num_heads,
+                                          int seq_len, int head_dim) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_Q = 8;  // Process 8 queries at once
+    constexpr int BLOCK_K = 32;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    for (int b = 0; b < batch; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q + ((b * num_heads + h) * seq_len) * head_dim;
+            const float* K_head = K + ((b * num_heads + h) * seq_len) * head_dim;
+            const float* V_head = V + ((b * num_heads + h) * seq_len) * head_dim;
+            float* O_head = O + ((b * num_heads + h) * seq_len) * head_dim;
+
+            for (int qi = 0; qi < seq_len; qi += UNROLL_Q) {
+                int q_end = std::min(qi + UNROLL_Q, seq_len);
+                int num_q = q_end - qi;
+
+                // Process queries in batch
+                for (int q_idx = 0; q_idx < num_q; q_idx++) {
+                    const float* Q_row = Q_head + (qi + q_idx) * head_dim;
+                    float* O_row = O_head + (qi + q_idx) * head_dim;
+
+                    // Accumulator for V-weighted sum
+                    __m256 accum[32] = {0};
+                    float row_max = -FLT_MAX;
+                    float row_sum = 0;
+
+                    for (int k_block = 0; k_block < seq_len; k_block += BLOCK_K) {
+                        int k_end = std::min(k_block + BLOCK_K, seq_len);
+                        float block_max = -FLT_MAX;
+
+                        // Compute Q @ K^T for this block
+                        for (int kk = k_block; kk < k_end; kk++) {
+                            const float* K_row = K_head + kk * head_dim;
+                            float dot = 0;
+
+                            // Vectorized dot product
+                            for (int d = 0; d < head_dim; d += AVX_SIZE) {
+                                __m256 q_vec = _mm256_loadu_ps(Q_row + d);
+                                __m256 k_vec = _mm256_loadu_ps(K_row + d);
+                                __m256 prod = _mm256_mul_ps(q_vec, k_vec);
+                                float arr[8];
+                                _mm256_storeu_ps(arr, prod);
+                                for (int i = 0; i < 8; i++) dot += arr[i];
+                            }
+
+                            dot *= scale;
+                            block_max = std::max(block_max, dot);
+                        }
+
+                        // Online softmax for this block
+                        float scale_factor = std::exp(row_max - block_max);
+                        row_sum *= scale_factor;
+                        row_max = block_max;
+
+                        // Accumulate weighted V
+                        for (int kk = k_block; kk < k_end; kk++) {
+                            const float* V_row = V_head + kk * head_dim;
+                            float dot = 0;
+
+                            // Recompute dot product
+                            for (int d = 0; d < head_dim; d += AVX_SIZE) {
+                                __m256 q_vec = _mm256_loadu_ps(Q_row + d);
+                                __m256 k_vec = _mm256_loadu_ps(K_head + kk * head_dim + d);
+                                __m256 prod = _mm256_mul_ps(q_vec, k_vec);
+                                float arr[8];
+                                _mm256_storeu_ps(arr, prod);
+                                for (int i = 0; i < 8; i++) dot += arr[i];
+                            }
+
+                            dot *= scale;
+                            float exp_val = std::exp(dot - block_max);
+
+                            for (int d = 0; d < head_dim; d += AVX_SIZE) {
+                                __m256 exp_v = _mm256_set1_ps(exp_val);
+                                __m256 v_vec = _mm256_loadu_ps(V_row + d);
+                                __m256 o_vec = accum[d / AVX_SIZE];
+                                accum[d / AVX_SIZE] = _mm256_fmadd_ps(exp_v, v_vec, o_vec);
+                            }
+                            row_sum += exp_val;
+                        }
+                    }
+
+                    // Finalize
+                    float inv_sum = 1.0f / (row_sum + 1e-8f);
+                    for (int d = 0; d < head_dim; d += AVX_SIZE) {
+                        __m256 inv = _mm256_set1_ps(inv_sum);
+                        _mm256_storeu_ps(O_row + d, _mm256_mul_ps(accum[d / AVX_SIZE], inv));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ==================== Thread Affinity Optimized Parallel MatMul ====================
+
+#if IS_X86_PLATFORM
+
+void matmul_parallel_affinity_ultra(const float* A, const float* B, float* C,
+                                    int M, int N, int K, int num_threads) {
+    pthread_t threads[64];
+    ThreadData thread_data[64];
+
+    int rows_per_thread = M / num_threads;
+
+    // Set thread affinity for better cache utilization
+    for (int t = 0; t < num_threads; t++) {
+        thread_data[t] = {A, B, C, M, N, K,
+                          t * rows_per_thread,
+                          (t == num_threads - 1) ? M : (t + 1) * rows_per_thread};
+
+        // Create thread with affinity hint
+        pthread_create(&threads[t], nullptr, matmul_thread, &thread_data[t]);
+
+        // Set CPU affinity (Linux)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(t % std::thread::hardware_concurrency(), &cpuset);
+        pthread_setaffinity_np(threads[t], sizeof(cpu_set_t), &cpuset);
+    }
+
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ============================================================================
+// Cross-Platform Aliases for Session 45
+// ============================================================================
+
+#if IS_X86_PLATFORM
+#define matmul_ultra_extreme matmul_ultra_extreme_64x64
+#define apply_rope_ultra apply_rope_ultra_fast
+#define attention_ultra attention_ultra_extreme
+#define matmul_parallel_affinity matmul_parallel_affinity_ultra
+#else
+#define matmul_ultra_extreme matmul_ultra_extreme_32x32_neon
+#define apply_rope_ultra apply_rope_streaming  // Fallback for ARM
+#define attention_ultra attention_hyper  // Fallback for ARM
+#define matmul_parallel_affinity matmul_parallel_affinity  // Already defined
+#endif
+
+// ============================================================================
+// End of Session 45 Optimizations
 // ============================================================================
