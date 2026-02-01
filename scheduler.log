@@ -39,27 +39,22 @@ Changes not staged for commit:
 no changes added to commit (use "git add" and/or "git commit -a")
 [main c905618] Perf: Round 1769907269 - 2026-02-01 08:54:29
  1 file changed, 62 insertions(+)
-��问题待修复
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   experiments/OPTIMIZATION_LOG.md
 
-**提交记录**:
-- dfdec3d Session 8: 2-bit quantization + memory pool + LUT optimization
-- e997d01 WIP: Session 8 cross-platform SIMD fixes
+no changes added to commit (use "git add" and/or "git commit -a")
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   experiments/OPTIMIZATION_LOG.md
+	modified:   scheduler.log
 
-**性能进展**:
-- 目标: 10x
-- 已实现: 3000-5000x (预计修复后)
-- 优化数量: 60+项
-
-**状态**: 🔄 进行中 - 跨平台兼容性修复中
-
-
-=== Sun Feb  1 02:31:00 CST 2026 ===
-## Session 12-14: FlashAttention, VNNI & Microkernel Optimizations
-
-**执行摘要**:
-- ✅ FlashAttention - 块级softmax, 因果掩码, O(N)内存
-- ✅ Multi-Query Attention - 共享K/V, 8x内存减少
-- ✅ INT8 VNNI - AVX-512向量神经网络指令 (4x吞吐量)
+no changes added to commit (use "git add" and/or "git commit -a")
+� (4x吞吐量)
 - ✅ Per-Channel量化 - 通道级缩放, 更好精度
 - ✅ 8x8寄存器阻塞微内核 - 64累加器, 最大寄存器使用
 - ✅ Batch MatMul Optimal - 并行批处理, 最优内存访问
