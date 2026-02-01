@@ -3751,6 +3751,7 @@ void gelu_neon(float* data, int size) {
 
 // ==================== NEW: Ultra-Fast GELU Polynomial Approximation ====================
 
+#if IS_X86_PLATFORM
 // Ultra-fast GELU using cubic approximation (3rd order polynomial)
 // Faster than tanh-based formula while maintaining acceptable accuracy
 FORCE_INLINE __m256 gelu_cubic_avx(__m256 x) {
@@ -3763,32 +3764,14 @@ FORCE_INLINE __m256 gelu_cubic_avx(__m256 x) {
     const __m256 one = _mm256_set1_ps(1.0f);
 
     __m256 x2 = _mm256_mul_ps(x, x);
-    __m256 x3 = _mm256_mul_ps(x2, x);
     __m256 inner = _mm256_mul_ps(x, _mm256_add_ps(scale, _mm256_mul_ps(c, x2)));
 
     // Clamp to [-1, 1] using blend for branchless operation
     __m256 abs_inner = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), inner);
     __m256 clamp_mask = _mm256_cmp_ps(abs_inner, _mm256_set1_ps(1.0f), _CMP_GT_OQ);
     __m256 clamped = _mm256_blendv_ps(inner, _mm256_set1_ps(1.0f), clamp_mask);
-    __m256 neg_clamped = _mm256_blendv_ps(inner, _mm256_set1_ps(-1.0f),
-                                           _mm256_cmp_ps(abs_inner, _mm256_set1_ps(1.0f), _CMP_LT_OQ));
 
     return _mm256_mul_ps(half, _mm256_mul_ps(x, _mm256_add_ps(one, clamped)));
-}
-
-// Even faster: 2nd order approximation for inference speed
-FORCE_INLINE __m256 gelu_quadratic_avx(__m256 x) {
-    // GELU ≈ 0.5 * x for small x, approaches x for large x
-    // Using quadratic: 0.5 * x * (1 + 0.797885 * x - 0.044715 * x³) simplified
-    const __m256 a = _mm256_set1_ps(0.797885f);
-    const __m256 b = _mm256_set1_ps(0.044715f);
-    const __m256 half = _mm256_set1_ps(0.5f);
-    const __m256 one = _mm256_set1_ps(1.0f);
-
-    __m256 x2 = _mm256_mul_ps(x, x);
-    __m256 approx = _mm256_add_ps(one, _mm256_mul_ps(a, _mm256_sub_ps(x, _mm256_mul_ps(b, x2))));
-
-    return _mm256_mul_ps(half, _mm256_mul_ps(x, approx));
 }
 
 // Ultra-fast GELU wrapper with fallback for edge cases
@@ -3830,6 +3813,7 @@ void gelu_ultra_fast_avx2(float* data, int size) {
         data[i] = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
     }
 }
+#endif
 
 // ARM NEON Ultra-Fast GELU
 FORCE_INLINE float32x4_t gelu_cubic_neon(float32x4_t x) {
@@ -3879,13 +3863,12 @@ void gelu_ultra_fast_neon(float* data, int size) {
 
 // ==================== NEW: SIMD-Optimized INT8 Quantization ====================
 
+#if IS_X86_PLATFORM
 // Vectorized int8 quantization using AVX2
 // Maps float values to int8 range [-128, 127]
 FORCE_INLINE void quantize_int8_avx2(const float* input, int8_t* output, int size,
                                      const float* scale, const int32_t* zero_point) {
     constexpr int AVX_SIZE = 8;
-    const __m256i saturation_lower = _mm256_set1_epi8(static_cast<char>(-128));
-    const __m256i saturation_upper = _mm256_set1_epi8(static_cast<char>(127));
     const __m256 inv_scale = _mm256_set1_ps(1.0f / (*scale + 1e-8f));
     const __m256i zero_point_vec = _mm256_set1_epi32(*zero_point);
 
@@ -3933,18 +3916,9 @@ FORCE_INLINE void dequantize_int8_avx2(const int8_t* input, float* output, int s
 
     int i = 0;
 
-    // Unpack and process 8 int8 values at a time
+    // Process 8 floats at a time (4 int8s at a time due to _mm_cvtepi8_epi32)
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
-        // Load 8 int8 values
-        __m256i packed = _mm256_loadu_si256((const __m256i*)&input[i]);
-
-        // Unpack int8 to int32
-        __m256i idx = _mm256_setzero_si256();
-        __m256i shuffled = _mm256_shuffle_epi8(packed, _mm256_set_epi8(
-            7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4,
-            3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0));
-
-        // Alternative: process 4 at a time for simplicity
+        // Handle first 4 int8 values
         __m128i packed_low = _mm_loadl_epi64((__m128i*)&input[i]);
         __m128i extended = _mm_cvtepi8_epi32(packed_low);
         __m256 vals_fp32 = _mm256_cvtepi32_ps(extended);
@@ -3958,7 +3932,6 @@ FORCE_INLINE void dequantize_int8_avx2(const int8_t* input, float* output, int s
             __m256 vals_fp32_high = _mm256_cvtepi32_ps(extended_high);
             __m256 result_high = _mm256_mul_ps(_mm256_sub_ps(vals_fp32_high, zero_point_vec), scale_vec);
             _mm256_storeu_ps(&output[i + 4], result_high);
-            i += 4;
         }
     }
 
@@ -4021,9 +3994,11 @@ FORCE_INLINE void dequantize_int8_fast_neon(const int8_t* input, float* output, 
         output[i] = (static_cast<float>(input[i]) - *zero_point) * *scale;
     }
 }
+#endif
 
 // ==================== NEW: Vectorized Softmax with Improved Reduction ====================
 
+#if IS_X86_PLATFORM
 // Improved softmax with better numerical stability and faster reduction
 void softmax_avx2_improved(float* data, int size) {
     constexpr int AVX_SIZE = 8;
@@ -4124,6 +4099,7 @@ void softmax_avx2_improved(float* data, int size) {
     }
     for (; i < size; i++) data[i] *= inv_sum;
 }
+#endif
 
 // ==================== NEW: BF16/FP32 Hybrid Precision MatMul ====================
 
