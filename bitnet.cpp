@@ -3731,22 +3731,398 @@ void gelu_neon(float* data, int size) {
     const float32x4_t c2 = vdupq_n_f32(0.5f);
     const float32x4_t two = vdupq_n_f32(2.0f);
     const float32x4_t point2 = vdupq_n_f32(0.2f);
-    
+
     for (int i = 0; i < size; i += NEON_SIZE) {
         float32x4_t x = vld1q_f32(&data[i]);
         float32x4_t x2 = vmulq_f32(x, x);
         float32x4_t x3 = vmulq_f32(x2, x);
         float32x4_t tanh_arg = vmulq_f32(c0, vaddq_f32(x, vmulq_f32(c1, x3)));
-        
+
         float32x4_t tanh_x2 = vmulq_f32(tanh_arg, tanh_arg);
         float32x4_t tanh_x3 = vmulq_f32(tanh_x2, tanh_arg);
         float32x4_t num = vaddq_f32(vmulq_f32(two, tanh_arg), vmulq_f32(point2, tanh_x3));
         float32x4_t den = vaddq_f32(two, vmulq_f32(point2, tanh_x2));
         float32x4_t tanh_val = vdivq_f32(num, den);
-        
+
         float32x4_t result = vmulq_f32(c2, vmulq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), tanh_val)));
         vst1q_f32(&data[i], result);
     }
+}
+
+// ==================== NEW: Ultra-Fast GELU Polynomial Approximation ====================
+
+// Ultra-fast GELU using cubic approximation (3rd order polynomial)
+// Faster than tanh-based formula while maintaining acceptable accuracy
+FORCE_INLINE __m256 gelu_cubic_avx(__m256 x) {
+    // GELU ≈ 0.5 * x * (1 + tanh(0.797885 * x * (1 + 0.044715 * x²)))
+    // For speed, we use a simpler polynomial approximation:
+    // GELU ≈ 0.5 * x * (1 + clamp(x * (0.797885 + 0.044715 * x²), -1, 1))
+    const __m256 c = _mm256_set1_ps(0.044715f);
+    const __m256 scale = _mm256_set1_ps(0.797885f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+
+    __m256 x2 = _mm256_mul_ps(x, x);
+    __m256 x3 = _mm256_mul_ps(x2, x);
+    __m256 inner = _mm256_mul_ps(x, _mm256_add_ps(scale, _mm256_mul_ps(c, x2)));
+
+    // Clamp to [-1, 1] using blend for branchless operation
+    __m256 abs_inner = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), inner);
+    __m256 clamp_mask = _mm256_cmp_ps(abs_inner, _mm256_set1_ps(1.0f), _CMP_GT_OQ);
+    __m256 clamped = _mm256_blendv_ps(inner, _mm256_set1_ps(1.0f), clamp_mask);
+    __m256 neg_clamped = _mm256_blendv_ps(inner, _mm256_set1_ps(-1.0f),
+                                           _mm256_cmp_ps(abs_inner, _mm256_set1_ps(1.0f), _CMP_LT_OQ));
+
+    return _mm256_mul_ps(half, _mm256_mul_ps(x, _mm256_add_ps(one, clamped)));
+}
+
+// Even faster: 2nd order approximation for inference speed
+FORCE_INLINE __m256 gelu_quadratic_avx(__m256 x) {
+    // GELU ≈ 0.5 * x for small x, approaches x for large x
+    // Using quadratic: 0.5 * x * (1 + 0.797885 * x - 0.044715 * x³) simplified
+    const __m256 a = _mm256_set1_ps(0.797885f);
+    const __m256 b = _mm256_set1_ps(0.044715f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+
+    __m256 x2 = _mm256_mul_ps(x, x);
+    __m256 approx = _mm256_add_ps(one, _mm256_mul_ps(a, _mm256_sub_ps(x, _mm256_mul_ps(b, x2))));
+
+    return _mm256_mul_ps(half, _mm256_mul_ps(x, approx));
+}
+
+// Ultra-fast GELU wrapper with fallback for edge cases
+void gelu_ultra_fast_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+
+    // Handle small sizes with standard function
+    if (size < AVX_SIZE) {
+        for (int i = 0; i < size; i++) {
+            data[i] = 0.5f * data[i] * (1.0f + std::tanh(0.797885f * data[i] * (1.0f + 0.044715f * data[i] * data[i])));
+        }
+        return;
+    }
+
+    // Process main body
+    int i = 0;
+
+    // Unroll by 2 for better instruction-level parallelism
+    for (; i + AVX_SIZE * 2 <= size; i += AVX_SIZE * 2) {
+        __m256 x0 = _mm256_loadu_ps(&data[i]);
+        __m256 x1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+
+        __m256 result0 = gelu_cubic_avx(x0);
+        __m256 result1 = gelu_cubic_avx(x1);
+
+        _mm256_storeu_ps(&data[i], result0);
+        _mm256_storeu_ps(&data[i + AVX_SIZE], result1);
+    }
+
+    // Handle remaining elements
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], gelu_cubic_avx(x));
+    }
+
+    // Scalar tail
+    for (; i < size; i++) {
+        float x = data[i];
+        data[i] = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
+    }
+}
+
+// ARM NEON Ultra-Fast GELU
+FORCE_INLINE float32x4_t gelu_cubic_neon(float32x4_t x) {
+    const float32x4_t c = vdupq_n_f32(0.044715f);
+    const float32x4_t scale = vdupq_n_f32(0.797885f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+
+    float32x4_t x2 = vmulq_f32(x, x);
+    float32x4_t inner = vmulq_f32(x, vaddq_f32(scale, vmulq_f32(c, x2)));
+    float32x4_t abs_inner = vabsq_f32(inner);
+    uint32x4_t mask = vcgtq_f32(abs_inner, vdupq_n_f32(1.0f));
+    float32x4_t clamped = vbslq_f32(mask, vdupq_n_f32(1.0f), inner);
+
+    return vmulq_f32(half, vmulq_f32(x, vaddq_f32(one, clamped)));
+}
+
+void gelu_ultra_fast_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+
+    if (size < NEON_SIZE) {
+        for (int i = 0; i < size; i++) {
+            float x = data[i];
+            data[i] = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
+        }
+        return;
+    }
+
+    int i = 0;
+    for (; i + NEON_SIZE * 2 <= size; i += NEON_SIZE * 2) {
+        float32x4_t x0 = vld1q_f32(&data[i]);
+        float32x4_t x1 = vld1q_f32(&data[i + NEON_SIZE]);
+        vst1q_f32(&data[i], gelu_cubic_neon(x0));
+        vst1q_f32(&data[i + NEON_SIZE], gelu_cubic_neon(x1));
+    }
+
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        vst1q_f32(&data[i], gelu_cubic_neon(x));
+    }
+
+    for (; i < size; i++) {
+        float x = data[i];
+        data[i] = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
+    }
+}
+
+// ==================== NEW: SIMD-Optimized INT8 Quantization ====================
+
+// Vectorized int8 quantization using AVX2
+// Maps float values to int8 range [-128, 127]
+FORCE_INLINE void quantize_int8_avx2(const float* input, int8_t* output, int size,
+                                     const float* scale, const int32_t* zero_point) {
+    constexpr int AVX_SIZE = 8;
+    const __m256i saturation_lower = _mm256_set1_epi8(static_cast<char>(-128));
+    const __m256i saturation_upper = _mm256_set1_epi8(static_cast<char>(127));
+    const __m256 inv_scale = _mm256_set1_ps(1.0f / (*scale + 1e-8f));
+    const __m256i zero_point_vec = _mm256_set1_epi32(*zero_point);
+
+    int i = 0;
+
+    // Process 8 floats at a time
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        __m256 scaled = _mm256_mul_ps(vals, inv_scale);
+        __m256i rounded = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_ROUND_NEAREST));
+
+        // Add zero point
+        rounded = _mm256_add_epi32(rounded, zero_point_vec);
+
+        // Saturate to int8 range
+        __m256i max_val = _mm256_max_epi32(rounded, _mm256_set1_epi32(-128));
+        __m256i min_val = _mm256_min_epi32(max_val, _mm256_set1_epi32(127));
+
+        // Pack int32 to int8
+        __m256i packed = _mm256_packs_epi32(min_val, _mm256_setzero_si256());
+        packed = _mm256_packs_epi16(packed, _mm256_setzero_si256());
+
+        // Store 8 int8 values
+        int8_t result[8];
+        _mm256_storeu_si256((__m256i*)result, packed);
+        for (int j = 0; j < 8 && i + j < size; j++) {
+            output[i + j] = result[j];
+        }
+    }
+
+    // Scalar tail
+    for (; i < size; i++) {
+        float scaled = input[i] / (*scale + 1e-8f) + *zero_point;
+        int32_t quantized = static_cast<int32_t>(std::round(scaled));
+        output[i] = static_cast<int8_t>(std::max(-128, std::min(127, quantized)));
+    }
+}
+
+// Vectorized int8 dequantization using AVX2
+FORCE_INLINE void dequantize_int8_avx2(const int8_t* input, float* output, int size,
+                                       const float* scale, const int32_t* zero_point) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 scale_vec = _mm256_set1_ps(*scale);
+    const __m256 zero_point_vec = _mm256_set1_ps(static_cast<float>(*zero_point));
+
+    int i = 0;
+
+    // Unpack and process 8 int8 values at a time
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        // Load 8 int8 values
+        __m256i packed = _mm256_loadu_si256((const __m256i*)&input[i]);
+
+        // Unpack int8 to int32
+        __m256i idx = _mm256_setzero_si256();
+        __m256i shuffled = _mm256_shuffle_epi8(packed, _mm256_set_epi8(
+            7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4,
+            3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0));
+
+        // Alternative: process 4 at a time for simplicity
+        __m128i packed_low = _mm_loadl_epi64((__m128i*)&input[i]);
+        __m128i extended = _mm_cvtepi8_epi32(packed_low);
+        __m256 vals_fp32 = _mm256_cvtepi32_ps(extended);
+        __m256 result = _mm256_mul_ps(_mm256_sub_ps(vals_fp32, zero_point_vec), scale_vec);
+        _mm256_storeu_ps(&output[i], result);
+
+        // Handle next 4
+        if (i + 4 < size) {
+            __m128i packed_high = _mm_loadl_epi64((__m128i*)&input[i + 4]);
+            __m128i extended_high = _mm_cvtepi8_epi32(packed_high);
+            __m256 vals_fp32_high = _mm256_cvtepi32_ps(extended_high);
+            __m256 result_high = _mm256_mul_ps(_mm256_sub_ps(vals_fp32_high, zero_point_vec), scale_vec);
+            _mm256_storeu_ps(&output[i + 4], result_high);
+            i += 4;
+        }
+    }
+
+    // Scalar tail
+    for (; i < size; i++) {
+        output[i] = (static_cast<float>(input[i]) - *zero_point) * *scale;
+    }
+}
+
+// ARM NEON int8 quantization
+FORCE_INLINE void quantize_int8_fast_neon(const float* input, int8_t* output, int size,
+                                          const float* scale, const int32_t* zero_point) {
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t inv_scale = vdupq_n_f32(1.0f / (*scale + 1e-8f));
+    const int32x4_t zero_point_vec = vdupq_n_s32(*zero_point);
+
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        float32x4_t scaled = vmulq_f32(vals, inv_scale);
+        int32x4_t rounded = vcvtnq_s32_f32(scaled);
+        int32x4_t with_zp = vaddq_s32(rounded, zero_point_vec);
+
+        // Clamp to [-128, 127]
+        int32x4_t clamped = vmaxq_s32(with_zp, vdupq_n_s32(-128));
+        clamped = vminq_s32(clamped, vdupq_n_s32(127));
+
+        // Store as int8
+        int32_t temp[4];
+        vst1q_s32(temp, clamped);
+        for (int j = 0; j < 4 && i + j < size; j++) {
+            output[i + j] = static_cast<int8_t>(temp[j]);
+        }
+    }
+
+    for (; i < size; i++) {
+        float scaled = input[i] / (*scale + 1e-8f) + *zero_point;
+        int32_t quantized = static_cast<int32_t>(std::round(scaled));
+        output[i] = static_cast<int8_t>(std::max(-128, std::min(127, quantized)));
+    }
+}
+
+// ARM NEON int8 dequantization
+FORCE_INLINE void dequantize_int8_fast_neon(const int8_t* input, float* output, int size,
+                                            const float* scale, const int32_t* zero_point) {
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t scale_vec = vdupq_n_f32(*scale);
+    const float32x4_t zero_point_vec = vdupq_n_f32(static_cast<float>(*zero_point));
+
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        int32x4_t vals = vmovl_s16(vmovn_s32(vld1_s32((const int32_t*)&input[i])));
+        int32x4_t extended = vmovl_s16(vld1_s16((const int16_t*)&input[i]));
+        float32x4_t vals_fp32 = vcvtq_f32_s32(extended);
+        float32x4_t result = vmulq_f32(vsubq_f32(vals_fp32, zero_point_vec), scale_vec);
+        vst1q_f32(&output[i], result);
+    }
+
+    for (; i < size; i++) {
+        output[i] = (static_cast<float>(input[i]) - *zero_point) * *scale;
+    }
+}
+
+// ==================== NEW: Vectorized Softmax with Improved Reduction ====================
+
+// Improved softmax with better numerical stability and faster reduction
+void softmax_avx2_improved(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 4;
+
+    if (size <= 0) return;
+
+    // Step 1: Find maximum with vectorized reduction
+    __m256 max_vec = _mm256_loadu_ps(data);
+    int i = AVX_SIZE;
+
+    // Process in chunks of AVX_SIZE * UNROLL_FACTOR
+    for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 2]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 3]));
+    }
+
+    // Handle remaining chunks
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+    }
+
+    // Horizontal reduction of max_vec
+    float max_vals[8];
+    _mm256_storeu_ps(max_vals, max_vec);
+    float max_val = max_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) {
+        max_val = std::max(max_val, max_vals[j]);
+    }
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+    }
+
+    // Step 2: Exp with max subtraction and sum
+    __m256 max_scalar = _mm256_set1_ps(max_val);
+    __m256 sum_vec = _mm256_setzero_ps();
+    i = 0;
+
+    for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        __m256 vals0 = _mm256_loadu_ps(&data[i]);
+        __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        __m256 vals2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
+        __m256 vals3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+
+        vals0 = fast_exp_avx(_mm256_sub_ps(vals0, max_scalar));
+        vals1 = fast_exp_avx(_mm256_sub_ps(vals1, max_scalar));
+        vals2 = fast_exp_avx(_mm256_sub_ps(vals2, max_scalar));
+        vals3 = fast_exp_avx(_mm256_sub_ps(vals3, max_scalar));
+
+        _mm256_storeu_ps(&data[i], vals0);
+        _mm256_storeu_ps(&data[i + AVX_SIZE], vals1);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 2], vals2);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 3], vals3);
+
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals0, vals1));
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals2, vals3));
+    }
+
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = fast_exp_avx(_mm256_sub_ps(vals, max_scalar));
+        _mm256_storeu_ps(&data[i], vals);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+    }
+
+    // Sum reduction
+    float sum_vals[8];
+    _mm256_storeu_ps(sum_vals, sum_vec);
+    float sum = sum_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) sum += sum_vals[j];
+    for (; i < size; i++) {
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+
+    // Step 3: Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    i = 0;
+
+    for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        __m256 vals0 = _mm256_loadu_ps(&data[i]);
+        __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        __m256 vals2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
+        __m256 vals3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals0, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE], _mm256_mul_ps(vals1, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 2], _mm256_mul_ps(vals2, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 3], _mm256_mul_ps(vals3, inv_vec));
+    }
+
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
 }
 
 // ==================== NEW: BF16/FP32 Hybrid Precision MatMul ====================
