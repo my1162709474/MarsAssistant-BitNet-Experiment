@@ -11248,3 +11248,65 @@ void matmul_hyperthreading_neon(const float* A, const float* B, float* C,
 // ==================== End of Session 30 ====================
 
 // ==================== End of File ====================
+
+// ==================== Quantized Matrix Multiplication ====================
+HOT_FUNC inline unsigned char quantize(float x) {
+    return x > 0.0f ? 1 : 0;
+}
+
+// LUT for popcount optimization
+static const uint8_t POPCOUNT_LUT[256] = {
+    0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8
+};
+
+HOT_FUNC inline int fast_popcount(uint8_t x) {
+    return POPCOUNT_LUT[x];
+}
+
+int popcount_bytes(const unsigned char* data, int len) {
+    int count = 0;
+    int i = 0;
+    
+    // Process 8 bytes at a time for better efficiency
+    for (; i + 7 < len; i += 8) {
+        uint64_t val;
+        std::memcpy(&val, data + i, sizeof(val));
+        count += __builtin_popcountll(val);
+    }
+    
+    // Handle remainder
+    for (; i < len; i++) {
+        count += POPCOUNT_LUT[data[i]];
+    }
+    
+    return count;
+}
+
+// 1-bit matrix multiplication using popcount
+void quantized_matmul(const BitMatrix& A, const BitMatrix& B, float* C,
+                      int M, int N, int K) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int matches = 0;
+            
+            // XOR and count matching bits (1-bit dot product)
+            for (int k = 0; k < K; k += 8) {
+                int chunk = std::min(8, K - k);
+                unsigned char a_val = (A.data[i * A.stride_bytes + k / 8] >> (k % 8)) & 0xFF;
+                unsigned char b_val = (B.data[j * B.stride_bytes + k / 8] >> (k % 8)) & 0xFF;
+                unsigned char xored = a_val ^ b_val;
+                matches += POPCOUNT_LUT[xored];
+            }
+            
+            // Convert to bipolar: matching = +1, mismatching = -1
+            C[i * N + j] = 2.0f * matches - chunk;
+        }
+    }
+}
