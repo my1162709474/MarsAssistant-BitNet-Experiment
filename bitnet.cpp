@@ -65,6 +65,29 @@ struct Matrix {
     }
 };
 
+// ==================== NEW: Sparse Matrix Optimization ====================
+
+struct SparseMatrix {
+    float* values;
+    int* col_indices;
+    int* row_ptr;
+    int rows;
+    int cols;
+    int nnz;  // Number of non-zero elements
+
+    SparseMatrix(int r = 0, int c = 0) : rows(r), cols(c), nnz(0) {
+        values = nullptr;
+        col_indices = nullptr;
+        row_ptr = new int[rows + 1]();
+    }
+
+    ~SparseMatrix() {
+        delete[] values;
+        delete[] col_indices;
+        delete[] row_ptr;
+    }
+};
+
 // ==================== NEW: Aligned 1-bit Matrix ====================
 
 struct BitMatrix {
@@ -2074,29 +2097,6 @@ int get_optimal_batch_size(int M, int N, int K, size_t cache_size) {
     
     return batch_dim;
 }
-
-// ==================== NEW: Sparse Matrix Optimization ====================
-
-struct SparseMatrix {
-    float* values;
-    int* col_indices;
-    int* row_ptr;
-    int rows;
-    int cols;
-    int nnz;  // Number of non-zero elements
-    
-    SparseMatrix(int r = 0, int c = 0) : rows(r), cols(c), nnz(0) {
-        values = nullptr;
-        col_indices = nullptr;
-        row_ptr = new int[rows + 1]();
-    }
-    
-    ~SparseMatrix() {
-        delete[] values;
-        delete[] col_indices;
-        delete[] row_ptr;
-    }
-};
 
 // Convert dense to CSR sparse format
 void dense_to_csr(const float* dense, SparseMatrix& sparse, float threshold = 1e-5f) {
@@ -11331,23 +11331,17 @@ void memcpy_nt(float* dst, const float* src, size_t size) {
 
 #if IS_ARM_PLATFORM
 
-// ARM NEON tanh with lookup table
+// ARM NEON tanh with scalar fallback (uses std::tanh)
 void tanh_lut_neon(float* data, int size) {
-    constexpr int NEON_SIZE = 4;
-
-    int i = 0;
-    for (; i < size; i++) {
-        data[i] = fast_tanh_lut(data[i]);
+    for (int i = 0; i < size; i++) {
+        data[i] = std::tanh(data[i]);
     }
 }
 
-// ARM NEON fast exp v2
+// ARM NEON fast exp v2 (uses scalar fallback)
 void fast_exp_v2_neon(float* data, int size) {
-    constexpr int NEON_SIZE = 4;
-
-    int i = 0;
-    for (; i < size; i++) {
-        data[i] = fast_exp_v2(data[i]);
+    for (int i = 0; i < size; i++) {
+        data[i] = std::exp(data[i]);
     }
 }
 
@@ -11398,8 +11392,6 @@ void memcpy_neon(float* dst, const float* src, size_t size) {
 // ==================== Session 30: Hyper-Threading Aware + Ultra Prefetch ====================
 // Target: Additional 10-20% on top of Session 29
 
-#if defined(__x86_64__) || defined(__i386__)
-
 // ==================== CPU Topology Detection ====================
 
 static inline int get_num_cores() {
@@ -11415,6 +11407,8 @@ static inline int get_current_core() {
 }
 
 // ==================== Hyper-Threading Aware Thread Binding ====================
+
+#if IS_X86_PLATFORM
 
 void matmul_hyperthreading(const float* A, const float* B, float* C,
                            int M, int N, int K) {
@@ -11648,7 +11642,7 @@ FORCE_INLINE void fused_scale_add_relu_gelu(float* RESTRICT out,
     }
 }
 
-#endif  // x86 platform
+#endif  // IS_X86_PLATFORM for matmul_hyperthreading
 
 // ==================== ARM NEON Hyper-Threading Aware (Session 30) ====================
 
@@ -12061,13 +12055,29 @@ void quantize_4bit_neon(const float* src, Bit4MatrixArm& dst) {
             float32x4_t n0 = vmulq_f32(vsubq_f32(v0, zp_vec), inv_scale_vec);
             float32x4_t n1 = vmulq_f32(vsubq_f32(v1, zp_vec), inv_scale_vec);
             
-            // Pack 8 values into 4 bytes
+            // Pack 8 values into 4 bytes using vgetq_lane_f32 with constant indices
+            int q00 = (int)vgetq_lane_f32(n0, 0);
+            int q01 = (int)vgetq_lane_f32(n0, 1);
+            int q02 = (int)vgetq_lane_f32(n0, 2);
+            int q03 = (int)vgetq_lane_f32(n0, 3);
+            int q10 = (int)vgetq_lane_f32(n1, 0);
+            int q11 = (int)vgetq_lane_f32(n1, 1);
+            int q12 = (int)vgetq_lane_f32(n1, 2);
+            int q13 = (int)vgetq_lane_f32(n1, 3);
+
+            int qs[8] = {
+                std::max(0, std::min(15, q00)),
+                std::max(0, std::min(15, q01)),
+                std::max(0, std::min(15, q02)),
+                std::max(0, std::min(15, q03)),
+                std::max(0, std::min(15, q10)),
+                std::max(0, std::min(15, q11)),
+                std::max(0, std::min(15, q12)),
+                std::max(0, std::min(15, q13))
+            };
+
             for (int k = 0; k < 4; k++) {
-                int q0 = (int)vgetq_lane_f32(n0, k);
-                int q1 = (int)vgetq_lane_f32(n1, k);
-                q0 = std::max(0, std::min(15, q0));
-                q1 = std::max(0, std::min(15, q1));
-                dst.data[i * dst.stride_bytes + j / 2 + k] = (unsigned char)((q1 << 4) | q0);
+                dst.data[i * dst.stride_bytes + j / 2 + k] = (unsigned char)((qs[k + 4] << 4) | qs[k]);
             }
         }
         
@@ -12143,16 +12153,17 @@ void quantized_matmul(const BitMatrix& A, const BitMatrix& B, float* C,
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             int matches = 0;
-            
+            int chunk = 0;
+
             // XOR and count matching bits (1-bit dot product)
             for (int k = 0; k < K; k += 8) {
-                int chunk = std::min(8, K - k);
+                chunk = std::min(8, K - k);
                 unsigned char a_val = (A.data[i * A.stride_bytes + k / 8] >> (k % 8)) & 0xFF;
                 unsigned char b_val = (B.data[j * B.stride_bytes + k / 8] >> (k % 8)) & 0xFF;
                 unsigned char xored = a_val ^ b_val;
                 matches += POPCOUNT_LUT[xored];
             }
-            
+
             // Convert to bipolar: matching = +1, mismatching = -1
             C[i * N + j] = 2.0f * matches - chunk;
         }
@@ -12466,7 +12477,18 @@ void attention_gelu_fused(const float* Q, const float* K, const float* V,
                     float32x4_t x_sq = vmulq_f32(x, x);
                     float32x4_t inner = vmulq_f32(vdupq_n_f32(sqrt_2pi),
                                                   vaddq_f32(x, vmulq_f32(vdupq_n_f32(coef), x_sq)));
-                    float32x4_t tanh_inner = vtanhq_f32(inner);
+                    // Manual tanh using exp(2x) approximation
+                    // tanh(y) = (exp(2y) - 1) / (exp(2y) + 1)
+                    // For NEON without vexpq, use scalar fallback
+                    float inner_arr[4];
+                    vst1q_f32(inner_arr, inner);
+                    float tanh_arr[4];
+                    for (int vi = 0; vi < 4; vi++) {
+                        float two_y = 2.0f * inner_arr[vi];
+                        float exp_2y = std::exp(two_y);
+                        tanh_arr[vi] = (exp_2y - 1.0f) / (exp_2y + 1.0f);
+                    }
+                    float32x4_t tanh_inner = vld1q_f32(tanh_arr);
                     float32x4_t gelu = vmulq_f32(vmulq_f32(x, vdupq_n_f32(half)),
                                                   vaddq_f32(vdupq_n_f32(1.0f), tanh_inner));
                     
@@ -12599,9 +12621,11 @@ void matmul_16x_unroll(const float* A, const float* B, float* C,
     matmul_neon(A, B, C, M, N, K);
 }
 
-#endif
+#endif  // defined(__x86_64__) || defined(__i386__)
 
 // ==================== NEW: Hyper-Optimized Softmax ====================
+
+#if IS_X86_PLATFORM
 
 FORCE_INLINE void softmax_hyper(float* data, int size) {
     constexpr int AVX_SIZE = 8;
@@ -12711,7 +12735,11 @@ FORCE_INLINE void softmax_hyper(float* data, int size) {
     }
 }
 
+#endif  // IS_X86_PLATFORM for softmax_hyper
+
 // ==================== NEW: Supercharged Attention with Hyper Softmax ====================
+
+#if IS_X86_PLATFORM
 
 void attention_hyper(const float* Q, const float* K, const float* V,
                      float* output, int B, int T, int d) {
@@ -12793,6 +12821,8 @@ void attention_hyper(const float* Q, const float* K, const float* V,
     
     delete[] scores;
 }
+
+#endif  // IS_X86_PLATFORM for attention_hyper
 
 // ==================== NEW: Improved Memory Prefetch Strategy ====================
 
