@@ -5508,11 +5508,12 @@ void flash_attention_causal(const float* Q, const float* K, const float* V,
     delete[] acc_tile;
 }
 
-// Multi-Query Attention (shared K/V for memory efficiency)
+// Multi-Query Attention (shared K/V for memory efficiency) - OPTIMIZED
 void multi_query_attention(const float* Q, const float* K, const float* V,
                            float* O, int N, int d, int num_heads) {
     constexpr int AVX_SIZE = 8;
     const int d_head = d / num_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d_head));
     
     // K and V have shape (N, d_head) - shared across heads
     // Q has shape (N, d)
@@ -5521,47 +5522,149 @@ void multi_query_attention(const float* Q, const float* K, const float* V,
         const float* Q_head = Q + h * d_head;
         float* O_head = O + h * d_head;
         
-        // S = Q_head @ K^T (N x N)
+        // S = Q_head @ K^T (N x N) - OPTIMIZED with SIMD
         float* S = new float[N * N];
+        
+        // Pre-compute Q_head as array of vectors for better cache reuse
+        std::vector<std::vector<float>> Q_vecs(N);
         for (int i = 0; i < N; i++) {
+            Q_vecs[i].resize(d_head);
             const float* Q_row = Q_head + i * d;
-            for (int j = 0; j < N; j++) {
-                const float* K_row = K + j * d_head;
-                float sum = 0.0f;
-                for (int k = 0; k < d_head; k++) {
-                    sum += Q_row[k] * K_row[k];
-                }
-                S[i * N + j] = sum / std::sqrt(d_head);
+            for (int k = 0; k < d_head; k++) {
+                Q_vecs[i][k] = Q_row[k];
             }
         }
         
-        // Softmax
+        // Compute S using vectorized dot products
+        for (int i = 0; i < N; i++) {
+            const float* Q_row = Q_vecs[i].data();
+            float* S_row = S + i * N;
+            
+            for (int j = 0; j < N; j++) {
+                const float* K_row = K + j * d_head;
+                
+                // Vectorized dot product
+                __m256 sum_vec = _mm256_setzero_ps();
+                int k = 0;
+                for (; k + AVX_SIZE <= d_head; k += AVX_SIZE) {
+                    __m256 q_vec = _mm256_loadu_ps(&Q_row[k]);
+                    __m256 k_vec = _mm256_loadu_ps(&K_row[k]);
+                    sum_vec = _mm256_fmadd_ps(q_vec, k_vec, sum_vec);
+                }
+                
+                // Horizontal sum
+                float sum_arr[8];
+                _mm256_storeu_ps(sum_arr, sum_vec);
+                float sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3] +
+                           sum_arr[4] + sum_arr[5] + sum_arr[6] + sum_arr[7];
+                
+                // Scalar remainder
+                for (; k < d_head; k++) {
+                    sum += Q_row[k] * K_row[k];
+                }
+                
+                S_row[j] = sum * scale;
+            }
+        }
+        
+        // Softmax - OPTIMIZED with SIMD
+        const __m256 zero = _mm256_setzero_ps();
         for (int i = 0; i < N; i++) {
             float* S_row = S + i * N;
-            float max_val = -FLT_MAX;
-            for (int j = 0; j < N; j++) {
-                max_val = std::max(max_val, S_row[j]);
+            
+            // Find max
+            __m256 max_vec = _mm256_set1_ps(S_row[0]);
+            int j = 0;
+            for (; j + AVX_SIZE <= N; j += AVX_SIZE) {
+                max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&S_row[j]));
             }
-            float sum = 0.0f;
-            for (int j = 0; j < N; j++) {
+            
+            // Horizontal max reduction
+            float max_val = S_row[0];
+            for (int k = 0; k < 8 && j - AVX_SIZE + k < N; k++) {
+                max_val = std::max(max_val, S_row[j - AVX_SIZE + k]);
+            }
+            float max_arr[8];
+            _mm256_storeu_ps(max_arr, max_vec);
+            for (int k = 0; k < 8; k++) max_val = std::max(max_val, max_arr[k]);
+            for (; j < N; j++) max_val = std::max(max_val, S_row[j]);
+            
+            // Exp and sum
+            __m256 sum_vec = _mm256_setzero_ps();
+            __m256 max_scalar = _mm256_set1_ps(max_val);
+            j = 0;
+            
+            for (; j + AVX_SIZE * 2 <= N; j += AVX_SIZE * 2) {
+                __m256 vals0 = _mm256_loadu_ps(&S_row[j]);
+                __m256 vals1 = _mm256_loadu_ps(&S_row[j + AVX_SIZE]);
+                vals0 = _mm256_sub_ps(vals0, max_scalar);
+                vals1 = _mm256_sub_ps(vals1, max_scalar);
+                vals0 = fast_exp_avx(vals0);
+                vals1 = fast_exp_avx(vals1);
+                _mm256_storeu_ps(&S_row[j], vals0);
+                _mm256_storeu_ps(&S_row[j + AVX_SIZE], vals1);
+                sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals0, vals1));
+            }
+            
+            for (; j + AVX_SIZE <= N; j += AVX_SIZE) {
+                __m256 vals = _mm256_sub_ps(_mm256_loadu_ps(&S_row[j]), max_scalar);
+                vals = fast_exp_avx(vals);
+                _mm256_storeu_ps(&S_row[j], vals);
+                sum_vec = _mm256_add_ps(sum_vec, vals);
+            }
+            
+            float sum = 0;
+            float sum_arr[8];
+            _mm256_storeu_ps(sum_arr, sum_vec);
+            for (int k = 0; k < 8; k++) sum += sum_arr[k];
+            for (; j < N; j++) {
                 S_row[j] = std::exp(S_row[j] - max_val);
                 sum += S_row[j];
             }
-            for (int j = 0; j < N; j++) {
-                S_row[j] /= sum;
+            
+            // Normalize
+            float inv_sum = 1.0f / (sum + 1e-8f);
+            __m256 inv_vec = _mm256_set1_ps(inv_sum);
+            j = 0;
+            
+            for (; j + AVX_SIZE * 2 <= N; j += AVX_SIZE * 2) {
+                __m256 vals0 = _mm256_loadu_ps(&S_row[j]);
+                __m256 vals1 = _mm256_loadu_ps(&S_row[j + AVX_SIZE]);
+                _mm256_storeu_ps(&S_row[j], _mm256_mul_ps(vals0, inv_vec));
+                _mm256_storeu_ps(&S_row[j + AVX_SIZE], _mm256_mul_ps(vals1, inv_vec));
             }
+            
+            for (; j + AVX_SIZE <= N; j += AVX_SIZE) {
+                __m256 vals = _mm256_loadu_ps(&S_row[j]);
+                _mm256_storeu_ps(&S_row[j], _mm256_mul_ps(vals, inv_vec));
+            }
+            for (; j < N; j++) S_row[j] *= inv_sum;
         }
         
-        // O = S @ V
+        // O = S @ V - OPTIMIZED with SIMD
         for (int i = 0; i < N; i++) {
             const float* S_row = S + i * N;
-            float* O_row = O_head + i * d;
-            std::fill(O_row, O_row + d_head, 0.0f);
+            float* O_row = O_head + i * d_head;
             
+            // Initialize output to zero
+            for (int k = 0; k < d_head; k++) O_row[k] = 0.0f;
+            
+            // Accumulate weighted V
             for (int j = 0; j < N; j++) {
+                float s_val = S_row[j];
                 const float* V_row = V + j * d_head;
-                for (int k = 0; k < d_head; k++) {
-                    O_row[k] += S_row[j] * V_row[k];
+                
+                if (s_val > 1e-6f) {  // Skip small values
+                    __m256 s_vec = _mm256_set1_ps(s_val);
+                    int k = 0;
+                    for (; k + AVX_SIZE <= d_head; k += AVX_SIZE) {
+                        __m256 o_vec = _mm256_loadu_ps(&O_row[k]);
+                        __m256 v_vec = _mm256_loadu_ps(&V_row[k]);
+                        _mm256_storeu_ps(&O_row[k], _mm256_fmadd_ps(s_vec, v_vec, o_vec));
+                    }
+                    for (; k < d_head; k++) {
+                        O_row[k] += s_val * V_row[k];
+                    }
                 }
             }
         }
