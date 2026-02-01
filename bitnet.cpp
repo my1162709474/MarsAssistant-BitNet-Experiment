@@ -29,6 +29,13 @@ void matmul_multi_level_blocked(const float* A, const float* B, float* C, int M,
 #define IS_X86_PLATFORM 0
 #endif
 
+// Compiler detection
+#if defined(__GNUC__)
+#define COMPILER_GCC 1
+#else
+#define COMPILER_GCC 0
+#endif
+
 #if defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
 #define IS_ARM_PLATFORM 1
 #else
@@ -5509,6 +5516,8 @@ void flash_attention_causal(const float* Q, const float* K, const float* V,
 }
 
 // Multi-Query Attention (shared K/V for memory efficiency) - OPTIMIZED
+#if defined(__x86_64__) || defined(__i386__)
+
 void multi_query_attention(const float* Q, const float* K, const float* V,
                            float* O, int N, int d, int num_heads) {
     constexpr int AVX_SIZE = 8;
@@ -20992,11 +21001,287 @@ FORCE_INLINE void softmax_hyper_8x_neon(float* data, int size) {
 
 #endif  // IS_ARM_PLATFORM
 
-// ==================== Cross-Platform Aliases for Session 54 ====================
+// 55: Ultra-F ==================== Sessionast Lookup Table Optimization + Enhanced Prefetch ====================
+
+// ==================== Ultra-Expanded Exp Lookup Table (1024 entries) ====================
+
+static float exp_lut_1024[1024];
+static bool exp_lut_initialized = false;
+
+FORCE_INLINE void init_exp_lut_1024() {
+    if (exp_lut_initialized) return;
+    
+    constexpr float X_MIN = -10.0f;
+    constexpr float X_MAX = 10.0f;
+    constexpr float STEP = (X_MAX - X_MIN) / 1023.0f;
+    
+    for (int i = 0; i < 1024; i++) {
+        float x = X_MIN + i * STEP;
+        exp_lut_1024[i] = std::exp(x);
+    }
+    
+    exp_lut_initialized = true;
+}
+
+FORCE_INLINE float fast_exp_lut_1024(float x) {
+    constexpr float X_MIN = -10.0f;
+    constexpr float X_MAX = 10.0f;
+    constexpr float INV_STEP = 1023.0f / (X_MAX - X_MIN);
+    
+    // Clamp to LUT range
+    if (x <= X_MIN) return exp_lut_1024[0];
+    if (x >= X_MAX) return exp_lut_1024[1023];
+    
+    float idx_f = (x - X_MIN) * INV_STEP;
+    int idx = static_cast<int>(idx_f);
+    float alpha = idx_f - idx;
+    
+    // Linear interpolation
+    float result = exp_lut_1024[idx] * (1.0f - alpha) + exp_lut_1024[idx + 1] * alpha;
+    return result;
+}
+
+// AVX2 vectorized exp with 1024-entry LUT
+FORCE_INLINE void exp_lut_1024_avx2(float* data, int size) {
+    init_exp_lut_1024();
+    constexpr int AVX_SIZE = 8;
+    constexpr float X_MIN = -10.0f;
+    constexpr float X_MAX = 10.0f;
+    constexpr float INV_STEP = 1023.0f / (X_MAX - X_MIN);
+    __m256 min_vec = _mm256_set1_ps(X_MIN);
+    __m256 max_vec = _mm256_set1_ps(X_MAX);
+    __m256 step_vec = _mm256_set1_ps(INV_STEP);
+    
+    // Pre-load LUT (8 entries at a time)
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(data + i);
+        
+        // Clamp
+        x = _mm256_max_ps(x, min_vec);
+        x = _mm256_min_ps(x, max_vec);
+        
+        // Compute indices
+        __m256 idx_f = _mm256_sub_ps(x, min_vec);
+        idx_f = _mm256_mul_ps(idx_f, step_vec);
+        
+        // This is simplified - full implementation would use gather instructions
+        // Fallback to scalar for simplicity in this version
+        float x_vals[8];
+        _mm256_storeu_ps(x_vals, x);
+        for (int j = 0; j < 8; j++) {
+            x_vals[j] = fast_exp_lut_1024(x_vals[j]);
+        }
+        _mm256_storeu_ps(data + i, _mm256_loadu_ps(x_vals));
+    }
+}
+
+// ==================== Ultra-Expanded Tanh Lookup Table (1024 entries) ====================
+
+static float tanh_lut_1024[1024];
+static bool tanh_lut_initialized = false;
+
+FORCE_INLINE void init_tanh_lut_1024() {
+    if (tanh_lut_initialized) return;
+    
+    constexpr float X_MIN = -5.0f;
+    constexpr float X_MAX = 5.0f;
+    constexpr float STEP = (X_MAX - X_MIN) / 1023.0f;
+    
+    for (int i = 0; i < 1024; i++) {
+        float x = X_MIN + i * STEP;
+        tanh_lut_1024[i] = std::tanh(x);
+    }
+    
+    tanh_lut_initialized = true;
+}
+
+FORCE_INLINE float fast_tanh_lut_1024(float x) {
+    constexpr float X_MIN = -5.0f;
+    constexpr float X_MAX = 5.0f;
+    constexpr float INV_STEP = 1023.0f / (X_MAX - X_MIN);
+    
+    if (x <= X_MIN) return -1.0f;
+    if (x >= X_MAX) return 1.0f;
+    
+    float idx_f = (x - X_MIN) * INV_STEP;
+    int idx = static_cast<int>(idx_f);
+    float alpha = idx_f - idx;
+    
+    float result = tanh_lut_1024[idx] * (1.0f - alpha) + tanh_lut_1024[idx + 1] * alpha;
+    return result;
+}
+
+// ==================== Ultra-Fast Memory Set with NT Stores (AVX2) ====================
+
+FORCE_INLINE void memory_set_zero_nt_avx2(float* ptr, int size) {
+    constexpr int AVX_SIZE = 8;
+    __m256 zero = _mm256_setzero_ps();
+    
+    int i = 0;
+    // Non-temporal stores for large buffers (>1KB)
+    if (size > 256) {
+        for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+            _mm256_stream_ps(ptr + i, zero);
+            _mm256_stream_ps(ptr + i + AVX_SIZE, zero);
+            _mm256_stream_ps(ptr + i + AVX_SIZE * 2, zero);
+            _mm256_stream_ps(ptr + i + AVX_SIZE * 3, zero);
+        }
+    }
+    
+    // Regular stores for remaining data
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        _mm256_storeu_ps(ptr + i, zero);
+    }
+    
+    // Scalar fallback
+    for (; i < size; i++) {
+        ptr[i] = 0.0f;
+    }
+    
+    // Memory fence
+    _mm_sfence();
+}
+
+// ==================== Ultra-Fast Memory Copy with AVX2 ====================
+
+FORCE_INLINE void memory_copy_fast_avx2(float* RESTRICT dest, 
+                                        const float* RESTRICT src, 
+                                        int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;
+    constexpr int BLOCK = AVX_SIZE * UNROLL;
+    
+    int i = 0;
+    
+    // Aligned copy with 4x unrolling
+    for (; i + BLOCK <= size; i += BLOCK) {
+        _mm256_storeu_ps(dest + i, _mm256_loadu_ps(src + i));
+        _mm256_storeu_ps(dest + i + AVX_SIZE, _mm256_loadu_ps(src + i + AVX_SIZE));
+        _mm256_storeu_ps(dest + i + AVX_SIZE * 2, _mm256_loadu_ps(src + i + AVX_SIZE * 2));
+        _mm256_storeu_ps(dest + i + AVX_SIZE * 3, _mm256_loadu_ps(src + i + AVX_SIZE * 3));
+    }
+    
+    // Remaining data
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        _mm256_storeu_ps(dest + i, _mm256_loadu_ps(src + i));
+    }
+    
+    // Scalar fallback
+    for (; i < size; i++) {
+        dest[i] = src[i];
+    }
+}
+
+// ==================== Enhanced Prefetch Strategy (Adaptive Distance) ====================
+
+FORCE_INLINE void adaptive_prefetch_matrix(const float* RESTRICT A,
+                                           const float* RESTRICT B,
+                                           int M, int N, int K,
+                                           int K_current, int i, int j) {
+    // Adaptive prefetch distance based on K position
+    int prefetch_dist;
+    if (K_current < K / 4) {
+        prefetch_dist = 8;  // Early: longer prefetch to warm cache
+    } else if (K_current < K / 2) {
+        prefetch_dist = 4;  // Mid: normal prefetch
+    } else {
+        prefetch_dist = 2;  // Late: short prefetch, data in L1
+    }
+    
+    // Prefetch A row for next iteration
+    if (i + 1 < M && K_current + prefetch_dist < K) {
+        PREFETCH_READ(&A[(i + 1) * K + K_current + prefetch_dist]);
+    }
+    
+    // Prefetch B column
+    if (j + 16 < N && K_current + prefetch_dist < K) {
+        PREFETCH_READ(&B[(K_current + prefetch_dist) * N + j + 16]);
+    }
+    
+    // Prefetch C output
+    if (i + 1 < M) {
+        PREFETCH_WRITE(&C[(i + 1) * N + j]);
+    }
+}
+
+// ==================== Hyper-Parallel Batch Processing (4x Batch Unrolling) ====================
+
+void matmul_batch_4x_unroll(const float* A_batch, const float* B, float* C_batch,
+                            int batch_size, int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 3;
+    
+    for (int b = 0; b < batch_size; b += 4) {
+        const float* A0 = A_batch + b * M * K;
+        const float* A1 = (b + 1 < batch_size) ? A_batch + (b + 1) * M * K : nullptr;
+        const float* A2 = (b + 2 < batch_size) ? A_batch + (b + 2) * M * K : nullptr;
+        const float* A3 = (b + 3 < batch_size) ? A_batch + (b + 3) * M * K : nullptr;
+        
+        float* C0 = C_batch + b * M * N;
+        float* C1 = (b + 1 < batch_size) ? C_batch + (b + 1) * M * N : nullptr;
+        float* C2 = (b + 2 < batch_size) ? C_batch + (b + 2) * M * N : nullptr;
+        float* C3 = (b + 3 < batch_size) ? C_batch + (b + 3) * M * N : nullptr;
+        
+        int valid_batches = 1;
+        if (A1 && C1) valid_batches++;
+        if (A2 && C2) valid_batches++;
+        if (A3 && C3) valid_batches++;
+        
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j += AVX_SIZE) {
+                __m256 c0[8] = {0}, c1[8] = {0}, c2[8] = {0}, c3[8] = {0};
+                
+                for (int k = 0; k < K; k++) {
+                    __m256 a0 = _mm256_set1_ps(A0[i * K + k]);
+                    _mm_prefetch(&A0[i * K + k + PREFETCH_DIST], _MM_HINT_T0);
+                    
+                    __m256 b_vec = _mm256_loadu_ps(&B[k * N + j]);
+                    c0[0] = _mm256_fmadd_ps(a0, b_vec, c0[0]);
+                    
+                    if (valid_batches >= 2) {
+                        __m256 a1 = _mm256_set1_ps(A1[i * K + k]);
+                        c1[0] = _mm256_fmadd_ps(a1, b_vec, c1[0]);
+                    }
+                    if (valid_batches >= 3) {
+                        __m256 a2 = _mm256_set1_ps(A2[i * K + k]);
+                        c2[0] = _mm256_fmadd_ps(a2, b_vec, c2[0]);
+                    }
+                    if (valid_batches >= 4) {
+                        __m256 a3 = _mm256_set1_ps(A3[i * K + k]);
+                        c3[0] = _mm256_fmadd_ps(a3, b_vec, c3[0]);
+                    }
+                }
+                
+                _mm256_storeu_ps(&C0[i * N + j], c0[0]);
+                if (valid_batches >= 2) _mm256_storeu_ps(&C1[i * N + j], c1[0]);
+                if (valid_batches >= 3) _mm256_storeu_ps(&C2[i * N + j], c2[0]);
+                if (valid_batches >= 4) _mm256_storeu_ps(&C3[i * N + j], c3[0]);
+            }
+        }
+    }
+}
+
+// ==================== Cross-Platform Aliases for Session 55 ====================
 
 #if IS_X86_PLATFORM
-#define matmul_ultra_unroll_16x matmul_ultra_16x_unroll
-#define matmul_hyper_4level matmul_hyper_4level_prefetch
+#define exp_lut_fast exp_lut_1024_avx2
+#define memory_set_zero memory_set_zero_nt_avx2
+#define memory_copy memory_copy_fast_avx2
+#define matmul_batch_hyper matmul_batch_4x_unroll
+
+// Initialize LUTs on first use
+__attribute__((constructor))
+static void init_session55_luts() {
+    init_exp_lut_1024();
+    init_tanh_lut_1024();
+}
+
+#elif IS_ARM_PLATFORM
+#define exp_lut_fast sigmoid_lut_avx2  // Fallback to existing
+#define memory_set_zero memory_set_zero_neon
+#define memory_copy memory_copy_fast_neon
+#define matmul_batch_hyper matmul_batch_neon
+#endif
 #else
 #define matmul_ultra_unroll_16x matmul_neon_8x_unroll
 #define matmul_hyper_4level matmul_neon_8x_unroll  // Use same base implementation
