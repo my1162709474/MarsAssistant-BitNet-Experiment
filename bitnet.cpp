@@ -15615,5 +15615,520 @@ FORCE_INLINE void fused_layernorm_gelu_residual(
 }
 
 // ============================================================================
-// End of Session 41 Optimizations
+// SESSION 42: Ultra-Vectorized RoPE, FlashAttention 2.0 & INT4 Microkernel
+// ============================================================================
+
+// ==================== Session 42.1: AVX-512 Hyper Vectorized RoPE ====================
+
+#if defined(__AVX512F__)
+
+void apply_rope_avx512(float* q, float* k, int num_heads, int head_dim, int seq_len) {
+    constexpr float PI = 3.141592653589793f;
+    int half_dim = head_dim / 2;
+    
+    // Pre-compute rotation angles with AVX-512
+    std::vector<float> angles(seq_len * half_dim);
+    constexpr float INV_HEAD_DIM = 1.0f / 10000.0f;
+    
+    for (int pos = 0; pos < seq_len; pos++) {
+        for (int i = 0; i < half_dim; i++) {
+            angles[pos * half_dim + i] = pos * INV_HEAD_DIM * 2.0f * i * PI;
+        }
+    }
+    
+    // Apply rotation using AVX-512 (16 floats per iteration)
+    constexpr int AVX512_SIZE = 16;
+    for (int h = 0; h < num_heads; h++) {
+        for (int pos = 0; pos < seq_len; pos++) {
+            for (int i = 0; i < half_dim; i += AVX512_SIZE) {
+                // Load rotation values
+                __m512 cos_vals = _mm512_loadu_ps(&angles[pos * half_dim + i]);
+                __m512 sin_vals = _mm512_loadu_ps(&angles[pos * half_dim + i]);
+                
+                // Compute cos and sin using vectorized operations
+                __m512 cos_vec = cos_vals;
+                __m512 sin_vec = sin_vals;
+                
+                // Use approximation for faster trig
+                // cos(x) ≈ 1 - x²/2 + x⁴/24, sin(x) ≈ x - x³/6
+                __m512 x2 = _mm512_mul_ps(cos_vec, cos_vec);
+                __m512 x4 = _mm512_mul_ps(x2, x2);
+                
+                __m512 cos_approx = _mm512_sub_ps(
+                    _mm512_add_ps(_mm512_set1_ps(1.0f), _mm512_mul_ps(_mm512_set1_ps(0.5f), x2)),
+                    _mm512_mul_ps(_mm512_set1_ps(0.0416667f), x4)
+                );
+                
+                __m512 x3 = _mm512_mul_ps(x2, cos_vec);
+                __m512 sin_approx = _mm512_sub_ps(
+                    cos_vec,
+                    _mm512_mul_ps(_mm512_set1_ps(0.166667f), x3)
+                );
+                
+                // Load Q values (complex pair)
+                __m512 q0 = _mm512_loadu_ps(&q[(h * seq_len + pos) * head_dim + i]);
+                __m512 q1 = _mm512_loadu_ps(&q[(h * seq_len + pos) * head_dim + i + half_dim]);
+                
+                // Rotate: [q0, q1] * [cos, sin] = [q0*cos - q1*sin, q0*sin + q1*cos]
+                __m512 q_rotated = _mm512_add_ps(
+                    _mm512_mul_ps(q0, cos_approx),
+                    _mm512_mul_ps(q1, sin_approx)
+                );
+                __m512 q_rotated_2 = _mm512_sub_ps(
+                    _mm512_mul_ps(q0, sin_approx),
+                    _mm512_mul_ps(q1, cos_approx)
+                );
+                
+                _mm512_storeu_ps(&q[(h * seq_len + pos) * head_dim + i], q_rotated);
+                _mm512_storeu_ps(&q[(h * seq_len + pos) * head_dim + i + half_dim], q_rotated_2);
+                
+                // Rotate K
+                __m512 k0 = _mm512_loadu_ps(&k[(h * seq_len + pos) * head_dim + i]);
+                __m512 k1 = _mm512_loadu_ps(&k[(h * seq_len + pos) * head_dim + i + half_dim]);
+                
+                __m512 k_rotated = _mm512_add_ps(
+                    _mm512_mul_ps(k0, cos_approx),
+                    _mm512_mul_ps(k1, sin_approx)
+                );
+                __m512 k_rotated_2 = _mm512_sub_ps(
+                    _mm512_mul_ps(k0, sin_approx),
+                    _mm512_mul_ps(k1, cos_approx)
+                );
+                
+                _mm512_storeu_ps(&k[(h * seq_len + pos) * head_dim + i], k_rotated);
+                _mm512_storeu_ps(&k[(h * seq_len + pos) * head_dim + i + half_dim], k_rotated_2);
+            }
+        }
+    }
+}
+
+#else
+
+void apply_rope_avx512(float* q, float* k, int num_heads, int head_dim, int seq_len) {
+    // Fallback to AVX2 version
+    apply_rope(q, k, num_heads, head_dim, seq_len);
+}
+
+#endif
+
+// ==================== Session 42.2: FlashAttention 2.0 Block-Based ====================
+
+#if IS_X86_PLATFORM
+
+void flash_attention_2_blocked(
+    const float* Q, const float* K, const float* V,
+    float* O, float* L,
+    int N, int d, int num_heads,
+    float softmax_scale = 1.0f,
+    int block_size = 64) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int BLOCK_SIZE = 64;
+    constexpr int BLOCK_K = 64;
+    
+    int d_head = d / num_heads;
+    
+    // Process each head
+    for (int h = 0; h < num_heads; h++) {
+        const float* Q_head = Q + h * N * d_head;
+        const float* K_head = K + h * N * d_head;
+        const float* V_head = V + h * N * d_head;
+        float* O_head = O + h * N * d_head;
+        float* L_head = L + h * N;
+        
+        // Ti = row_i(Q @ K^T)
+        std::vector<float> T(N, 0.0f);
+        
+        // Block-based computation of Q @ K^T and softmax
+        for (int i = 0; i < N; i += BLOCK_SIZE) {
+            int M = std::min(BLOCK_SIZE, N - i);
+            
+            for (int j = 0; j < N; j += BLOCK_K) {
+                int K_block = std::min(BLOCK_K, N - j);
+                
+                // Process block
+                for (int ii = 0; ii < M; ii++) {
+                    int q_row = i + ii;
+                    __m256 sum_vec = _mm256_setzero_ps();
+                    
+                    for (int kk = 0; kk < K_block; kk += AVX_SIZE) {
+                        __m256 q_vals = _mm256_loadu_ps(&Q_head[q_row * d_head + kk]);
+                        __m256 k_vals = _mm256_loadu_ps(&K_head[(j + kk) * d_head + kk]);
+                        sum_vec = _mm256_fmadd_ps(q_vals, k_vals, sum_vec);
+                    }
+                    
+                    // Horizontal reduction
+                    float32_t sum_arr[8];
+                    _mm256_storeu_ps(sum_arr, sum_vec);
+                    float sum = 0;
+                    for (int s = 0; s < 8 && kk + s < K_block; s++) {
+                        sum += sum_arr[s];
+                    }
+                    T[q_row] += sum;
+                }
+            }
+            
+            // Online softmax for this block
+            for (int ii = 0; ii < M; ii++) {
+                int row = i + ii;
+                float row_max = -FLT_MAX;
+                
+                // Find max in this block
+                for (int j = 0; j < N; j++) {
+                    row_max = std::max(row_max, T[row]);
+                }
+                
+                // Compute exp and sum with scaling
+                float row_sum = 0;
+                for (int j = 0; j < N; j++) {
+                    float exp_val = std::exp((T[row] - row_max) * softmax_scale);
+                    T[row] = exp_val;
+                    row_sum += exp_val;
+                }
+                
+                // Normalize
+                float row_inv_sum = 1.0f / row_sum;
+                for (int j = 0; j < N; j++) {
+                    T[row] *= row_inv_sum;
+                }
+            }
+        }
+        
+        // Compute O = (Q @ K^T) @ V using blocks
+        std::vector<float> O_block(d_head);
+        for (int i = 0; i < N; i += BLOCK_SIZE) {
+            int M = std::min(BLOCK_SIZE, N - i);
+            std::fill(O_head + i * d_head, O_head + (i + M) * d_head, 0.0f);
+            
+            for (int j = 0; j < N; j += BLOCK_K) {
+                int K_block = std::min(BLOCK_K, N - j);
+                
+                // Compute (Q @ K_block) for this block
+                std::vector<float> S_block(M * K_block);
+                
+                for (int ii = 0; ii < M; ii++) {
+                    int q_row = i + ii;
+                    for (int jj = 0; jj < K_block; jj++) {
+                        float sum = 0;
+                        for (int kk = 0; kk < d_head; kk++) {
+                            sum += Q_head[q_row * d_head + kk] * K_head[(j + jj) * d_head + kk];
+                        }
+                        S_block[ii * K_block + jj] = sum * softmax_scale;
+                    }
+                }
+                
+                // Apply softmax to block
+                for (int ii = 0; ii < M; ii++) {
+                    float row_max = -FLT_MAX;
+                    for (int jj = 0; jj < K_block; jj++) {
+                        row_max = std::max(row_max, S_block[ii * K_block + jj]);
+                    }
+                    
+                    float row_sum = 0;
+                    for (int jj = 0; jj < K_block; jj++) {
+                        S_block[ii * K_block + jj] = std::exp(S_block[ii * K_block + jj] - row_max);
+                        row_sum += S_block[ii * K_block + jj];
+                    }
+                    
+                    float row_inv = 1.0f / row_sum;
+                    for (int jj = 0; jj < K_block; jj++) {
+                        S_block[ii * K_block + jj] *= row_inv;
+                    }
+                }
+                
+                // O_block += S_block @ V_block
+                for (int ii = 0; ii < M; ii++) {
+                    int o_row = i + ii;
+                    for (int dd = 0; dd < d_head; dd++) {
+                        float sum = 0;
+                        for (int jj = 0; jj < K_block; jj++) {
+                            sum += S_block[ii * K_block + jj] * V_head[(j + jj) * d_head + dd];
+                        }
+                        O_head[o_row * d_head + dd] += sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#else
+
+void flash_attention_2_blocked(
+    const float* Q, const float* K, const float* V,
+    float* O, float* L,
+    int N, int d, int num_heads,
+    float softmax_scale = 1.0f,
+    int block_size = 64) {
+    // ARM fallback: use standard attention
+    multi_query_attention(Q, K, V, O, N, d, num_heads);
+}
+
+#endif
+
+// ==================== Session 42.3: INT4 Dequantization Microkernel ====================
+
+#if IS_X86_PLATFORM
+
+void dequantize_int4_avx2(const unsigned char* src, float* dst, 
+                          int size, float scale, float zero_point) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 scale_vec = _mm256_set1_ps(scale);
+    const __m256 zp_vec = _mm256_set1_ps(zero_point);
+    
+    int i = 0;
+    for (; i + AVX_SIZE * 2 <= size; i += AVX_SIZE * 2) {
+        // Load 16 packed INT4 values (2 bytes)
+        __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&src[i / 2]));
+        
+        // Unpack low 4 bits
+        __m256i low_nibble = _mm256_cvtepu8_epi32(_mm256_castsi256_si128(packed));
+        // Unpack high 4 bits
+        __m256i high_nibble = _mm256_cvtepu8_epi32(_mm256_srli_si128(packed, 1));
+        high_nibble = _mm256_and_si256(high_nibble, _mm256_set1_epi32(0x0F));
+        
+        // Convert to float and dequantize
+        __m256 low_fp = _mm256_cvtepi32_ps(low_nibble);
+        __m256 high_fp = _mm256_cvtepi32_ps(high_nibble);
+        
+        __m256 low_dq = _mm256_mul_ps(_mm256_sub_ps(low_fp, zp_vec), scale_vec);
+        __m256 high_dq = _mm256_mul_ps(_mm256_sub_ps(high_fp, zp_vec), scale_vec);
+        
+        // Store results
+        _mm256_storeu_ps(&dst[i], low_dq);
+        _mm256_storeu_ps(&dst[i + AVX_SIZE], high_dq);
+    }
+    
+    // Handle remainder
+    for (; i < size; i++) {
+        unsigned char val = src[i / 2];
+        unsigned char nibble = (i % 2 == 0) ? (val & 0x0F) : (val >> 4);
+        dst[i] = (static_cast<float>(nibble) - zero_point) * scale;
+    }
+}
+
+#else
+
+void dequantize_int4_avx2(const unsigned char* src, float* dst, 
+                          int size, float scale, float zero_point) {
+    // ARM fallback
+    int i = 0;
+    for (; i + 4 <= size; i += 4) {
+        unsigned char packed = src[i / 2];
+        float32x4_t vals = vdupq_n_f32(zero_point);
+        
+        // Extract nibbles using NEON
+        uint8x8_t v = vdup_n_u8(packed);
+        uint8x8_t low = vand_u8(v, vdup_n_u8(0x0F));
+        uint8x8_t high = vshr_n_u8(v, 4);
+        
+        // Convert to float
+        float32x4_t low_f = vcvtq_f32_u32(vmovl_u8(low));
+        float32x4_t high_f = vcvtq_f32_u32(vmovl_u8(high));
+        
+        // Dequantize
+        low_f = vsubq_f32(low_f, vdupq_n_f32(zero_point));
+        high_f = vsubq_f32(high_f, vdupq_n_f32(zero_point));
+        low_f = vmulq_f32(low_f, vdupq_n_f32(scale));
+        high_f = vmulq_f32(high_f, vdupq_n_f32(scale));
+        
+        vst1q_f32(&dst[i], low_f);
+        vst1q_f32(&dst[i + 4], high_f);
+    }
+    
+    for (; i < size; i++) {
+        unsigned char val = src[i / 2];
+        unsigned char nibble = (i % 2 == 0) ? (val & 0x0F) : (val >> 4);
+        dst[i] = (static_cast<float>(nibble) - zero_point) * scale;
+    }
+}
+
+#endif
+
+// ==================== Session 42.4: Structured Sparse Attention ====================
+
+// Generate structured sparse pattern (every other token for keys/values)
+void generate_sparse_mask(bool* mask, int seq_len, int sparse_factor) {
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            // Sparse pattern: only attend to tokens within sparse_factor stride
+            mask[i * seq_len + j] = (j % sparse_factor == 0) || (j <= i);
+        }
+    }
+}
+
+// Structured sparse attention (sparse_factor determines sparsity)
+void sparse_attention(
+    const float* Q, const float* K, const float* V,
+    float* O, int N, int d, int num_heads,
+    int sparse_factor = 4) {
+    
+    constexpr int AVX_SIZE = 8;
+    int d_head = d / num_heads;
+    int sparse_N = (N + sparse_factor - 1) / sparse_factor;
+    
+    for (int h = 0; h < num_heads; h++) {
+        const float* Q_head = Q + h * N * d_head;
+        const float* K_head = K + h * N * d_head;
+        const float* V_head = V + h * N * d_head;
+        float* O_head = O + h * N * d_head;
+        
+        // Downsample K and V
+        std::vector<float> K_sparse(sparse_N * d_head);
+        std::vector<float> V_sparse(sparse_N * d_head);
+        
+        for (int i = 0; i < sparse_N; i++) {
+            int src_idx = std::min(i * sparse_factor, N - 1) * d_head;
+            std::copy(K_head + src_idx, K_head + src_idx + d_head, 
+                     K_sparse.data() + i * d_head);
+            std::copy(V_head + src_idx, V_head + src_idx + d_head, 
+                     V_sparse.data() + i * d_head);
+        }
+        
+        // Compute Q @ K_sparse^T
+        std::vector<float> S(N * sparse_N);
+        float scale = 1.0f / std::sqrt(d_head);
+        
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < sparse_N; j++) {
+                float sum = 0;
+                for (int k = 0; k < d_head; k += AVX_SIZE) {
+                    __m256 q_vals = _mm256_loadu_ps(&Q_head[i * d_head + k]);
+                    __m256 k_vals = _mm256_loadu_ps(&K_sparse[j * d_head + k]);
+                    __m256 prod = _mm256_mul_ps(q_vals, k_vals);
+                    float32_t prod_arr[8];
+                    _mm256_storeu_ps(prod_arr, prod);
+                    for (int s = 0; s < 8 && k + s < d_head; s++) {
+                        sum += prod_arr[s];
+                    }
+                }
+                S[i * sparse_N + j] = sum * scale;
+                
+                // Apply causal mask
+                if (j * sparse_factor > i) {
+                    S[i * sparse_N + j] = -FLT_MAX;
+                }
+            }
+        }
+        
+        // Sparse softmax
+        for (int i = 0; i < N; i++) {
+            float row_max = -FLT_MAX;
+            for (int j = 0; j < sparse_N; j++) {
+                row_max = std::max(row_max, S[i * sparse_N + j]);
+            }
+            
+            float row_sum = 0;
+            for (int j = 0; j < sparse_N; j++) {
+                if (S[i * sparse_N + j] > -FLT_MAX / 2) {
+                    S[i * sparse_N + j] = std::exp(S[i * sparse_N + j] - row_max);
+                    row_sum += S[i * sparse_N + j];
+                }
+            }
+            
+            if (row_sum > 0) {
+                float inv_sum = 1.0f / row_sum;
+                for (int j = 0; j < sparse_N; j++) {
+                    if (S[i * sparse_N + j] > -FLT_MAX / 2) {
+                        S[i * sparse_N + j] *= inv_sum;
+                    }
+                }
+            }
+        }
+        
+        // Compute O = S @ V_sparse
+        for (int i = 0; i < N; i++) {
+            std::fill(O_head + i * d_head, O_head + (i + 1) * d_head, 0.0f);
+            
+            for (int j = 0; j < sparse_N; j++) {
+                if (S[i * sparse_N + j] > -FLT_MAX / 2) {
+                    float attn = S[i * sparse_N + j];
+                    
+                    for (int k = 0; k < d_head; k++) {
+                        O_head[i * d_head + k] += attn * V_sparse[j * d_head + k];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== Session 42.5: Hyper-Fused MatMul + Softmax + Add + GELU ====================
+
+#if IS_X86_PLATFORM
+
+void matmul_fused_attention_ops(
+    const float* A, const float* B, const float* C_add,
+    float* D, int M, int N, int K,
+    bool apply_gelu = true, bool apply_residual = true) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 16;
+    
+    // Compute D = A @ B with fused operations
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* D_row = D + i * N;
+        
+        // Initialize accumulators
+        __m256 acc[UNROLL_FACTOR];
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            acc[u] = _mm256_setzero_ps();
+        }
+        
+        // Main computation loop
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_row = B + k * N;
+            
+            for (int u = 0; u < UNROLL_FACTOR; u++) {
+                int col = u * AVX_SIZE;
+                __m256 b_vec = _mm256_loadu_ps(&B_row[col]);
+                acc[u] = _mm256_fmadd_ps(a_val, b_vec, acc[u]);
+            }
+        }
+        
+        // Store and apply fused operations
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            int col = u * AVX_SIZE;
+            
+            if (apply_gelu) {
+                // Apply GELU activation
+                for (int v = 0; v < AVX_SIZE; v++) {
+                    float x = acc[v].m256_f32[v];
+                    float gelu = 0.5f * x * (1.0f + std::tanh(0.797885f * x * (1.0f + 0.044715f * x * x)));
+                    D_row[col + v] = gelu;
+                }
+            } else {
+                _mm256_storeu_ps(&D_row[col], acc[u]);
+            }
+            
+            // Add residual if requested
+            if (apply_residual && C_add) {
+                for (int v = 0; v < AVX_SIZE; v++) {
+                    D_row[col + v] += C_add[i * N + col + v];
+                }
+            }
+        }
+    }
+}
+
+#else
+
+void matmul_fused_attention_ops(
+    const float* A, const float* B, const float* C_add,
+    float* D, int M, int N, int K,
+    bool apply_gelu = true, bool apply_residual = true) {
+    // ARM fallback
+    matmul_neon(A, B, D, M, N, K);
+    if (apply_residual && C_add) {
+        fused_add_relu(D, C_add, M * N);
+    }
+}
+
+#endif
+
+// ============================================================================
+// End of Session 42 Optimizations
+// ============================================================================
 // ============================================================================
