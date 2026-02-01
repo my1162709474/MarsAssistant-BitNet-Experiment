@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cfloat>
 
 // Platform-specific SIMD headers
 #if defined(__x86_64__) || defined(__i386__)
@@ -17,6 +18,9 @@
 #elif defined(__aarch64__) || defined(__arm__)
 #include <arm_neon.h>
 #endif
+
+// Forward declarations for functions used before definition
+void matmul_multi_level_blocked(const float* A, const float* B, float* C, int M, int N, int K);
 
 // Track platform capabilities for conditional compilation
 #if defined(__x86_64__) || defined(__i386__)
@@ -316,7 +320,7 @@ FORCE_INLINE void softmax_batch(float* data, int batch, int rows, int cols) {
             float* row = data + b * rows * cols + i * cols;
             
             // Find max (vectorized)
-            __m256 max_vec = _mm256_set1_ps(-INFINITY);
+            __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
             int j = 0;
             for (; j + AVX_SIZE <= cols; j += AVX_SIZE) {
                 __m256 vals = _mm256_loadu_ps(&row[j]);
@@ -995,7 +999,7 @@ void attention_blocked(const float* Q, const float* K, const float* V,
             
             // Process query block
             for (int qi = 0; qi < T; qi++) {
-                float row_max = -INFINITY;
+                float row_max = -FLT_MAX;
                 
                 // Compute Q[qi] * K^T for all keys
                 for (int ki = 0; ki < T; ki++) {
@@ -4112,7 +4116,7 @@ void attention_fused(const float* Q, const float* K, const float* V,
     for (int b = 0; b < batch; b++) {
         for (int h = 0; h < num_heads; h++) {
             for (int i = 0; i < seq_len; i++) {
-                float max_val = -INFINITY;
+                float max_val = -FLT_MAX;
                 std::vector<float> attn_scores(seq_len);
 
                 for (int j = 0; j < seq_len; j++) {
@@ -5428,7 +5432,7 @@ void flash_attention_causal(const float* Q, const float* K, const float* V,
         int Bi = i_end - i_start;
         
         // Initialize
-        std::fill(m_tile, m_tile + Bi, -INFINITY);
+        std::fill(m_tile, m_tile + Bi, -FLT_MAX);
         std::fill(l_tile, l_tile + Bi, 0.0f);
         std::fill(acc_tile, acc_tile + Bi * d, 0.0f);
         
@@ -5453,12 +5457,12 @@ void flash_attention_causal(const float* Q, const float* K, const float* V,
                     
                     // Causal mask
                     if (j_start + j > i_start + i) {
-                        S_row[j] = -INFINITY;
+                        S_row[j] = -FLT_MAX;
                     }
                 }
                 
                 // Online softmax
-                float m_row = -INFINITY;
+                float m_row = -FLT_MAX;
                 for (int j = 0; j < Bj; j++) {
                     m_row = std::max(m_row, S_row[j]);
                 }
@@ -5526,7 +5530,7 @@ void multi_query_attention(const float* Q, const float* K, const float* V,
         // Softmax
         for (int i = 0; i < N; i++) {
             float* S_row = S + i * N;
-            float max_val = -INFINITY;
+            float max_val = -FLT_MAX;
             for (int j = 0; j < N; j++) {
                 max_val = std::max(max_val, S_row[j]);
             }
@@ -5615,7 +5619,7 @@ void quantize_per_channel(const float* input, int8_t* output,
     const int num_channels = size / channel_dim;
     
     for (int c = 0; c < num_channels; c++) {
-        float min_val = INFINITY, max_val = -INFINITY;
+        float min_val = FLT_MAX, max_val = -FLT_MAX;
         
         for (int i = 0; i < channel_dim; i++) {
             float val = input[c * channel_dim + i];
@@ -5965,7 +5969,7 @@ void softmax_online(const float* input, float* output, int size) {
     }
     
     // Horizontal max reduction
-    float max_val = -INFINITY;
+    float max_val = -FLT_MAX;
     float* max_ptr = reinterpret_cast<float*>(&max_vec);
     for (int i = 0; i < 8; i++) {
         max_val = std::max(max_val, max_ptr[i]);
@@ -6726,7 +6730,7 @@ void flash_attention_2_0(
                 
                 // Initialize output and running stats
                 std::fill(O_head, O_head + head_dim, 0.0f);
-                float row_max = -INFINITY;
+                float row_max = -FLT_MAX;
                 float row_sum = 0.0f;
                 
                 // Process in blocks for better memory efficiency
@@ -6734,7 +6738,7 @@ void flash_attention_2_0(
                     int block_end = std::min(block_start + config.block_size_k, seq_len);
                     
                     // Compute Q @ K^T block
-                    float block_max = -INFINITY;
+                    float block_max = -FLT_MAX;
                     std::vector<float> S_block((block_end - block_start) * head_dim);
                     
                     for (int ki = block_start; ki < block_end; ki++) {
@@ -8490,7 +8494,7 @@ void softmax_super_fast_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     
     // Find max (vectorized reduction)
-    __m256 max_vec = _mm256_set1_ps(-INFINITY);
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(data + i));
@@ -8553,7 +8557,7 @@ void softmax_super_fast_avx2(float* data, int size) {
 // NEON version for ARM
 void softmax_super_fast_neon(float* data, int size) {
     constexpr int NEON_SIZE = 4;
-    const float32x4_t neg_inf = vdupq_n_f32(-INFINITY);
+    const float32x4_t neg_inf = vdupq_n_f32(-FLT_MAX);
     
     // Find max (vectorized)
     float32x4_t max_vec = neg_inf;
@@ -9885,13 +9889,13 @@ void attention_streaming(const float* Q, const float* K, const float* V,
                 float* O_row = O_head + qi * head_dim;
 
                 // Streaming computation: process K in blocks
-                __m256 row_max = _mm256_set1_ps(-INFINITY);
+                __m256 row_max = _mm256_set1_ps(-FLT_MAX);
                 __m256 row_sum = _mm256_setzero_ps();
                 __m256 accum[32] = {0};
 
                 for (int k_block = 0; k_block < seq_len; k_block += BLOCK_K) {
                     int k_end = std::min(k_block + BLOCK_K, seq_len);
-                    __m256 block_max = _mm256_set1_ps(-INFINITY);
+                    __m256 block_max = _mm256_set1_ps(-FLT_MAX);
 
                     // Compute Q @ K^T block
                     __m256 dot_products[8] = {0};
@@ -9923,7 +9927,7 @@ void attention_streaming(const float* Q, const float* K, const float* V,
                     }
 
                     // Online softmax: rescale previous
-                    if (_mm256_movemask_ps(_mm256_cmp_ps(row_max, _mm256_set1_ps(-INFINITY), _CMP_EQ_OQ)) == 0xF) {
+                    if (_mm256_movemask_ps(_mm256_cmp_ps(row_max, _mm256_set1_ps(-FLT_MAX), _CMP_EQ_OQ)) == 0xF) {
                         row_max = block_max;
                     } else {
                         float scale_factor = std::exp(row_max[0] - block_max[0]);
@@ -10540,10 +10544,21 @@ void gelu_fast_neon(float* data, int size) {
         
         inner_0 = vmulq_f32(coef_vec, inner_0);
         inner_1 = vmulq_f32(coef_vec, inner_1);
-        
-        float32x4_t tanh_0 = vtanhq_f32(inner_0);
-        float32x4_t tanh_1 = vtanhq_f32(inner_1);
-        
+
+        // Use scalar approximation for tanh (vtanhq_f32 may not be available)
+        float32x4_t tanh_0, tanh_1;
+        float inner0_arr[4], inner1_arr[4], tanh0_arr[4], tanh1_arr[4];
+        vst1q_f32(inner0_arr, inner_0);
+        vst1q_f32(inner1_arr, inner_1);
+        for (int j = 0; j < 4; j++) {
+            float x = inner0_arr[j];
+            tanh0_arr[j] = std::tanh(x);
+            x = inner1_arr[j];
+            tanh1_arr[j] = std::tanh(x);
+        }
+        tanh_0 = vld1q_f32(tanh0_arr);
+        tanh_1 = vld1q_f32(tanh1_arr);
+
         float32x4_t result_0 = vmulq_f32(half_vec, vmulq_f32(x0, vaddq_f32(one_vec, tanh_0)));
         float32x4_t result_1 = vmulq_f32(half_vec, vmulq_f32(x1, vaddq_f32(one_vec, tanh_1)));
         
@@ -10565,7 +10580,7 @@ void softmax_neon(float* data, int size) {
     constexpr int NEON_SIZE = 4;
     
     // Find max (vectorized)
-    float32x4_t max_vec = vdupq_n_f32(-INFINITY);
+    float32x4_t max_vec = vdupq_n_f32(-FLT_MAX);
     int i = 0;
     for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
         float32x4_t vals = vld1q_f32(&data[i]);
@@ -10585,11 +10600,17 @@ void softmax_neon(float* data, int size) {
     i = 0;
     float32x4_t sum_vec = vdupq_n_f32(0.0f);
     float32x4_t max_vec_broadcast = vdupq_n_f32(row_max);
-    
+
     for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
         float32x4_t vals = vld1q_f32(&data[i]);
         vals = vsubq_f32(vals, max_vec_broadcast);
-        vals = vexpq_f32(vals);  // NEON has native exp
+        // Use scalar exp approximation for NEON (vexpq_f32 may not be available)
+        float vals_arr[4], exp_arr[4];
+        vst1q_f32(vals_arr, vals);
+        for (int j = 0; j < 4; j++) {
+            exp_arr[j] = std::exp(vals_arr[j]);
+        }
+        vals = vld1q_f32(exp_arr);
         sum_vec = vaddq_f32(sum_vec, vals);
         vst1q_f32(&data[i], vals);
     }
@@ -10623,12 +10644,18 @@ void softmax_neon(float* data, int size) {
 void sigmoid_neon(float* data, int size) {
     constexpr int NEON_SIZE = 4;
     float32x4_t one_vec = vdupq_n_f32(1.0f);
-    
+
     int i = 0;
     for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
         float32x4_t vals = vld1q_f32(&data[i]);
         vals = vnegq_f32(vals);
-        vals = vexpq_f32(vals);
+        // Use scalar exp for NEON (vexpq_f32 may not be available)
+        float vals_arr[4], exp_arr[4];
+        vst1q_f32(vals_arr, vals);
+        for (int j = 0; j < 4; j++) {
+            exp_arr[j] = std::exp(vals_arr[j]);
+        }
+        vals = vld1q_f32(exp_arr);
         vals = vaddq_f32(one_vec, vals);
         vals = vrecpeq_f32(vals);  // Reciprocal approximation
         vst1q_f32(&data[i], vals);
@@ -11395,8 +11422,8 @@ void quantize_4bit(const float* src, Bit4Matrix& dst) {
         const float* row = src + i * dst.cols;
         
         // Find min/max for per-row quantization
-        __m256 min_vec = _mm256_set1_ps(INFINITY);
-        __m256 max_vec = _mm256_set1_ps(-INFINITY);
+        __m256 min_vec = _mm256_set1_ps(FLT_MAX);
+        __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
         
         int j = 0;
         for (; j + AVX_SIZE <= dst.cols; j += AVX_SIZE) {
@@ -11660,8 +11687,8 @@ void quantize_4bit_neon(const float* src, Bit4MatrixArm& dst) {
         const float* row = src + i * dst.cols;
         
         // Find min/max
-        float32x4_t min_vec = vdupq_n_f32(INFINITY);
-        float32x4_t max_vec = vdupq_n_f32(-INFINITY);
+        float32x4_t min_vec = vdupq_n_f32(FLT_MAX);
+        float32x4_t max_vec = vdupq_n_f32(-FLT_MAX);
         
         int j = 0;
         for (; j + NEON_SIZE <= dst.cols; j += NEON_SIZE) {
@@ -12154,7 +12181,7 @@ FORCE_INLINE void softmax_hyper(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     
     // Find max (vectorized)
-    __m256 max_vec = _mm256_set1_ps(-INFINITY);
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
     int i = 0;
     for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
         __m256 v0 = _mm256_loadu_ps(&data[i]);
@@ -12497,7 +12524,7 @@ void softmax_fused_scale(float* data, int size, float scale) {
     const __m256 zero = _mm256_setzero_ps();
     
     // Apply scale and find max in one pass
-    __m256 max_vec = _mm256_set1_ps(-INFINITY);
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         __m256 vals = _mm256_loadu_ps(&data[i]);
@@ -12604,7 +12631,7 @@ void softmax_fused_scale(float* data, int size, float scale) {
     float32x4_t zero = vdupq_n_f32(0.0f);
     
     // Apply scale and find max
-    float max_val = -INFINITY;
+    float max_val = -FLT_MAX;
     for (int i = 0; i < size; i++) {
         data[i] *= scale;
         max_val = std::max(max_val, data[i]);
