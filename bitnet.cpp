@@ -42,6 +42,10 @@ void matmul_multi_level_blocked(const float* A, const float* B, float* C, int M,
 #include <algorithm>
 #include <thread>
 
+// Forward declarations
+void matmul_batch(const float* A_batch, const float* B, float* C_batch,
+                  int batch_size, int M, int N, int K);
+
 // Configuration
 constexpr int BLOCK_SIZE = 64;
 constexpr int CACHE_LINE_SIZE = 64;
@@ -117,6 +121,10 @@ struct BitMatrix {
             }
         }
     }
+    
+#if defined(__aarch64__) || defined(__arm__)
+    void pack_from_float_neon(const float* src);
+#endif
 };
 
 struct BitNetConfig {
@@ -772,7 +780,7 @@ void matmul_1bit_avx512(const unsigned char* A_packed, const unsigned char* B_pa
 void matmul_1bit_avx512(const unsigned char* A_packed, const unsigned char* B_packed, 
                         float* C, int M, int N, int K) {
     // Fallback to parallel implementation
-    matmul_1bit_parallel(A_packed, B_packed, C, M, N, K, 4);
+    matmul_1bit_dynamic(A_packed, B_packed, C, M, N, K, 4);
 }
 
 #endif
@@ -12893,6 +12901,7 @@ void matmul_dynamic_parallel(const float* A, const float* B, float* C,
             
             if (my_task == -1) break;  // No more tasks
             
+#if IS_X86_PLATFORM
             // Process assigned task using AVX2
             constexpr int AVX_SIZE = 8;
             for (int i = a->tasks[my_task].start_row; i < a->tasks[my_task].end_row; i++) {
@@ -12923,6 +12932,34 @@ void matmul_dynamic_parallel(const float* A, const float* B, float* C,
                     _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
                 }
             }
+#else
+            // Process assigned task using NEON
+            constexpr int NEON_SIZE = 4;
+            for (int i = a->tasks[my_task].start_row; i < a->tasks[my_task].end_row; i++) {
+                const float* A_row = a->A + i * a->K;
+                float* C_row = a->C + i * a->N;
+                
+                float32x4_t c_vec[64];
+                int num_vec = a->N / NEON_SIZE;
+                for (int j = 0; j < num_vec; j++) {
+                    c_vec[j] = vdupq_n_f32(0.0f);
+                }
+                
+                for (int k = 0; k < a->K; k++) {
+                    float32x4_t a_val = vdupq_n_f32(A_row[k]);
+                    const float* B_k = a->B + k * a->N;
+                    
+                    for (int j = 0; j < num_vec; j++) {
+                        float32x4_t b_vec = vld1q_f32(&B_k[j * NEON_SIZE]);
+                        c_vec[j] = vfmaq_f32(c_vec[j], a_val, b_vec);
+                    }
+                }
+                
+                for (int j = 0; j < num_vec; j++) {
+                    vst1q_f32(&C_row[j * NEON_SIZE], c_vec[j]);
+                }
+            }
+#endif
         }
         
         return nullptr;
@@ -13251,26 +13288,13 @@ void BitMatrix::pack_from_float_neon(const float* src) {
     }
 }
 
-// Cross-platform alias
-void BitMatrix::pack_from_float(const float* src) {
-#if defined(__aarch64__) || defined(__arm__)
-    pack_from_float_neon(src);
-#else
-    // Fallback to original scalar implementation
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            if (src[i * cols + j] > 0.0f) {
-                data[i * stride_bytes + j / 8] |= (1 << (j % 8));
-            }
-        }
-    }
-#endif
-}
+
 
 #endif  // IS_X86_PLATFORM
 
 // ==================== Aggressive Prefetch Strategy for Large Matrices ====================
 
+#if IS_X86_PLATFORM
 void matmul_aggressive_prefetch_v3(const float* A, const float* B, float* C,
                                    int M, int N, int K) {
     // Enhanced prefetch strategy with multi-level cache awareness
@@ -13322,7 +13346,35 @@ void matmul_aggressive_prefetch_v3(const float* A, const float* B, float* C,
             }
         }
     }
+#else
+// ARM NEON version of aggressive prefetch
+void matmul_aggressive_prefetch_v3(const float* A, const float* B, float* C,
+                                   int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int BLOCK_SIZE_K = 64;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int k = 0; k < K; k += BLOCK_SIZE_K) {
+            int k_end = std::min(k + BLOCK_SIZE_K, K);
+            
+            for (int j = 0; j < N; j += NEON_SIZE) {
+                float32x4_t c_vec = vdupq_n_f32(0.0f);
+                
+                for (int kk = k; kk < k_end; kk++) {
+                    float32x4_t a_val = vdupq_n_f32(A_row[kk]);
+                    float32x4_t b_vec = vld1q_f32(&B[kk * N + j]);
+                    c_vec = vfmaq_f32(c_vec, a_val, b_vec);
+                }
+                
+                vst1q_f32(&C_row[j], c_vec);
+            }
+        }
+    }
 }
+#endif
 
 // ==================== End of Session 34 ====================
 
@@ -14457,8 +14509,8 @@ void matmul_multi_level_cache_aware(const float* A, const float* B, float* C,
     
     for (int i_l1 = 0; i_l1 < M; i_l1 += TILE_L1_M) {
         for (int j_l1 = 0; j_l1 < N; j_l1 += TILE_L1_N) {
-            int i_max = min(i_l1 + TILE_L1_M, M);
-            int j_max = min(j_l1 + TILE_L1_N, N);
+            int i_max = std::min(i_l1 + TILE_L1_M, M);
+            int j_max = std::min(j_l1 + TILE_L1_N, N);
             
             for (int i = i_l1; i < i_max; i++) {
                 const float* A_row = A + i * K;
@@ -14562,7 +14614,17 @@ void fused_gelu_layernorm(float* output, const float* input, const float* residu
         float32x4_t inner = vmulq_f32(vdupq_n_f32(PI), vmulq_f32(sum, vaddq_f32(vdupq_n_f32(1.0f), vmulq_f32(vdupq_n_f32(A), x2))));
         
         // NEON doesn't have tanh, use approximation
-        float32x4_t tanh_val = vtanhq_f32(inner);
+        // NEON has no native tanh, use scalar approximation
+        float inner_arr[4];
+        vst1q_f32(inner_arr, inner);
+        for(int ti=0; ti<4; ti++) {
+            float x = inner_arr[ti];
+            // Fast tanh approximation: sign(x) * (1 - 1/(1+|x|+2x²+5x⁴))
+            float ax = std::abs(x);
+            float tanh_x = ax / (1.0f + ax + 2.0f*ax*ax + 5.0f*ax*ax*ax*ax);
+            inner_arr[ti] = (x >= 0) ? tanh_x : -tanh_x;
+        }
+        float32x4_t tanh_val = vld1q_f32(inner_arr);
         float32x4_t result = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(sum, vmulq_f32(sum, tanh_val)));
         
         vst1q_f32(&temp[i], result);
@@ -15432,6 +15494,28 @@ void matmul_1bit_ultra_avx512(const unsigned char* A_packed,
     }
 }
 
+// 1-bit matrix multiplication with dynamic precision
+void matmul_1bit_dynamic(const unsigned char* A_packed, const unsigned char* B_packed, 
+                         float* C, int M, int N, int K, int num_threads) {
+#if IS_X86_PLATFORM && defined(__AVX512VPOPCNTDQ__)
+    matmul_1bit_ultra_avx512(A_packed, B_packed, C, M, N, K);
+#else
+    // Fallback to standard 1-bit matmul
+    const int K_words = (K + 31) / 32;
+    for (int i = 0; i < M; i++) {
+        const unsigned int* A_words = reinterpret_cast<const unsigned int*>(A_packed + i * K);
+        for (int j = 0; j < N; j++) {
+            const unsigned int* B_words = reinterpret_cast<const unsigned int*>(B_packed + j * K);
+            int diff_count = 0;
+            for (int w = 0; w < K_words; w++) {
+                diff_count += __builtin_popcount(A_words[w] ^ B_words[w]);
+            }
+            C[i * N + j] = static_cast<float>(K - 2 * diff_count);
+        }
+    }
+#endif
+}
+
 // Ultra-wide with row batching for better cache utilization
 void matmul_1bit_ultra_avx512_batched(const unsigned char* A_packed, 
                                        const unsigned char* B_packed, 
@@ -15483,7 +15567,7 @@ void matmul_1bit_ultra_avx512_batched(const unsigned char* A_packed,
 void matmul_1bit_ultra_avx512(const unsigned char* A_packed, 
                               const unsigned char* B_packed, 
                               float* C, int M, int N, int K) {
-    matmul_1bit_parallel(A_packed, B_packed, C, M, N, K, 4);
+    matmul_1bit_dynamic(A_packed, B_packed, C, M, N, K, 4);
 }
 
 void matmul_1bit_ultra_avx512_batched(const unsigned char* A_packed, 
