@@ -933,6 +933,7 @@ void benchmark(const std::string& name,
     std::cout << name << ": " << avg_time << " us, " << gflops << " GFLOPS" << std::endl;
 }
 
+#if defined(__x86_64__) || defined(__i386__)
 int main() {
     constexpr int M = 512;
     constexpr int N = 512;
@@ -988,6 +989,7 @@ int main() {
     
     return 0;
 }
+#endif  // x86 only
 
 // ==================== Optimized 6: Attention Mechanism ====================
 
