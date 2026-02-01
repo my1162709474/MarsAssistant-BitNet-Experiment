@@ -326,3 +326,69 @@ Attempting to compile...
 ✅ Compilation successful!
 Done at Sun Feb  1 01:46:20 CST 2026
 ---
+=== Sun Feb  1 14:03:33 CST 2026 ===
+Checking for source files...
+Found bitnet.cpp
+Attempting to compile...
+❌ Compilation failed!
+bitnet.cpp:15570:5: error: use of undeclared identifier 'matmul_1bit_dynamic'
+ 15570 |     matmul_1bit_dynamic(A_packed, B_packed, C, M, N, K, 4);
+       |     ^
+bitnet.cpp:15726:11: error: unknown type name '__m256'
+ 15726 |     const __m256 scale_vec = _mm256_set1_ps(scale);
+       |           ^
+bitnet.cpp:15726:30: error: use of undeclared identifier '_mm256_set1_ps'
+ 15726 |     const __m256 scale_vec = _mm256_set1_ps(scale);
+       |                              ^
+bitnet.cpp:15727:11: error: unknown type name '__m256'
+ 15727 |     const __m256 zero = _mm256_setzero_ps();
+       |           ^
+bitnet.cpp:15727:25: error: use of undeclared identifier '_mm256_setzero_ps'
+ 15727 |     const __m256 zero = _mm256_setzero_ps();
+       |                         ^
+bitnet.cpp:15728:11: error: unknown type name '__m256'
+ 15728 |     const __m256 neg_inf = _mm256_set1_ps(-1e30f);
+       |           ^
+bitnet.cpp:15728:28: error: use of undeclared identifier '_mm256_set1_ps'
+ 15728 |     const __m256 neg_inf = _mm256_set1_ps(-1e30f);
+       |                            ^
+bitnet.cpp:15748:21: error: unknown type name '__m256'
+ 15748 |                     __m256 dot_prod = _mm256_setzero_ps();
+       |                     ^
+bitnet.cpp:15748:39: error: use of undeclared identifier '_mm256_setzero_ps'
+ 15748 |                     __m256 dot_prod = _mm256_setzero_ps();
+       |                                       ^
+bitnet.cpp:15750:25: error: unknown type name '__m256'
+ 15750 |                         __m256 q_vec = _mm256_loadu_ps(&Q_row[d]);
+       |                         ^
+bitnet.cpp:15750:40: error: use of undeclared identifier '_mm256_loadu_ps'
+ 15750 |                         __m256 q_vec = _mm256_loadu_ps(&Q_row[d]);
+       |                                        ^
+bitnet.cpp:15751:25: error: unknown type name '__m256'
+ 15751 |                         __m256 k_vec = _mm256_loadu_ps(&K_row[d]);
+       |                         ^
+bitnet.cpp:15751:40: error: use of undeclared identifier '_mm256_loadu_ps'
+ 15751 |                         __m256 k_vec = _mm256_loadu_ps(&K_row[d]);
+       |                                        ^
+bitnet.cpp:15765:17: error: unknown type name '__m256'
+ 15765 |                 __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+       |                 ^
+bitnet.cpp:15765:34: error: use of undeclared identifier '_mm256_set1_ps'
+ 15765 |                 __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+       |                                  ^
+bitnet.cpp:15767:21: error: unknown type name '__m256'
+ 15767 |                     __m256 s_vec = _mm256_loadu_ps(&S_row[kj]);
+       |                     ^
+bitnet.cpp:15767:36: error: use of undeclared identifier '_mm256_loadu_ps'
+ 15767 |                     __m256 s_vec = _mm256_loadu_ps(&S_row[kj]);
+       |                                    ^
+bitnet.cpp:15776:17: error: unknown type name '__m256'
+ 15776 |                 __m256 sum_vec = _mm256_setzero_ps();
+       |                 ^
+bitnet.cpp:15776:34: error: use of undeclared identifier '_mm256_setzero_ps'
+ 15776 |                 __m256 sum_vec = _mm256_setzero_ps();
+       |                                  ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+Done at Sun Feb  1 14:03:33 CST 2026
+---
