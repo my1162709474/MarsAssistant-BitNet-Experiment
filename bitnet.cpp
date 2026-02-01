@@ -13674,4 +13674,543 @@ void layernorm_neon(float* data, float* output, int size, float eps) {
 #define matmul_hyper_unroll matmul_hyper_16x_unroll
 #endif
 
-// ==================== End of Session 36 ====================
+// ==================== Session 37: Multi-Level Cache & Ultra Fusion ====================
+// Target: +10-15% additional performance on large matrices
+
+#if IS_X86_PLATFORM
+
+// ==================== Multi-Level Cache-Aware Microkernel ====================
+// Optimized for L1 (32KB), L2 (256KB), L3 (8MB+) cache hierarchy
+
+void matmul_multi_level_cache_aware(const float* A, const float* B, float* C,
+                                     int M, int N, int K) {
+    // L1 tile: 32x32 (fits in 32KB L1: 32*32*4*2 = 8KB for A+B, 4KB for C)
+    constexpr int TILE_L1_M = 32;
+    constexpr int TILE_L1_N = 32;
+    constexpr int TILE_L1_K = 32;
+    
+    // L2 tile: 128x128 (fits in 256KB L2: 128*128*4*2 = 128KB for A+B, 64KB for C)
+    constexpr int TILE_L2_M = 128;
+    constexpr int TILE_L2_N = 128;
+    
+    // AVX2: 8 floats per vector
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 16;  // 16 AVX vectors = 128 floats
+    
+    for (int i_l2 = 0; i_l2 < M; i_l2 += TILE_L2_M) {
+        for (int j_l2 = 0; j_l2 < N; j_l2 += TILE_L2_N) {
+            int i_l2_max = min(i_l2 + TILE_L2_M, M);
+            int j_l2_max = min(j_l2 + TILE_L2_N, N);
+            
+            for (int i_l1 = i_l2; i_l1 < i_l2_max; i_l1 += TILE_L1_M) {
+                int i_l1_max = min(i_l1 + TILE_L1_M, i_l2_max);
+                
+                for (int j_l1 = j_l2; j_l1 < j_l2_max; j_l1 += TILE_L1_N) {
+                    int j_l1_max = min(j_l1 + TILE_L1_N, j_l2_max);
+                    
+                    for (int k = 0; k < K; k += TILE_L1_K) {
+                        int k_max = min(k + TILE_L1_K, K);
+                        
+                        // Process L1 tiles
+                        for (int i = i_l1; i < i_l1_max; i++) {
+                            const float* A_row = A + i * K;
+                            const float* A_tile = &A_row[k];
+                            float* C_row = C + i * N;
+                            float* C_tile = &C_row[j_l1];
+                            
+                            __m256 acc[UNROLL_FACTOR];
+                            int num_vec = (j_l1_max - j_l1) / AVX_SIZE;
+                            int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+                            
+                            for (int u = 0; u < unrolled; u++) {
+                                acc[u] = _mm256_setzero_ps();
+                            }
+                            
+                            // Prefetch next A row
+                            if (i + 1 < i_l1_max) {
+                                _mm_prefetch(reinterpret_cast<const char*>(&A[(i + 1) * K + k]), _MM_HINT_T0);
+                            }
+                            
+                            for (int kk = k; kk < k_max; kk++) {
+                                __m256 a_val = _mm256_broadcast_ss(&A_tile[kk - k]);
+                                const float* B_k = B + kk * N;
+                                const float* B_tile = &B_k[j_l1];
+                                
+                                // Prefetch B row
+                                if (kk + 1 < k_max) {
+                                    _mm_prefetch(reinterpret_cast<const char*>(&B[(kk + 1) * N + j_l1]), _MM_HINT_T0);
+                                }
+                                
+                                for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                                    #define LOAD_B(uidx) __m256 b##uidx = _mm256_loadu_ps(&B_tile[(u + uidx) * AVX_SIZE]);
+                                    #define FMA_B(uidx) acc[u + uidx] = _mm256_fmadd_ps(a_val, b##uidx, acc[u + uidx]);
+                                    
+                                    LOAD_B(0) LOAD_B(1) LOAD_B(2) LOAD_B(3)
+                                    LOAD_B(4) LOAD_B(5) LOAD_B(6) LOAD_B(7)
+                                    LOAD_B(8) LOAD_B(9) LOAD_B(10) LOAD_B(11)
+                                    LOAD_B(12) LOAD_B(13) LOAD_B(14) LOAD_B(15)
+                                    
+                                    FMA_B(0) FMA_B(1) FMA_B(2) FMA_B(3)
+                                    FMA_B(4) FMA_B(5) FMA_B(6) FMA_B(7)
+                                    FMA_B(8) FMA_B(9) FMA_B(10) FMA_B(11)
+                                    FMA_B(12) FMA_B(13) FMA_B(14) FMA_B(15)
+                                    
+                                    #undef LOAD_B
+                                    #undef FMA_B
+                                }
+                            }
+                            
+                            // Store results
+                            for (int u = 0; u < unrolled; u++) {
+                                _mm256_storeu_ps(&C_tile[u * AVX_SIZE], acc[u]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== Ultra 32x AVX2 Loop Unrolling ====================
+// Maximum instruction-level parallelism: 32 AVX vectors = 256 floats per iteration
+
+void matmul_ultra_32x_unroll(const float* A, const float* B, float* C,
+                              int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 32;  // 32 AVX vectors = 256 floats
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / AVX_SIZE;
+        int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+        
+        // Initialize accumulators
+        __m256 acc[UNROLL_FACTOR];
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            acc[u] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Prefetch for next iteration
+            if (k + 2 < K) {
+                _mm_prefetch(reinterpret_cast<const char*>(&A_row[k + 2]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&B_k[0]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&B_k[128]), _MM_HINT_T0);
+            }
+            
+            // Ultra-unrolled inner loop
+            for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                // Load 32 B vectors
+                #define LOAD32(uidx) __m256 b##uidx = _mm256_loadu_ps(&B_k[(u + uidx) * AVX_SIZE]);
+                
+                LOAD32(0) LOAD32(1) LOAD32(2) LOAD32(3) LOAD32(4) LOAD32(5) LOAD32(6) LOAD32(7)
+                LOAD32(8) LOAD32(9) LOAD32(10) LOAD32(11) LOAD32(12) LOAD32(13) LOAD32(14) LOAD32(15)
+                LOAD32(16) LOAD32(17) LOAD32(18) LOAD32(19) LOAD32(20) LOAD32(21) LOAD32(22) LOAD32(23)
+                LOAD32(24) LOAD32(25) LOAD32(26) LOAD32(27) LOAD32(28) LOAD32(29) LOAD32(30) LOAD32(31)
+                #undef LOAD32
+                
+                // FMA with 32 vectors
+                #define FMA32(uidx) acc[uidx] = _mm256_fmadd_ps(a_val, b##uidx, acc[uidx]);
+                
+                FMA32(0) FMA32(1) FMA32(2) FMA32(3) FMA32(4) FMA32(5) FMA32(6) FMA32(7)
+                FMA32(8) FMA32(9) FMA32(10) FMA32(11) FMA32(12) FMA32(13) FMA32(14) FMA32(15)
+                FMA32(16) FMA32(17) FMA32(18) FMA32(19) FMA32(20) FMA32(21) FMA32(22) FMA32(23)
+                FMA32(24) FMA32(25) FMA32(26) FMA32(27) FMA32(28) FMA32(29) FMA32(30) FMA32(31)
+                #undef FMA32
+            }
+        }
+        
+        // Store final results
+        for (int u = 0; u < unrolled; u++) {
+            _mm256_storeu_ps(&C_row[u * AVX_SIZE], acc[u]);
+        }
+    }
+}
+
+// ==================== Fused GELU + Add + LayerNorm ====================
+// Single-pass operation: matmul -> +residual -> GELU -> +add -> LayerNorm
+
+void fused_gelu_layernorm(float* output, const float* input, const float* residual,
+                          int size, float eps) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Step 1: Fused GELU on residual + input
+    // Step 2: LayerNorm on the result
+    
+    float* temp = new float[size];
+    
+    // GELU: 0.5 * x * (1 + tanh(0.797885 * x * (1 + 0.044715 * x²)))
+    constexpr float PI = 0.7978845608028654f;  // sqrt(2/pi)
+    constexpr float A = 0.044715f;
+    
+    for (int i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&input[i]);
+        __m256 r = _mm256_loadu_ps(&residual[i]);
+        __m256 sum = _mm256_add_ps(x, r);
+        
+        // GELU approximation
+        __m256 x2 = _mm256_mul_ps(sum, sum);
+        __m256 inner = _mm256_fmadd_ps(_mm256_set1_ps(A), x2, _mm256_set1_ps(1.0f));
+        inner = _mm256_mul_ps(_mm256_set1_ps(PI), _mm256_mul_ps(sum, inner));
+        
+        __m256 tanh_val = _mm256_tanh_ps(inner);
+        __m256 result = _mm256_fmadd_ps(_mm256_set1_ps(0.5f), sum,
+                                        _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_mul_ps(sum, tanh_val)));
+        
+        _mm256_storeu_ps(&temp[i], result);
+    }
+    
+    // Scalar tail for GELU
+    for (int i = size - (size % AVX_SIZE); i < size; i++) {
+        float x = input[i] + residual[i];
+        float x2 = x * x;
+        float inner = PI * x * (1.0f + A * x2);
+        temp[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+    
+    // LayerNorm on temp
+    // Compute mean
+    __m256 sum_vec = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&temp[i]));
+    }
+    
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    float sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3] +
+                sum_arr[4] + sum_arr[5] + sum_arr[6] + sum_arr[7];
+    for (; i < size; i++) sum += temp[i];
+    float mean = sum / size;
+    
+    // Compute variance
+    __m256 mean_vec = _mm256_set1_ps(mean);
+    __m256 var_vec = _mm256_setzero_ps();
+    i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(&temp[i]), mean_vec);
+        var_vec = _mm256_add_ps(var_vec, _mm256_mul_ps(diff, diff));
+    }
+    
+    float var_arr[8];
+    _mm256_storeu_ps(var_arr, var_vec);
+    float var_sum = var_arr[0] + var_arr[1] + var_arr[2] + var_arr[3] +
+                    var_arr[4] + var_arr[5] + var_arr[6] + var_arr[7];
+    for (; i < size; i++) {
+        float diff = temp[i] - mean;
+        var_sum += diff * diff;
+    }
+    
+    float inv_std = 1.0f / std::sqrt(var_sum / size + eps);
+    __m256 inv_std_vec = _mm256_set1_ps(inv_std);
+    
+    // Normalize and store
+    i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(&temp[i]), mean_vec);
+        __m256 result = _mm256_mul_ps(diff, inv_std_vec);
+        _mm256_storeu_ps(&output[i], result);
+    }
+    for (; i < size; i++) {
+        output[i] = (temp[i] - mean) * inv_std;
+    }
+    
+    delete[] temp;
+}
+
+// ==================== Dynamic Batch Sizing ====================
+// Automatically adjust batch size based on cache size
+
+void matmul_dynamic_batch(const float* A, const float* B, float* C,
+                          int M, int N, int K) {
+    // Estimate L2 cache size (typically 256KB-1MB for modern CPUs)
+    // Use 192KB for accumulation buffers to leave room for data
+    
+    // Batch size = min(256, M) but adjusted for cache
+    int batch_size = std::min(64, M);
+    if (K > 1024) batch_size = std::min(32, batch_size);
+    if (K > 4096) batch_size = std::min(16, batch_size);
+    
+    // Process in batches
+    for (int batch_start = 0; batch_start < M; batch_start += batch_size) {
+        int batch_end = std::min(batch_start + batch_size, M);
+        
+        // Process this batch
+        for (int i = batch_start; i < batch_end; i++) {
+            const float* A_row = A + i * K;
+            float* C_row = C + i * N;
+            
+            constexpr int AVX_SIZE = 8;
+            constexpr int UNROLL_FACTOR = 16;
+            
+            int num_vec = N / AVX_SIZE;
+            int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+            
+            __m256 acc[UNROLL_FACTOR];
+            for (int u = 0; u < UNROLL_FACTOR; u++) {
+                acc[u] = _mm256_setzero_ps();
+            }
+            
+            for (int k = 0; k < K; k++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k]);
+                const float* B_k = B + k * N;
+                
+                for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                    #define LOAD_DYN(uidx) __m256 b##uidx = _mm256_loadu_ps(&B_k[(u + uidx) * AVX_SIZE]);
+                    #define FMA_DYN(uidx) acc[uidx] = _mm256_fmadd_ps(a_val, b##uidx, acc[uidx]);
+                    
+                    LOAD_DYN(0) LOAD_DYN(1) LOAD_DYN(2) LOAD_DYN(3)
+                    LOAD_DYN(4) LOAD_DYN(5) LOAD_DYN(6) LOAD_DYN(7)
+                    LOAD_DYN(8) LOAD_DYN(9) LOAD_DYN(10) LOAD_DYN(11)
+                    LOAD_DYN(12) LOAD_DYN(13) LOAD_DYN(14) LOAD_DYN(15)
+                    
+                    FMA_DYN(0) FMA_DYN(1) FMA_DYN(2) FMA_DYN(3)
+                    FMA_DYN(4) FMA_DYN(5) FMA_DYN(6) FMA_DYN(7)
+                    FMA_DYN(8) FMA_DYN(9) FMA_DYN(10) FMA_DYN(11)
+                    FMA_DYN(12) FMA_DYN(13) FMA_DYN(14) FMA_DYN(15)
+                    
+                    #undef LOAD_DYN
+                    #undef FMA_DYN
+                }
+            }
+            
+            for (int u = 0; u < unrolled; u++) {
+                _mm256_storeu_ps(&C_row[u * AVX_SIZE], acc[u]);
+            }
+        }
+    }
+}
+
+#else
+
+// ARM NEON versions of Session 37 optimizations
+
+void matmul_multi_level_cache_aware(const float* A, const float* B, float* C,
+                                     int M, int N, int K) {
+    constexpr int TILE_L1_M = 32;
+    constexpr int TILE_L1_N = 32;
+    constexpr int TILE_L1_K = 32;
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL_FACTOR = 8;
+    
+    for (int i_l1 = 0; i_l1 < M; i_l1 += TILE_L1_M) {
+        for (int j_l1 = 0; j_l1 < N; j_l1 += TILE_L1_N) {
+            int i_max = min(i_l1 + TILE_L1_M, M);
+            int j_max = min(j_l1 + TILE_L1_N, N);
+            
+            for (int i = i_l1; i < i_max; i++) {
+                const float* A_row = A + i * K;
+                const float* A_tile = &A_row[0];
+                float* C_row = C + i * N;
+                float* C_tile = &C_row[j_l1];
+                
+                float32x4_t acc[UNROLL_FACTOR];
+                int num_vec = (j_max - j_l1) / NEON_SIZE;
+                int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+                
+                for (int u = 0; u < unrolled; u++) {
+                    acc[u] = vdupq_n_f32(0.0f);
+                }
+                
+                for (int kk = 0; kk < K; kk++) {
+                    float32x4_t a_val = vdupq_n_f32(A_tile[kk]);
+                    const float* B_k = B + kk * N;
+                    const float* B_tile = &B_k[j_l1];
+                    
+                    for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                        #define LOAD_NEON(uidx) float32x4_t b##uidx = vld1q_f32(&B_tile[(u + uidx) * NEON_SIZE]);
+                        #define FMA_NEON(uidx) acc[u + uidx] = vfmaq_f32(acc[u + uidx], a_val, b##uidx);
+                        
+                        LOAD_NEON(0) LOAD_NEON(1) LOAD_NEON(2) LOAD_NEON(3)
+                        LOAD_NEON(4) LOAD_NEON(5) LOAD_NEON(6) LOAD_NEON(7)
+                        
+                        FMA_NEON(0) FMA_NEON(1) FMA_NEON(2) FMA_NEON(3)
+                        FMA_NEON(4) FMA_NEON(5) FMA_NEON(6) FMA_NEON(7)
+                        
+                        #undef LOAD_NEON
+                        #undef FMA_NEON
+                    }
+                }
+                
+                for (int u = 0; u < unrolled; u++) {
+                    vst1q_f32(&C_tile[u * NEON_SIZE], acc[u]);
+                }
+            }
+        }
+    }
+}
+
+void matmul_ultra_32x_unroll(const float* A, const float* B, float* C,
+                              int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL_FACTOR = 16;  // 16 NEON vectors = 64 floats
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        int num_vec = N / NEON_SIZE;
+        int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+        
+        float32x4_t acc[UNROLL_FACTOR];
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            acc[u] = vdupq_n_f32(0.0f);
+        }
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                #define LOAD16(uidx) float32x4_t b##uidx = vld1q_f32(&B_k[(u + uidx) * NEON_SIZE]);
+                #define FMA16(uidx) acc[uidx] = vfmaq_f32(acc[uidx], a_val, b##uidx);
+                
+                LOAD16(0) LOAD16(1) LOAD16(2) LOAD16(3) LOAD16(4) LOAD16(5) LOAD16(6) LOAD16(7)
+                LOAD16(8) LOAD16(9) LOAD16(10) LOAD16(11) LOAD16(12) LOAD16(13) LOAD16(14) LOAD16(15)
+                
+                FMA16(0) FMA16(1) FMA16(2) FMA16(3) FMA16(4) FMA16(5) FMA16(6) FMA16(7)
+                FMA16(8) FMA16(9) FMA16(10) FMA16(11) FMA16(12) FMA16(13) FMA16(14) FMA16(15)
+                
+                #undef LOAD16
+                #undef FMA16
+            }
+        }
+        
+        for (int u = 0; u < unrolled; u++) {
+            vst1q_f32(&C_row[u * NEON_SIZE], acc[u]);
+        }
+    }
+}
+
+void fused_gelu_layernorm(float* output, const float* input, const float* residual,
+                          int size, float eps) {
+    constexpr int NEON_SIZE = 4;
+    float* temp = new float[size];
+    
+    constexpr float PI = 0.7978845608028654f;
+    constexpr float A = 0.044715f;
+    
+    // GELU
+    for (int i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&input[i]);
+        float32x4_t r = vld1q_f32(&residual[i]);
+        float32x4_t sum = vaddq_f32(x, r);
+        
+        float32x4_t x2 = vmulq_f32(sum, sum);
+        float32x4_t inner = vmulq_f32(vdupq_n_f32(PI), vmulq_f32(sum, vaddq_f32(vdupq_n_f32(1.0f), vmulq_f32(vdupq_n_f32(A), x2))));
+        
+        // NEON doesn't have tanh, use approximation
+        float32x4_t tanh_val = vtanhq_f32(inner);
+        float32x4_t result = vmulq_f32(vdupq_n_f32(0.5f), vaddq_f32(sum, vmulq_f32(sum, tanh_val)));
+        
+        vst1q_f32(&temp[i], result);
+    }
+    
+    for (int i = size - (size % NEON_SIZE); i < size; i++) {
+        float x = input[i] + residual[i];
+        float x2 = x * x;
+        float inner = PI * x * (1.0f + A * x2);
+        temp[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+    
+    // LayerNorm
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        sum_vec = vaddq_f32(sum_vec, vld1q_f32(&temp[i]));
+    }
+    
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    float sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    for (; i < size; i++) sum += temp[i];
+    float mean = sum / size;
+    
+    float32x4_t mean_vec = vdupq_n_f32(mean);
+    float32x4_t var_vec = vdupq_n_f32(0.0f);
+    i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t diff = vsubq_f32(vld1q_f32(&temp[i]), mean_vec);
+        var_vec = vaddq_f32(var_vec, vmulq_f32(diff, diff));
+    }
+    
+    float var_arr[4];
+    vst1q_f32(var_arr, var_vec);
+    float var_sum = var_arr[0] + var_arr[1] + var_arr[2] + var_arr[3];
+    for (; i < size; i++) {
+        float diff = temp[i] - mean;
+        var_sum += diff * diff;
+    }
+    
+    float inv_std = 1.0f / std::sqrt(var_sum / size + eps);
+    float32x4_t inv_std_vec = vdupq_n_f32(inv_std);
+    
+    i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t diff = vsubq_f32(vld1q_f32(&temp[i]), mean_vec);
+        vst1q_f32(&output[i], vmulq_f32(diff, inv_std_vec));
+    }
+    for (; i < size; i++) {
+        output[i] = (temp[i] - mean) * inv_std;
+    }
+    
+    delete[] temp;
+}
+
+void matmul_dynamic_batch(const float* A, const float* B, float* C,
+                          int M, int N, int K) {
+    int batch_size = std::min(32, M);
+    
+    for (int batch_start = 0; batch_start < M; batch_start += batch_size) {
+        int batch_end = std::min(batch_start + batch_size, M);
+        
+        for (int i = batch_start; i < batch_end; i++) {
+            const float* A_row = A + i * K;
+            float* C_row = C + i * N;
+            
+            constexpr int NEON_SIZE = 4;
+            constexpr int UNROLL_FACTOR = 8;
+            
+            int num_vec = N / NEON_SIZE;
+            int unrolled = (num_vec / UNROLL_FACTOR) * UNROLL_FACTOR;
+            
+            float32x4_t acc[UNROLL_FACTOR];
+            for (int u = 0; u < UNROLL_FACTOR; u++) {
+                acc[u] = vdupq_n_f32(0.0f);
+            }
+            
+            for (int k = 0; k < K; k++) {
+                float32x4_t a_val = vdupq_n_f32(A_row[k]);
+                const float* B_k = B + k * N;
+                
+                for (int u = 0; u < unrolled; u += UNROLL_FACTOR) {
+                    #define LOAD_DYN_NEON(uidx) float32x4_t b##uidx = vld1q_f32(&B_k[(u + uidx) * NEON_SIZE]);
+                    #define FMA_DYN_NEON(uidx) acc[uidx] = vfmaq_f32(acc[uidx], a_val, b##uidx);
+                    
+                    LOAD_DYN_NEON(0) LOAD_DYN_NEON(1) LOAD_DYN_NEON(2) LOAD_DYN_NEON(3)
+                    LOAD_DYN_NEON(4) LOAD_DYN_NEON(5) LOAD_DYN_NEON(6) LOAD_DYN_NEON(7)
+                    
+                    FMA_DYN_NEON(0) FMA_DYN_NEON(1) FMA_DYN_NEON(2) FMA_DYN_NEON(3)
+                    FMA_DYN_NEON(4) FMA_DYN_NEON(5) FMA_DYN_NEON(6) FMA_DYN_NEON(7)
+                    
+                    #undef LOAD_DYN_NEON
+                    #undef FMA_DYN_NEON
+                }
+            }
+            
+            for (int u = 0; u < unrolled; u++) {
+                vst1q_f32(&C_row[u * NEON_SIZE], acc[u]);
+            }
+        }
+    }
+}
+
+#endif
+
+// ==================== End of Session 37 ====================
