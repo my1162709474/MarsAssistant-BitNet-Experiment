@@ -6727,6 +6727,236 @@ void matmul_improved_prefetch(const float* A, const float* B, float* C,
     }
 }
 
+// ==================== Session 62: Ultra 128x Loop Unrolling & Hyper Prefetch ====================
+// Target: +5-10% improvement over 64x unrolling on compute-bound workloads
+
+// Ultra 128x AVX2 Loop Unrolling - Maximum ILP
+// 16 AVX vectors per iteration = 128 floats per iteration
+void matmul_128x_unroll_ultra(const float* A, const float* B, float* C,
+                              int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 16;  // 128 floats per iteration
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        // 128-bit accumulation vectors (16 AVX registers)
+        __m256 c0 = _mm256_setzero_ps();
+        __m256 c1 = _mm256_setzero_ps();
+        __m256 c2 = _mm256_setzero_ps();
+        __m256 c3 = _mm256_setzero_ps();
+        __m256 c4 = _mm256_setzero_ps();
+        __m256 c5 = _mm256_setzero_ps();
+        __m256 c6 = _mm256_setzero_ps();
+        __m256 c7 = _mm256_setzero_ps();
+        __m256 c8 = _mm256_setzero_ps();
+        __m256 c9 = _mm256_setzero_ps();
+        __m256 c10 = _mm256_setzero_ps();
+        __m256 c11 = _mm256_setzero_ps();
+        __m256 c12 = _mm256_setzero_ps();
+        __m256 c13 = _mm256_setzero_ps();
+        __m256 c14 = _mm256_setzero_ps();
+        __m256 c15 = _mm256_setzero_ps();
+        
+        int k = 0;
+        // Process 16 AVX vectors (128 floats) at once
+        for (; k + UNROLL_FACTOR * AVX_SIZE <= K; k += UNROLL_FACTOR * AVX_SIZE) {
+            // Maximum instruction-level parallelism
+            // Load all A values first to maximize register reuse
+            __m256 a0 = _mm256_set1_ps(A_row[k]);
+            __m256 a1 = _mm256_set1_ps(A_row[k + AVX_SIZE]);
+            __m256 a2 = _mm256_set1_ps(A_row[k + AVX_SIZE * 2]);
+            __m256 a3 = _mm256_set1_ps(A_row[k + AVX_SIZE * 3]);
+            __m256 a4 = _mm256_set1_ps(A_row[k + AVX_SIZE * 4]);
+            __m256 a5 = _mm256_set1_ps(A_row[k + AVX_SIZE * 5]);
+            __m256 a6 = _mm256_set1_ps(A_row[k + AVX_SIZE * 6]);
+            __m256 a7 = _mm256_set1_ps(A_row[k + AVX_SIZE * 7]);
+            __m256 a8 = _mm256_set1_ps(A_row[k + AVX_SIZE * 8]);
+            __m256 a9 = _mm256_set1_ps(A_row[k + AVX_SIZE * 9]);
+            __m256 a10 = _mm256_set1_ps(A_row[k + AVX_SIZE * 10]);
+            __m256 a11 = _mm256_set1_ps(A_row[k + AVX_SIZE * 11]);
+            __m256 a12 = _mm256_set1_ps(A_row[k + AVX_SIZE * 12]);
+            __m256 a13 = _mm256_set1_ps(A_row[k + AVX_SIZE * 13]);
+            __m256 a14 = _mm256_set1_ps(A_row[k + AVX_SIZE * 14]);
+            __m256 a15 = _mm256_set1_ps(A_row[k + AVX_SIZE * 15]);
+            
+            // Prefetch next iteration's A data
+            if (k + UNROLL_FACTOR * AVX_SIZE + 16 < K) {
+                _mm_prefetch(A_row + k + UNROLL_FACTOR * AVX_SIZE + 16, _MM_HINT_T0);
+                _mm_prefetch(A_row + k + UNROLL_FACTOR * AVX_SIZE + 32, _MM_HINT_T0);
+            }
+            
+            // Process all 16 A values with B matrix
+            const float* B_k0 = B + (k) * N;
+            const float* B_k1 = B + (k + AVX_SIZE) * N;
+            const float* B_k2 = B + (k + AVX_SIZE * 2) * N;
+            const float* B_k3 = B + (k + AVX_SIZE * 3) * N;
+            const float* B_k4 = B + (k + AVX_SIZE * 4) * N;
+            const float* B_k5 = B + (k + AVX_SIZE * 5) * N;
+            const float* B_k6 = B + (k + AVX_SIZE * 6) * N;
+            const float* B_k7 = B + (k + AVX_SIZE * 7) * N;
+            const float* B_k8 = B + (k + AVX_SIZE * 8) * N;
+            const float* B_k9 = B + (k + AVX_SIZE * 9) * N;
+            const float* B_k10 = B + (k + AVX_SIZE * 10) * N;
+            const float* B_k11 = B + (k + AVX_SIZE * 11) * N;
+            const float* B_k12 = B + (k + AVX_SIZE * 12) * N;
+            const float* B_k13 = B + (k + AVX_SIZE * 13) * N;
+            const float* B_k14 = B + (k + AVX_SIZE * 14) * N;
+            const float* B_k15 = B + (k + AVX_SIZE * 15) * N;
+            
+            // Prefetch B data for next iteration
+            if (k + UNROLL_FACTOR * AVX_SIZE + 8 < K) {
+                _mm_prefetch(B_k0 + 256, _MM_HINT_T0);
+                _mm_prefetch(B_k8 + 256, _MM_HINT_T0);
+            }
+            
+            // Process C[0-7] outputs
+            for (int j = 0; j < 8; j++) {
+                c0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(&B_k0[j * AVX_SIZE]), c0);
+                c1 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(&B_k1[j * AVX_SIZE]), c1);
+                c2 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(&B_k2[j * AVX_SIZE]), c2);
+                c3 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(&B_k3[j * AVX_SIZE]), c3);
+                c4 = _mm256_fmadd_ps(a4, _mm256_loadu_ps(&B_k4[j * AVX_SIZE]), c4);
+                c5 = _mm256_fmadd_ps(a5, _mm256_loadu_ps(&B_k5[j * AVX_SIZE]), c5);
+                c6 = _mm256_fmadd_ps(a6, _mm256_loadu_ps(&B_k6[j * AVX_SIZE]), c6);
+                c7 = _mm256_fmadd_ps(a7, _mm256_loadu_ps(&B_k7[j * AVX_SIZE]), c7);
+            }
+            
+            // Process C[8-15] outputs
+            for (int j = 8; j < 16; j++) {
+                c8 = _mm256_fmadd_ps(a8, _mm256_loadu_ps(&B_k8[j * AVX_SIZE]), c8);
+                c9 = _mm256_fmadd_ps(a9, _mm256_loadu_ps(&B_k9[j * AVX_SIZE]), c9);
+                c10 = _mm256_fmadd_ps(a10, _mm256_loadu_ps(&B_k10[j * AVX_SIZE]), c10);
+                c11 = _mm256_fmadd_ps(a11, _mm256_loadu_ps(&B_k11[j * AVX_SIZE]), c11);
+                c12 = _mm256_fmadd_ps(a12, _mm256_loadu_ps(&B_k12[j * AVX_SIZE]), c12);
+                c13 = _mm256_fmadd_ps(a13, _mm256_loadu_ps(&B_k13[j * AVX_SIZE]), c13);
+                c14 = _mm256_fmadd_ps(a14, _mm256_loadu_ps(&B_k14[j * AVX_SIZE]), c14);
+                c15 = _mm256_fmadd_ps(a15, _mm256_loadu_ps(&B_k15[j * AVX_SIZE]), c15);
+            }
+        }
+        
+        // Store accumulated results
+        _mm256_storeu_ps(&C_row[0], c0);
+        _mm256_storeu_ps(&C_row[N], c1);
+        _mm256_storeu_ps(&C_row[N * 2], c2);
+        _mm256_storeu_ps(&C_row[N * 3], c3);
+        _mm256_storeu_ps(&C_row[N * 4], c4);
+        _mm256_storeu_ps(&C_row[N * 5], c5);
+        _mm256_storeu_ps(&C_row[N * 6], c6);
+        _mm256_storeu_ps(&C_row[N * 7], c7);
+        _mm256_storeu_ps(&C_row[N * 8], c8);
+        _mm256_storeu_ps(&C_row[N * 9], c9);
+        _mm256_storeu_ps(&C_row[N * 10], c10);
+        _mm256_storeu_ps(&C_row[N * 11], c11);
+        _mm256_storeu_ps(&C_row[N * 12], c12);
+        _mm256_storeu_ps(&C_row[N * 13], c13);
+        _mm256_storeu_ps(&C_row[N * 14], c14);
+        _mm256_storeu_ps(&C_row[N * 15], c15);
+        
+        // Handle remaining elements - fall back to standard loop
+        for (; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            for (int j = 0; j < N; j += AVX_SIZE) {
+                __m256 c_vec = _mm256_loadu_ps(&C_row[j]);
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j]);
+                _mm256_storeu_ps(&C_row[j], _mm256_fmadd_ps(a_val, b_vec, c_vec));
+            }
+        }
+    }
+}
+
+// Hyper Prefetch Strategy - Aggressive data prefetching
+void matmul_hyper_prefetch(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 32;  // Double prefetch distance
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        __m256 c_vec[64];
+        int num_vec = N / AVX_SIZE;
+        for (int j = 0; j < num_vec; j++) {
+            c_vec[j] = _mm256_setzero_ps();
+        }
+        
+        for (int k = 0; k < K; k++) {
+            // Aggressive prefetch for A matrix
+            if (k + PREFETCH_DIST < K) {
+                _mm_prefetch(A_row + k + PREFETCH_DIST, _MM_HINT_T0);
+                _mm_prefetch(A_row + k + PREFETCH_DIST + 64, _MM_HINT_T0);
+                _mm_prefetch(A_row + k + PREFETCH_DIST + 128, _MM_HINT_T0);
+            }
+            
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Aggressive prefetch for B matrix
+            if (k + PREFETCH_DIST < K) {
+                _mm_prefetch(B + (k + PREFETCH_DIST) * N, _MM_HINT_T0);
+                _mm_prefetch(B + (k + PREFETCH_DIST) * N + 64, _MM_HINT_T0);
+                _mm_prefetch(B + (k + PREFETCH_DIST) * N + 128, _MM_HINT_T0);
+                _mm_prefetch(B + (k + PREFETCH_DIST) * N + 256, _MM_HINT_T0);
+            }
+            
+            for (int j = 0; j < num_vec; j++) {
+                __m256 b_vec = _mm256_loadu_ps(&B_k[j * AVX_SIZE]);
+                c_vec[j] = _mm256_fmadd_ps(a_val, b_vec, c_vec[j]);
+            }
+        }
+        
+        for (int j = 0; j < num_vec; j++) {
+            _mm256_storeu_ps(&C_row[j * AVX_SIZE], c_vec[j]);
+        }
+    }
+}
+
+// Ultra Vectorized Memory Copy with NT Stores
+void memory_copy_ultra_avx2(void* RESTRICT dst, const void* RESTRICT src, size_t size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int COPY_SIZE = 256;  // 256 bytes per iteration (8 AVX vectors)
+    
+    unsigned char* d = static_cast<unsigned char*>(dst);
+    const unsigned char* s = static_cast<const unsigned char*>(src);
+    
+    // Aligned copy with AVX2 and NT stores
+    size_t aligned_size = (size / COPY_SIZE) * COPY_SIZE;
+    
+    for (size_t i = 0; i < aligned_size; i += COPY_SIZE) {
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 32));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 64));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 96));
+        __m256i v4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 128));
+        __m256i v5 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 160));
+        __m256i v6 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 192));
+        __m256i v7 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 224));
+        
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d), v0);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 32), v1);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 64), v2);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 96), v3);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 128), v4);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 160), v5);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 192), v6);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + 224), v7);
+        
+        s += COPY_SIZE;
+        d += COPY_SIZE;
+    }
+    
+    // Handle remainder
+    for (size_t i = aligned_size; i < size; i++) {
+        d[i] = s[i];
+    }
+    
+    // Memory fence to ensure all stores are completed
+    _mm_sfence();
+}
+
 // ==================== Morton Order Cache Optimization ====================
 
 inline int morton_encode(int x, int y) {
