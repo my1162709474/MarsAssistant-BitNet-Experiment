@@ -2909,6 +2909,57 @@ void matmul_1bit_optimized(const unsigned char* A_packed, const unsigned char* B
     }
 }
 
+// ==================== NEW: Ultra-Optimized 64-bit Popcount 1-bit MatMul ====================
+
+void matmul_1bit_64bit(const unsigned char* A_packed, const unsigned char* B_packed, 
+                       float* C, int M, int N, int K) {
+    const int K_words = (K + 31) / 32;
+    const int K_dwords = (K + 63) / 64;  // 64-bit words
+    
+    // Process 4 rows at a time for better cache reuse
+    constexpr int ROW_BATCH = 4;
+    
+    for (int i = 0; i < M; i += ROW_BATCH) {
+        int rows_this_batch = std::min(ROW_BATCH, M - i);
+        
+        for (int j = 0; j < N; j++) {
+            int diff_counts[ROW_BATCH] = {0};
+            
+            // Use 64-bit popcount when possible (2x fewer iterations)
+            const int full_64_blocks = K_dwords;
+            
+            for (int w = 0; w < full_64_blocks; w++) {
+                // Load 64 bits (2 x 32-bit words) from B
+                unsigned long long b_word = 0;
+                const unsigned int* B_ptr = reinterpret_cast<const unsigned int*>(B_packed);
+                if (w * 2 < K_words) {
+                    b_word = B_ptr[w * 2 * N + j];
+                }
+                if (w * 2 + 1 < K_words) {
+                    b_word |= (static_cast<unsigned long long>(B_ptr[(w * 2 + 1) * N + j]) << 32);
+                }
+                
+                for (int r = 0; r < rows_this_batch; r++) {
+                    const unsigned int* A_ptr = reinterpret_cast<const unsigned int*>(A_packed);
+                    unsigned long long a_word = 0;
+                    if (w * 2 < K_words) {
+                        a_word = A_ptr[(i + r) * K_words + w * 2];
+                    }
+                    if (w * 2 + 1 < K_words) {
+                        a_word |= (static_cast<unsigned long long>(A_ptr[(i + r) * K_words + w * 2 + 1]) << 32);
+                    }
+                    diff_counts[r] += __builtin_popcountll(a_word ^ b_word);
+                }
+            }
+            
+            // Store results
+            for (int r = 0; r < rows_this_batch; r++) {
+                C[(i + r) * N + j] = static_cast<float>(K - 2 * diff_counts[r]);
+            }
+        }
+    }
+}
+
 // ==================== NEW: Work-Stealing Parallel Scheduler ====================
 
 struct StealData {
@@ -3639,9 +3690,44 @@ void init_sigmoid_lut() {
     }
 }
 
+// ==================== NEW: SIMD Gather Support Detection ====================
+
+#if defined(__AVX2__) && defined(__AVX512F__)
+#define HAS_AVX2_GATHER 1
+#else
+#define HAS_AVX2_GATHER 0
+#endif
+
 // SIMD sigmoid using lookup table with AVX2 gather (faster)
 void sigmoid_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
+    constexpr int STRIDE = sizeof(float);
+
+#if HAS_AVX2_GATHER
+    // Use hardware gather for maximum performance (AVX2 + AVX-512 capable CPUs)
+    const __m256 scale = _mm256_set1_ps((SIGMOID_LUT_SIZE - 1) / (SIGMOID_LUT_MAX - SIGMOID_LUT_MIN));
+    const __m256 offset = _mm256_set1_ps(-SIGMOID_LUT_MIN);
+    const __m256 lut_min_vec = _mm256_set1_ps(SIGMOID_LUT_MIN);
+    const __m256 lut_max_vec = _mm256_set1_ps(SIGMOID_LUT_MAX);
+
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+
+        // Clamp to LUT range
+        x = _mm256_max_ps(_mm256_min_ps(x, lut_max_vec), lut_min_vec);
+
+        // Convert to LUT index (0-511)
+        __m256 idx_float = _mm256_mul_ps(_mm256_add_ps(x, offset), scale);
+        __m256i idx = _mm256_cvttps_epi32(idx_float);
+
+        // Hardware-accelerated gather: 8 floats from 8 different LUT indices
+        // Each element of idx selects one float from sigmoid_lut
+        __m256 result = _mm256_i32gather_ps(sigmoid_lut, idx, STRIDE);
+
+        _mm256_storeu_ps(&data[i], result);
+    }
+#else
+    // Fallback: Manual gather for older CPUs without AVX2 gather
     const __m256 scale = _mm256_set1_ps((SIGMOID_LUT_SIZE - 1) / (SIGMOID_LUT_MAX - SIGMOID_LUT_MIN));
     const __m256 offset = _mm256_set1_ps(-SIGMOID_LUT_MIN);
     const __m256 lut_min_vec = _mm256_set1_ps(SIGMOID_LUT_MIN);
@@ -3671,6 +3757,7 @@ void sigmoid_avx2(float* data, int size) {
 
         _mm256_storeu_ps(&data[i], result);
     }
+#endif
 }
 
 // ARM NEON sigmoid with lookup table
@@ -3711,6 +3798,37 @@ void sigmoid_neon(float* data, int size) {
         vst1q_f32(&data[i], result);
     }
 }
+
+// ==================== NEW: AVX-512 Sigmoid with 16x Parallelism ====================
+
+#if USE_AVX512
+void sigmoid_avx512(float* data, int size) {
+    constexpr int AVX512_SIZE = 16;
+    constexpr int STRIDE = sizeof(float);
+
+    const __m512 scale = _mm512_set1_ps((SIGMOID_LUT_SIZE - 1) / (SIGMOID_LUT_MAX - SIGMOID_LUT_MIN));
+    const __m512 offset = _mm512_set1_ps(-SIGMOID_LUT_MIN);
+    const __m512 lut_min_vec = _mm512_set1_ps(SIGMOID_LUT_MIN);
+    const __m512 lut_max_vec = _mm512_set1_ps(SIGMOID_LUT_MAX);
+
+    for (int i = 0; i < size; i += AVX512_SIZE) {
+        __m512 x = _mm512_loadu_ps(&data[i]);
+
+        // Clamp to LUT range
+        x = _mm512_max_ps(_mm512_min_ps(x, lut_max_vec), lut_min_vec);
+
+        // Convert to LUT index (0-511)
+        __m512 idx_float = _mm512_mul_ps(_mm512_add_ps(x, offset), scale);
+        __m512i idx = _mm512_cvttps_epi32(idx_float);
+
+        // Hardware-accelerated gather: 16 floats from 16 different LUT indices
+        // 2x throughput compared to AVX2 version
+        __m512 result = _mm512_i32gather_ps(idx, sigmoid_lut, STRIDE);
+
+        _mm512_storeu_ps(&data[i], result);
+    }
+}
+#endif
 
 // ==================== NEW: Cache-Optimized Panel GEMM ====================
 
@@ -5518,6 +5636,8 @@ void quantize_per_channel(const float* input, int8_t* output,
 
 // ==================== SESSION 14: Register Blocking & Micro-kernel ====================
 
+#if IS_X86_PLATFORM
+
 // 8x8 register blocking micro-kernel (top performance)
 void matmul_8x8_microkernel(const float* A, const float* B, float* C,
                             int K, int lda, int ldb, int ldc) {
@@ -5574,7 +5694,10 @@ void matmul_8x8_microkernel(const float* A, const float* B, float* C,
     _mm256_storeu_ps(&C[0 * ldc + 8], c01);
 }
 
+#endif  // IS_X86_PLATFORM
+
 // Batch matmul with optimal memory access pattern
+#if IS_X86_PLATFORM
 void batch_matmul_optimal(const float* A, const float* B, float* C,
                           int batch_size, int M, int N, int K) {
     constexpr int AVX_SIZE = 8;
@@ -5609,9 +5732,13 @@ void batch_matmul_optimal(const float* A, const float* B, float* C,
     }
 }
 
+#endif  // IS_X86_PLATFORM
+
 // ==================== Session 15: Advanced Fusions & INT4 Quantization ====================
 
 // ==================== 1. Fused LayerNorm + GELU ====================
+
+#if IS_X86_PLATFORM
 
 // Fused LayerNorm + GELU: single pass, better memory locality
 void fused_layernorm_gelu(const float* input, float* output,
@@ -5707,7 +5834,11 @@ void fused_layernorm_gelu(const float* input, float* output,
     }
 }
 
+#endif  // IS_X86_PLATFORM
+
 // ==================== 2. Aggressive 32x Loop Unrolling ====================
+
+#if IS_X86_PLATFORM
 
 // 32x unrolling for maximum instruction-level parallelism
 void matmul_32x_unroll(const float* A, const float* B, float* C,
@@ -7208,6 +7339,7 @@ inline float fast_exp_taylor(float x) {
 }
 
 // Vectorized fast exp using Taylor series
+#if IS_X86_PLATFORM
 void exp_fast_taylor_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     int i = 0;
@@ -7245,8 +7377,11 @@ void exp_fast_taylor_avx2(float* data, int size) {
     }
 }
 
+#endif  // IS_X86_PLATFORM
+
 // Ultra-aggressive 64x loop unrolling for matrix multiplication
 // Maximum instruction-level parallelism
+#if IS_X86_PLATFORM
 void matmul_64x_unroll_avx2(const float* RESTRICT A,
                             const float* RESTRICT B,
                             float* RESTRICT C,
