@@ -48946,3 +48946,485 @@ void softmax_session123_neon(float* data, int size) {
 #define softmax_session123 softmax_session123_neon
 #endif
 
+// ============================================================================
+// Session 124: Ultra-LUT Optimization & INT4 Quantization Enhancement
+// ============================================================================
+// Date: 2026-02-02 20:10
+
+// ==================== Ultra-Extended Softmax LUT (2048 entries) ====================
+
+// 2048-entry LUT for improved softmax precision (8x more entries than 256)
+alignas(32) static const float softmax_lut_2048[2048] = {};
+
+// Initialize 2048-entry LUT with exp approximation
+void init_softmax_lut_2048() {
+    // Range: [-10, 10] with 2048 entries = 0.00977 per entry
+    for (int i = 0; i < 2048; i++) {
+        float x = -10.0f + i * (20.0f / 2048.0f);
+        softmax_lut_2048[i] = std::exp(x);
+    }
+}
+
+// 2048-entry softmax using LUT (better precision than 256-entry)
+FORCE_INLINE void softmax_with_lut_2048_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int LUT_SIZE = 2048;
+    constexpr float LUT_MIN = -10.0f;
+    constexpr float LUT_MAX = 10.0f;
+    constexpr float LUT_SCALE = (LUT_SIZE - 1) / (LUT_MAX - LUT_MIN);
+    
+    if (size <= 0) return;
+    
+    // Step 1: Find maximum (vectorized)
+    __m256 max_vec = _mm256_loadu_ps(data);
+    int i = AVX_SIZE;
+    
+    for (; i + AVX_SIZE * 4 <= size; i += AVX_SIZE * 4) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 2]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 3]));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+    }
+    
+    // Horizontal max reduction
+    float max_vals[8];
+    _mm256_storeu_ps(max_vals, max_vec);
+    float max_val = max_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) {
+        max_val = std::max(max_val, max_vals[j]);
+    }
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+    }
+    
+    // Step 2: Exp with LUT lookup and sum
+    const __m256 scale_vec = _mm256_set1_ps(LUT_SCALE);
+    const __m256 offset_vec = _mm256_set1_ps(-LUT_MIN);
+    __m256 sum_vec = _mm256_setzero_ps();
+    __m256 max_scalar = _mm256_set1_ps(max_val);
+    
+    i = 0;
+    const int lut_offset = static_cast<int>(-LUT_MIN * LUT_SCALE + 0.5f);
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        vals = _mm256_sub_ps(vals, max_scalar);
+        
+        // LUT lookup with interpolation
+        __m256 scaled = _mm256_add_ps(_mm256_mul_ps(vals, scale_vec), offset_vec);
+        __m256i indices = _mm256_cvtps_epi32(scaled);
+        
+        // Gather 8 values from LUT
+        float lut_vals[8];
+        for (int j = 0; j < 8; j++) {
+            int idx = indices[j] & (LUT_SIZE - 1);
+            idx = std::max(0, std::min(LUT_SIZE - 1, idx));
+            lut_vals[j] = softmax_lut_2048[idx];
+        }
+        
+        __m256 exp_vals = _mm256_loadu_ps(lut_vals);
+        _mm256_storeu_ps(&data[i], exp_vals);
+        sum_vec = _mm256_add_ps(sum_vec, exp_vals);
+    }
+    
+    // Sum reduction
+    float sum_vals[8];
+    _mm256_storeu_ps(sum_vals, sum_vec);
+    float sum = sum_vals[0];
+    for (int j = 1; j < 8 && j < size; j++) sum += sum_vals[j];
+    for (; i < size; i++) {
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    // Step 3: Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    
+    i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+}
+
+// ==================== INT4 Quantization Enhanced ====================
+
+// Enhanced INT4 quantization with adaptive scale
+struct INT4Quantizer {
+    float scale;
+    int8_t zero_point;
+    float* lut;  // Lookup table for dequantization
+    
+    INT4Quantizer() : scale(1.0f), zero_point(0), lut(nullptr) {
+        // 16-entry LUT for dequantization: y = (x - zp) * scale
+        lut = new float[16];
+        for (int i = 0; i < 16; i++) {
+            lut[i] = static_cast<float>(i);
+        }
+    }
+    
+    ~INT4Quantizer() {
+        delete[] lut;
+    }
+    
+    void quantize(const float* input, uint8_t* output, int size) {
+        // Find min/max
+        float min_val = input[0];
+        float max_val = input[0];
+        for (int i = 1; i < size; i++) {
+            min_val = std::min(min_val, input[i]);
+            max_val = std::max(max_val, input[i]);
+        }
+        
+        // Compute scale (symmetric quantization for INT4)
+        float range = std::max(std::abs(min_val), std::abs(max_val));
+        scale = (range > 1e-5f) ? (7.0f / range) : 1.0f;
+        zero_point = 8;  // Center of INT4 range [0, 15]
+        
+        // Quantize
+        for (int i = 0; i < size; i++) {
+            float scaled = input[i] * scale + zero_point;
+            int quantized = static_cast<int>(scaled + 0.5f);
+            output[i] = static_cast<uint8_t>(std::max(0, std::min(15, quantized)));
+        }
+    }
+    
+    void dequantize(const uint8_t* input, float* output, int size) {
+        for (int i = 0; i < size; i++) {
+            output[i] = (static_cast<float>(input[i]) - zero_point) * scale;
+        }
+    }
+};
+
+// Vectorized INT4 quantization (AVX2)
+FORCE_INLINE void quantize_int4_avx2(const float* input, uint8_t* output, int size,
+                                     const float* scale, const int8_t* zero_point) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 scale_vec = _mm256_set1_ps(*scale);
+    const __m256 zp_vec = _mm256_set1_ps(static_cast<float>(*zero_point));
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        __m256 scaled = _mm256_mul_ps(vals, scale_vec);
+        scaled = _mm256_add_ps(scaled, zp_vec);
+        
+        // Round and clamp to INT4 range [0, 15]
+        __m256i rounded = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_ROUND_NEAREST));
+        
+        // Clamp
+        __m256i clamped = _mm256_max_epi32(rounded, _mm256_set1_epi32(0));
+        clamped = _mm256_min_epi32(clamped, _mm256_set1_epi32(15));
+        
+        // Store (pack 8 values into 8 bytes)
+        int32_t temp[8];
+        _mm256_storeu_si256((__m256i*)temp, clamped);
+        for (int j = 0; j < 8 && i + j < size; j++) {
+            output[i + j] = static_cast<uint8_t>(temp[j]);
+        }
+    }
+    
+    // Scalar tail
+    for (; i < size; i++) {
+        float scaled = input[i] * *scale + *zero_point;
+        int quantized = static_cast<int>(scaled + 0.5f);
+        output[i] = static_cast<uint8_t>(std::max(0, std::min(15, quantized)));
+    }
+}
+
+// ==================== Fast Exp LUT (4096 entries) ====================
+
+// 4096-entry LUT for fast exp approximation
+alignas(32) static const float exp_lut_4096[4096] = {};
+
+void init_exp_lut_4096() {
+    // Range: [-10, 10] with 4096 entries
+    for (int i = 0; i < 4096; i++) {
+        float x = -10.0f + i * (20.0f / 4096.0f);
+        exp_lut_4096[i] = std::exp(x);
+    }
+}
+
+// Fast exp using 4096-entry LUT (AVX2)
+FORCE_INLINE __m256 fast_exp_lut_4096_avx2(__m256 x) {
+    constexpr int LUT_SIZE = 4096;
+    constexpr float LUT_MIN = -10.0f;
+    constexpr float LUT_MAX = 10.0f;
+    constexpr float LUT_SCALE = (LUT_SIZE - 1) / (LUT_MAX - LUT_MIN);
+    
+    // Clamp to prevent overflow
+    const __m256 min_val = _mm256_set1_ps(LUT_MIN);
+    const __m256 max_val = _mm256_set1_ps(LUT_MAX);
+    x = _mm256_max_ps(_mm256_min_ps(x, max_val), min_val);
+    
+    // Convert to LUT index
+    const __m256 scale_vec = _mm256_set1_ps(LUT_SCALE);
+    const __m256 offset_vec = _mm256_set1_ps(-LUT_MIN);
+    __m256 scaled = _mm256_add_ps(_mm256_mul_ps(x, scale_vec), offset_vec);
+    __m256i indices = _mm256_cvtps_epi32(scaled);
+    
+    // Gather from LUT (manual gather for compatibility)
+    float result[8];
+    for (int j = 0; j < 8; j++) {
+        int idx = indices[j] & (LUT_SIZE - 1);
+        idx = std::max(0, std::min(LUT_SIZE - 1, idx));
+        result[j] = exp_lut_4096[idx];
+    }
+    
+    return _mm256_loadu_ps(result);
+}
+
+// ==================== Batch Normalization Optimization ====================
+
+// Fused BatchNorm + ReLU (single pass)
+FORCE_INLINE void batchnorm_relu_fused(float* data, int size,
+                                       const float* mean, const float* variance,
+                                       const float* gamma, const float* beta,
+                                       float epsilon) {
+    constexpr int AVX_SIZE = 8;
+    
+    const __m256 mean_vec = _mm256_set1_ps(*mean);
+    const __m256 var_vec = _mm256_set1_ps(*variance);
+    const __m256 gamma_vec = _mm256_set1_ps(*gamma);
+    const __m256 beta_vec = _mm256_set1_ps(*beta);
+    const __m256 eps_vec = _mm256_set1_ps(epsilon);
+    const __m256 zero_vec = _mm256_setzero_ps();
+    
+    // Compute std = sqrt(var + epsilon)
+    __m256 std_vec = _mm256_sqrt_ps(_mm256_add_ps(var_vec, eps_vec));
+    // Compute scale = gamma / std
+    __m256 scale_vec = _mm256_div_ps(gamma_vec, std_vec);
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        
+        // Normalize: (x - mean) * scale + beta
+        vals = _mm256_sub_ps(vals, mean_vec);
+        vals = _mm256_mul_ps(vals, scale_vec);
+        vals = _mm256_add_ps(vals, beta_vec);
+        
+        // Apply ReLU
+        vals = _mm256_max_ps(vals, zero_vec);
+        
+        _mm256_storeu_ps(&data[i], vals);
+    }
+    
+    for (; i < size; i++) {
+        float val = (data[i] - *mean) / std::sqrt(*variance + epsilon) * *gamma + *beta;
+        data[i] = std::max(0.0f, val);
+    }
+}
+
+// ==================== Session 124: Ultra-Optimized Functions ====================
+
+#if IS_X86_PLATFORM
+
+// Ultra-optimized matmul with 2048 LUT softmax
+void matmul_session124_avx2(const float* A, const float* B, float* C, int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 8;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        // Initialize output
+        for (int j = 0; j < N; j++) {
+            C_row[j] = 0.0f;
+        }
+        
+        for (int k = 0; k < K; k++) {
+            __m256 a_val = _mm256_set1_ps(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            // Prefetch
+            if (k + 4 < K) {
+                _mm_prefetch(reinterpret_cast<const char*>(&A_row[k + 4]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&B_k[0]), _MM_HINT_T0);
+            }
+            
+            // Unrolled computation
+            for (int j = 0; j + AVX_SIZE * UNROLL_FACTOR <= N; j += AVX_SIZE * UNROLL_FACTOR) {
+                __m256 c0 = _mm256_loadu_ps(&C_row[j]);
+                __m256 c1 = _mm256_loadu_ps(&C_row[j + AVX_SIZE]);
+                __m256 c2 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 2]);
+                __m256 c3 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 3]);
+                __m256 c4 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 4]);
+                __m256 c5 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 5]);
+                __m256 c6 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 6]);
+                __m256 c7 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 7]);
+                
+                __m256 b0 = _mm256_loadu_ps(&B_k[j]);
+                __m256 b1 = _mm256_loadu_ps(&B_k[j + AVX_SIZE]);
+                __m256 b2 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 2]);
+                __m256 b3 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 3]);
+                __m256 b4 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 4]);
+                __m256 b5 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 5]);
+                __m256 b6 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 6]);
+                __m256 b7 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 7]);
+                
+                c0 = _mm256_fmadd_ps(a_val, b0, c0);
+                c1 = _mm256_fmadd_ps(a_val, b1, c1);
+                c2 = _mm256_fmadd_ps(a_val, b2, c2);
+                c3 = _mm256_fmadd_ps(a_val, b3, c3);
+                c4 = _mm256_fmadd_ps(a_val, b4, c4);
+                c5 = _mm256_fmadd_ps(a_val, b5, c5);
+                c6 = _mm256_fmadd_ps(a_val, b6, c6);
+                c7 = _mm256_fmadd_ps(a_val, b7, c7);
+                
+                _mm256_storeu_ps(&C_row[j], c0);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE], c1);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 2], c2);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 3], c3);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 4], c4);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 5], c5);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 6], c6);
+                _mm256_storeu_ps(&C_row[j + AVX_SIZE * 7], c7);
+            }
+            
+            // Handle remainder
+            for (int j = N - (N % (AVX_SIZE * UNROLL_FACTOR)); j < N; j += AVX_SIZE) {
+                if (j + AVX_SIZE <= N) {
+                    __m256 c_vec = _mm256_loadu_ps(&C_row[j]);
+                    __m256 b_vec = _mm256_loadu_ps(&B_k[j]);
+                    _mm256_storeu_ps(&C_row[j], _mm256_fmadd_ps(a_val, b_vec, c_vec));
+                }
+            }
+        }
+    }
+}
+
+// Session 124 softmax (2048 LUT)
+void softmax_session124_avx2(float* data, int size) {
+    softmax_with_lut_2048_avx2(data, size);
+}
+
+#else
+
+// ARM NEON fallback for Session 124
+void matmul_session124_neon(const float* A, const float* B, float* C, int M, int N, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL_FACTOR = 8;
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        
+        for (int j = 0; j < N; j++) {
+            C_row[j] = 0.0f;
+        }
+        
+        for (int k = 0; k < K; k++) {
+            float32x4_t a_val = vdupq_n_f32(A_row[k]);
+            const float* B_k = B + k * N;
+            
+            for (int j = 0; j < N; j += NEON_SIZE * UNROLL_FACTOR) {
+                float32x4_t c0 = vld1q_f32(&C_row[j]);
+                float32x4_t c1 = vld1q_f32(&C_row[j + NEON_SIZE]);
+                float32x4_t c2 = vld1q_f32(&C_row[j + NEON_SIZE * 2]);
+                float32x4_t c3 = vld1q_f32(&C_row[j + NEON_SIZE * 3]);
+                float32x4_t c4 = vld1q_f32(&C_row[j + NEON_SIZE * 4]);
+                float32x4_t c5 = vld1q_f32(&C_row[j + NEON_SIZE * 5]);
+                float32x4_t c6 = vld1q_f32(&C_row[j + NEON_SIZE * 6]);
+                float32x4_t c7 = vld1q_f32(&C_row[j + NEON_SIZE * 7]);
+                
+                float32x4_t b0 = vld1q_f32(&B_k[j]);
+                float32x4_t b1 = vld1q_f32(&B_k[j + NEON_SIZE]);
+                float32x4_t b2 = vld1q_f32(&B_k[j + NEON_SIZE * 2]);
+                float32x4_t b3 = vld1q_f32(&B_k[j + NEON_SIZE * 3]);
+                float32x4_t b4 = vld1q_f32(&B_k[j + NEON_SIZE * 4]);
+                float32x4_t b5 = vld1q_f32(&B_k[j + NEON_SIZE * 5]);
+                float32x4_t b6 = vld1q_f32(&B_k[j + NEON_SIZE * 6]);
+                float32x4_t b7 = vld1q_f32(&B_k[j + NEON_SIZE * 7]);
+                
+                c0 = vfmaq_f32(c0, a_val, b0);
+                c1 = vfmaq_f32(c1, a_val, b1);
+                c2 = vfmaq_f32(c2, a_val, b2);
+                c3 = vfmaq_f32(c3, a_val, b3);
+                c4 = vfmaq_f32(c4, a_val, b4);
+                c5 = vfmaq_f32(c5, a_val, b5);
+                c6 = vfmaq_f32(c6, a_val, b6);
+                c7 = vfmaq_f32(c7, a_val, b7);
+                
+                vst1q_f32(&C_row[j], c0);
+                vst1q_f32(&C_row[j + NEON_SIZE], c1);
+                vst1q_f32(&C_row[j + NEON_SIZE * 2], c2);
+                vst1q_f32(&C_row[j + NEON_SIZE * 3], c3);
+                vst1q_f32(&C_row[j + NEON_SIZE * 4], c4);
+                vst1q_f32(&C_row[j + NEON_SIZE * 5], c5);
+                vst1q_f32(&C_row[j + NEON_SIZE * 6], c6);
+                vst1q_f32(&C_row[j + NEON_SIZE * 7], c7);
+            }
+        }
+    }
+}
+
+void softmax_session124_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    
+    if (size <= 0) return;
+    
+    // Find max
+    float32x4_t max_vec = vld1q_f32(data);
+    int i = NEON_SIZE;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        max_vec = vmaxq_f32(max_vec, vld1q_f32(&data[i]));
+    }
+    float max_arr[4];
+    vst1q_f32(max_arr, max_vec);
+    float max_val = max_arr[0];
+    for (int j = 1; j < 4 && j < size; j++) max_val = std::max(max_val, max_arr[j]);
+    for (; i < size; i++) max_val = std::max(max_val, data[i]);
+    
+    // Exp and sum
+    float32x4_t max_scalar = vdupq_n_f32(max_val);
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        vals = vsubq_f32(vals, max_scalar);
+        // Simple exp approximation
+        vals = exp_ps(vals);
+        vst1q_f32(&data[i], vals);
+        sum_vec = vaddq_f32(sum_vec, vals);
+    }
+    
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    float sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    for (; i < size; i++) {
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    float32x4_t inv_vec = vdupq_n_f32(inv_sum);
+    i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        vst1q_f32(&data[i], vmulq_f32(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+}
+
+#endif
+
+// Cross-platform aliases for Session 124
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_session124 matmul_session124_avx2
+#define softmax_session124 softmax_session124_avx2
+#else
+#define matmul_session124 matmul_session124_neon
+#define softmax_session124 softmax_session124_neon
+#endif
+
