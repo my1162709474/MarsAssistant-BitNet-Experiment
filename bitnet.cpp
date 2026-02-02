@@ -52062,4 +52062,99 @@ FORCE_INLINE void fused_layernorm_gelu_add_super(float* RESTRICT output,
     const __m256 c6 = _mm256_set1_ps(0.317310f);
     const __m256 c7 = _mm256_set1_ps(0.999999f);
     
-    __m256 mean_vec = _mm256_set1_ps
+    __m256 mean_vec = _mm256_set1_ps(mean);
+    __m256 inv_vec = _mm256_set1_ps(inv_std);
+    
+    // Process with GELU and residual addition
+    i = 0;
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        __m256 inp0 = _mm256_loadu_ps(&input[i]);
+        __m256 inp1 = _mm256_loadu_ps(&input[i + AVX_SIZE]);
+        __m256 inp2 = _mm256_loadu_ps(&input[i + AVX_SIZE * 2]);
+        __m256 inp3 = _mm256_loadu_ps(&input[i + AVX_SIZE * 3]);
+        
+        __m256 res0 = _mm256_loadu_ps(&residual[i]);
+        __m256 res1 = _mm256_loadu_ps(&residual[i + AVX_SIZE]);
+        __m256 res2 = _mm256_loadu_ps(&residual[i + AVX_SIZE * 2]);
+        __m256 res3 = _mm256_loadu_ps(&residual[i + AVX_SIZE * 3]);
+        
+        __m256 norm0 = _mm256_mul_ps(_mm256_sub_ps(inp0, mean_vec), inv_vec);
+        __m256 norm1 = _mm256_mul_ps(_mm256_sub_ps(inp1, mean_vec), inv_vec);
+        __m256 norm2 = _mm256_mul_ps(_mm256_sub_ps(inp2, mean_vec), inv_vec);
+        __m256 norm3 = _mm256_mul_ps(_mm256_sub_ps(inp3, mean_vec), inv_vec);
+        
+        norm0 = _mm256_add_ps(_mm256_mul_ps(norm0, _mm256_loadu_ps(&gamma[i])), _mm256_loadu_ps(&beta[i]));
+        norm1 = _mm256_add_ps(_mm256_mul_ps(norm1, _mm256_loadu_ps(&gamma[i + AVX_SIZE])), _mm256_loadu_ps(&beta[i + AVX_SIZE]));
+        norm2 = _mm256_add_ps(_mm256_mul_ps(norm2, _mm256_loadu_ps(&gamma[i + AVX_SIZE * 2])), _mm256_loadu_ps(&beta[i + AVX_SIZE * 2]));
+        norm3 = _mm256_add_ps(_mm256_mul_ps(norm3, _mm256_loadu_ps(&gamma[i + AVX_SIZE * 3])), _mm256_loadu_ps(&beta[i + AVX_SIZE * 3]));
+        
+        auto gelu_poly = [&](__m256 x) {
+            __m256 x2 = _mm256_mul_ps(x, x);
+            __m256 x4 = _mm256_mul_ps(x2, x2);
+            return _mm256_add_ps(c7, _mm256_mul_ps(x2,
+                _mm256_add_ps(c6, _mm256_mul_ps(x2,
+                _mm256_add_ps(c5, _mm256_mul_ps(x2,
+                _mm256_add_ps(c4, _mm256_mul_ps(x2,
+                _mm256_add_ps(c3, _mm256_mul_ps(x2,
+                _mm256_add_ps(c2, _mm256_mul_ps(x2,
+                _mm256_add_ps(c1, _mm256_mul_ps(x2, c0)))))))))))));
+        };
+        
+        _mm256_storeu_ps(&output[i], _mm256_add_ps(gelu_poly(norm0), res0));
+        _mm256_storeu_ps(&output[i + AVX_SIZE], _mm256_add_ps(gelu_poly(norm1), res1));
+        _mm256_storeu_ps(&output[i + AVX_SIZE * 2], _mm256_add_ps(gelu_poly(norm2), res2));
+        _mm256_storeu_ps(&output[i + AVX_SIZE * 3], _mm256_add_ps(gelu_poly(norm3), res3));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 inp = _mm256_loadu_ps(&input[i]);
+        __m256 res = _mm256_loadu_ps(&residual[i]);
+        __m256 norm = _mm256_mul_ps(_mm256_sub_ps(inp, mean_vec), inv_vec);
+        norm = _mm256_add_ps(_mm256_mul_ps(norm, _mm256_loadu_ps(&gamma[i])), _mm256_loadu_ps(&beta[i]));
+        
+        __m256 x2 = _mm256_mul_ps(norm, norm);
+        __m256 x4 = _mm256_mul_ps(x2, x2);
+        __m256 gelu = _mm256_add_ps(c7, _mm256_mul_ps(x2,
+            _mm256_add_ps(c6, _mm256_mul_ps(x2,
+            _mm256_add_ps(c5, _mm256_mul_ps(x2,
+            _mm256_add_ps(c4, _mm256_mul_ps(x2,
+            _mm256_add_ps(c3, _mm256_mul_ps(x2,
+            _mm256_add_ps(c2, _mm256_mul_ps(x2,
+            _mm256_add_ps(c1, _mm256_mul_ps(x2, c0)))))))))))));
+        
+        _mm256_storeu_ps(&output[i], _mm256_add_ps(gelu, res));
+    }
+    
+    for (; i < size; i++) {
+        float norm = (input[i] - mean) * inv_std * gamma[i] + beta[i];
+        output[i] = gelu_optimized_poly7(norm) + residual[i];
+    }
+}
+
+#endif  // x86
+
+// ==================== Session 130 Initialization Helper ====================
+
+void init_session130() {
+    // No LUTs needed for Session 130 - all computational optimizations
+}
+
+// Session 130 aliases
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_8x8_session130 matmul_8x8_microkernel_extreme
+#define quantize_int4_session130 quantize_int4_avx2
+#define store_nt_session130 store_nt_aligned
+#define fused_layernorm_gelu_add_session130 fused_layernorm_gelu_add_super
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+#define matmul_8x8_session130 matmul_8x8_microkernel_extreme_neon
+#define quantize_int4_session130 quantize_int4_neon
+#define store_nt_session130 store_nt_aligned
+#define fused_layernorm_gelu_add_session130 fused_layernorm_gelu_add_super
+#else
+#define matmul_8x8_session130 matmul_8x8_microkernel_extreme
+#define quantize_int4_session130 quantize_int4_avx2
+#define store_nt_session130 store_nt_aligned
+#define fused_layernorm_gelu_add_session130 fused_layernorm_gelu_add_super
+#endif
+
+// ==================== Session 130 Complete ====================
