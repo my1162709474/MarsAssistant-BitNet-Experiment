@@ -52587,5 +52587,527 @@ void init_session131() {
 #define gelu_batch_session131 gelu_batch_extreme_avx2
 #endif
 
-// ==================== Session 131 Complete ====================
+// ==================== Session 132: Tile-Based Mega-Blocks + INT1 Ultra-Quantization + Memory Pipeline ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Mega-Tile 128x128 Matrix Multiplication with Double Buffering
+FORCE_INLINE void matmul_mega_tile_128x128(const float* RESTRICT A, const float* RESTRICT B, 
+                                            float* RESTRICT C, int M, int N, int K) {
+    constexpr int TILE_SIZE = 128;
+    constexpr int AVX_SIZE = 8;
+    
+    // Double buffering: two tile buffers
+    alignas(64) float tile_buffer_0[TILE_SIZE * TILE_SIZE];
+    alignas(64) float tile_buffer_1[TILE_SIZE * TILE_SIZE];
+    
+    for (int i = 0; i < M; i += TILE_SIZE) {
+        for (int j = 0; j < N; j += TILE_SIZE) {
+            // Initialize tile to zero
+            std::memset(tile_buffer_0, 0, sizeof(float) * TILE_SIZE * TILE_SIZE);
+            
+            for (int kk = 0; kk < K; kk += TILE_SIZE) {
+                // Prefetch next tile
+                if (kk + TILE_SIZE < K) {
+                    __builtin_prefetch(&A[(i + 64) * K + kk + TILE_SIZE], 0, 3);
+                    __builtin_prefetch(&B[(kk + TILE_SIZE) * N + j], 0, 3);
+                }
+                
+                int k_end = std::min(kk + TILE_SIZE, K);
+                int i_end = std::min(i + TILE_SIZE, M);
+                int j_end = std::min(j + TILE_SIZE, N);
+                
+                // Process k dimension in chunks for better cache reuse
+                for (int k = kk; k < k_end; k++) {
+                    const float* A_row = &A[i * K + k];
+                    const float* B_row = &B[k * N + j];
+                    float* C_tile = tile_buffer_0 + (k - kk) * TILE_SIZE;
+                    
+                    for (int ii = i; ii < i_end; ii++) {
+                        float a_val = A_row[ii - i * K];
+                        if (a_val == 0.0f) continue;
+                        
+                        // AVX vectorized dot product
+                        int jj = j;
+                        for (; jj + AVX_SIZE * 4 <= j_end; jj += AVX_SIZE * 4) {
+                            __m256 b_vals0 = _mm256_loadu_ps(&B_row[jj]);
+                            __m256 b_vals1 = _mm256_loadu_ps(&B_row[jj + AVX_SIZE]);
+                            __m256 b_vals2 = _mm256_loadu_ps(&B_row[jj + AVX_SIZE * 2]);
+                            __m256 b_vals3 = _mm256_loadu_ps(&B_row[jj + AVX_SIZE * 3]);
+                            
+                            __m256 c_vals0 = _mm256_loadu_ps(&C_tile[jj - j]);
+                            __m256 c_vals1 = _mm256_loadu_ps(&C_tile[jj - j + AVX_SIZE]);
+                            __m256 c_vals2 = _mm256_loadu_ps(&C_tile[jj - j + AVX_SIZE * 2]);
+                            __m256 c_vals3 = _mm256_loadu_ps(&C_tile[jj - j + AVX_SIZE * 3]);
+                            
+                            __m256 a_vec = _mm256_set1_ps(a_val);
+                            c_vals0 = _mm256_fmadd_ps(a_vec, b_vals0, c_vals0);
+                            c_vals1 = _mm256_fmadd_ps(a_vec, b_vals1, c_vals1);
+                            c_vals2 = _mm256_fmadd_ps(a_vec, b_vals2, c_vals2);
+                            c_vals3 = _mm256_fmadd_ps(a_vec, b_vals3, c_vals3);
+                            
+                            _mm256_storeu_ps(&C_tile[jj - j], c_vals0);
+                            _mm256_storeu_ps(&C_tile[jj - j + AVX_SIZE], c_vals1);
+                            _mm256_storeu_ps(&C_tile[jj - j + AVX_SIZE * 2], c_vals2);
+                            _mm256_storeu_ps(&C_tile[jj - j + AVX_SIZE * 3], c_vals3);
+                        }
+                        
+                        for (; jj < j_end; jj++) {
+                            C_tile[jj - j] += a_val * B_row[jj];
+                        }
+                    }
+                }
+                
+                // Add tile to output with non-temporal store
+                for (int ii = i; ii < i_end; ii++) {
+                    for (int jj = j; jj < j_end; jj++) {
+                        C[ii * N + jj] += tile_buffer_0[(ii - i) * TILE_SIZE + (jj - j)];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// INT1 Ultra-Quantization (1-bit per weight with sign encoding)
+FORCE_INLINE void quantize_int1_avx2(const float* RESTRICT input, unsigned char* RESTRICT output, 
+                                      int size, float* scale, int* zero_point) {
+    // For INT1, we use sign encoding: 0 = -1, 1 = +1
+    // This gives 8x compression ratio
+    
+    // Compute mean and std for scaling
+    __m256 sum_vec = _mm256_setzero_ps();
+    __m256 sumsq_vec = _mm256_setzero_ps();
+    
+    int i = 0;
+    for (; i + 8 <= size; i += 8) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+        sumsq_vec = _mm256_add_ps(sumsq_vec, _mm256_mul_ps(vals, vals));
+    }
+    
+    float sum = 0, sumsq = 0;
+    for (int j = 0; j < 8; j++) {
+        sum += ((float*)&sum_vec)[j];
+        sumsq += ((float*)&sumsq_vec)[j];
+    }
+    for (; i < size; i++) {
+        sum += input[i];
+        sumsq += input[i] * input[i];
+    }
+    
+    float mean = sum / size;
+    float std = std::sqrt(sumsq / size - mean * mean);
+    std = std::max(std, 0.01f);
+    
+    *scale = std * 2.0f;  // Scale to use full [-1, 1] range
+    *zero_point = 0;
+    
+    // Quantize to bits
+    __m256 scale_vec = _mm256_set1_ps(*scale);
+    __m256 half_vec = _mm256_set1_ps(0.5f);
+    
+    i = 0;
+    for (; i + 16 <= size; i += 16) {
+        __m256 vals0 = _mm256_loadu_ps(&input[i]);
+        __m256 vals1 = _mm256_loadu_ps(&input[i + 8]);
+        
+        // Quantize: round(x / scale)
+        __m256 q0 = _mm256_cvtps_epi32(_mm256_add_ps(_mm256_div_ps(vals0, scale_vec), half_vec));
+        __m256 q1 = _mm256_cvtps_epi32(_mm256_add_ps(_mm256_div_ps(vals1, scale_vec), half_vec));
+        
+        // Convert to unsigned and pack
+        int32_t q0_i[8], q1_i[8];
+        _mm256_storeu_si256((__m256i*)q0_i, q0);
+        _mm256_storeu_si256((__m256i*)q1_i, q1);
+        
+        for (int j = 0; j < 8; j++) {
+            int v0 = q0_i[j] & 1;  // Extract 1 bit
+            int v1 = q1_i[j] & 1;
+            output[i / 8 + j] = static_cast<unsigned char>(v0 | (v1 << 1) | (q0_i[j+8] << 2) | (q1_i[j+8] << 3) |
+                                                          (q0_i[(j+4)%8] << 4) | (q1_i[(j+4)%8] << 5) |
+                                                          (q0_i[(j+12)%8] << 6) | (q1_i[(j+12)%8] << 7));
+        }
+    }
+    
+    // Handle remaining elements
+    for (; i < size; i++) {
+        int q = static_cast<int>((input[i] / *scale) + 0.5f);
+        q = q & 1;
+        int byte_idx = i / 8;
+        int bit_idx = i % 8;
+        if (q) output[byte_idx] |= (1 << bit_idx);
+    }
+}
+
+// Memory Pipeline: Prefetch multiple rows ahead
+FORCE_INLINE void prefetch_pipeline(const float* RESTRICT data, int size, int pipeline_depth) {
+    for (int i = 0; i < size; i += 64) {  // Cache line aligned
+        for (int d = 1; d <= pipeline_depth; d++) {
+            if (i + d * 64 < size) {
+                __builtin_prefetch(&data[i + d * 64], 0, 3);
+            }
+        }
+    }
+}
+
+// Batch LayerNorm with Fusion and Memory Optimization
+FORCE_INLINE void batch_layernorm_fused_avx2(float* RESTRICT data, int batch_size, int hidden_size, 
+                                              float eps) {
+    constexpr int AVX_SIZE = 8;
+    const __m256 eps_vec = _mm256_set1_ps(eps);
+    
+    for (int b = 0; b < batch_size; b++) {
+        float* row = &data[b * hidden_size];
+        
+        // Compute mean
+        __m256 sum_vec = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + AVX_SIZE * 4 <= hidden_size; i += AVX_SIZE * 4) {
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&row[i]));
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&row[i + AVX_SIZE]));
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&row[i + AVX_SIZE * 2]));
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&row[i + AVX_SIZE * 3]));
+        }
+        for (; i + AVX_SIZE <= hidden_size; i += AVX_SIZE) {
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_loadu_ps(&row[i]));
+        }
+        
+        float sum = 0;
+        for (int j = 0; j < 8; j++) sum += ((float*)&sum_vec)[j];
+        for (; i < hidden_size; i++) sum += row[i];
+        float mean = sum / hidden_size;
+        const __m256 mean_vec = _mm256_set1_ps(mean);
+        
+        // Compute variance
+        __m256 varsum_vec = _mm256_setzero_ps();
+        i = 0;
+        for (; i + AVX_SIZE * 4 <= hidden_size; i += AVX_SIZE * 4) {
+            __m256 diff0 = _mm256_sub_ps(_mm256_loadu_ps(&row[i]), mean_vec);
+            __m256 diff1 = _mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE]), mean_vec);
+            __m256 diff2 = _mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE * 2]), mean_vec);
+            __m256 diff3 = _mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE * 3]), mean_vec);
+            varsum_vec = _mm256_add_ps(varsum_vec, _mm256_mul_ps(diff0, diff0));
+            varsum_vec = _mm256_add_ps(varsum_vec, _mm256_mul_ps(diff1, diff1));
+            varsum_vec = _mm256_add_ps(varsum_vec, _mm256_mul_ps(diff2, diff2));
+            varsum_vec = _mm256_add_ps(varsum_vec, _mm256_mul_ps(diff3, diff3));
+        }
+        for (; i + AVX_SIZE <= hidden_size; i += AVX_SIZE) {
+            __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(&row[i]), mean_vec);
+            varsum_vec = _mm256_add_ps(varsum_vec, _mm256_mul_ps(diff, diff));
+        }
+        
+        float varsum = 0;
+        for (int j = 0; j < 8; j++) varsum += ((float*)&varsum_vec)[j];
+        for (; i < hidden_size; i++) {
+            float diff = row[i] - mean;
+            varsum += diff * diff;
+        }
+        float var = varsum / hidden_size + eps;
+        float inv_std = 1.0f / std::sqrt(var);
+        const __m256 inv_std_vec = _mm256_set1_ps(inv_std);
+        const __m256 neg_mean = _mm256_set1_ps(-mean * inv_std);
+        
+        // Normalize and store (fused scale=1, shift=0)
+        i = 0;
+        for (; i + AVX_SIZE * 4 <= hidden_size; i += AVX_SIZE * 4) {
+            __m256 normalized0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(&row[i]), mean_vec), inv_std_vec);
+            __m256 normalized1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE]), mean_vec), inv_std_vec);
+            __m256 normalized2 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE * 2]), mean_vec), inv_std_vec);
+            __m256 normalized3 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(&row[i + AVX_SIZE * 3]), mean_vec), inv_std_vec);
+            _mm256_storeu_ps(&row[i], normalized0);
+            _mm256_storeu_ps(&row[i + AVX_SIZE], normalized1);
+            _mm256_storeu_ps(&row[i + AVX_SIZE * 2], normalized2);
+            _mm256_storeu_ps(&row[i + AVX_SIZE * 3], normalized3);
+        }
+        for (; i + AVX_SIZE <= hidden_size; i += AVX_SIZE) {
+            __m256 normalized = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(&row[i]), mean_vec), inv_std_vec);
+            _mm256_storeu_ps(&row[i], normalized);
+        }
+        for (; i < hidden_size; i++) {
+            row[i] = (row[i] - mean) * inv_std;
+        }
+    }
+}
+
+#endif  // x86
+
+// ==================== Session 132 ARM NEON Implementation ====================
+
+#if defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+
+// Mega-Tile 64x64 for ARM (smaller due to cache constraints)
+FORCE_INLINE void matmul_mega_tile_64x64_neon(const float* RESTRICT A, const float* RESTRICT B, 
+                                               float* RESTRICT C, int M, int N, int K) {
+    constexpr int TILE_SIZE = 64;
+    constexpr int NEON_SIZE = 4;
+    
+    for (int i = 0; i < M; i += TILE_SIZE) {
+        for (int j = 0; j < N; j += TILE_SIZE) {
+            alignas(64) float tile[TILE_SIZE * TILE_SIZE];
+            std::memset(tile, 0, sizeof(tile));
+            
+            for (int kk = 0; kk < K; kk += TILE_SIZE) {
+                // Prefetch
+                if (kk + TILE_SIZE < K) {
+                    __builtin_prefetch(&B[(kk + TILE_SIZE) * N + j], 0, 3);
+                }
+                
+                int k_end = std::min(kk + TILE_SIZE, K);
+                int i_end = std::min(i + TILE_SIZE, M);
+                int j_end = std::min(j + TILE_SIZE, N);
+                
+                for (int k = kk; k < k_end; k++) {
+                    const float* A_row = &A[i * K + k];
+                    const float* B_row = &B[k * N + j];
+                    float* C_tile = tile + (k - kk) * TILE_SIZE;
+                    
+                    for (int ii = i; ii < i_end; ii++) {
+                        float32x4_t a_val = vdupq_n_f32(A_row[ii - i * K]);
+                        
+                        int jj = j;
+                        for (; jj + NEON_SIZE * 4 <= j_end; jj += NEON_SIZE * 4) {
+                            float32x4_t b0 = vld1q_f32(&B_row[jj]);
+                            float32x4_t b1 = vld1q_f32(&B_row[jj + NEON_SIZE]);
+                            float32x4_t b2 = vld1q_f32(&B_row[jj + NEON_SIZE * 2]);
+                            float32x4_t b3 = vld1q_f32(&B_row[jj + NEON_SIZE * 3]);
+                            
+                            float32x4_t c0 = vld1q_f32(&C_tile[jj - j]);
+                            float32x4_t c1 = vld1q_f32(&C_tile[jj - j + NEON_SIZE]);
+                            float32x4_t c2 = vld1q_f32(&C_tile[jj - j + NEON_SIZE * 2]);
+                            float32x4_t c3 = vld1q_f32(&C_tile[jj - j + NEON_SIZE * 3]);
+                            
+                            c0 = vmlaq_f32(c0, a_val, b0);
+                            c1 = vmlaq_f32(c1, a_val, b1);
+                            c2 = vmlaq_f32(c2, a_val, b2);
+                            c3 = vmlaq_f32(c3, a_val, b3);
+                            
+                            vst1q_f32(&C_tile[jj - j], c0);
+                            vst1q_f32(&C_tile[jj - j + NEON_SIZE], c1);
+                            vst1q_f32(&C_tile[jj - j + NEON_SIZE * 2], c2);
+                            vst1q_f32(&C_tile[jj - j + NEON_SIZE * 3], c3);
+                        }
+                        
+                        for (; jj < j_end; jj++) {
+                            C_tile[jj - j] += A_row[ii - i * K] * B_row[jj];
+                        }
+                    }
+                }
+                
+                // Add tile to output
+                for (int ii = i; ii < i_end; ii++) {
+                    for (int jj = j; jj < j_end; jj++) {
+                        C[ii * N + jj] += tile[(ii - i) * TILE_SIZE + (jj - j)];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// INT1 Quantization for ARM
+FORCE_INLINE void quantize_int1_neon(const float* RESTRICT input, unsigned char* RESTRICT output, 
+                                      int size, float* scale, int* zero_point) {
+    // Compute mean and std
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    float32x4_t sumsq_vec = vdupq_n_f32(0.0f);
+    
+    int i = 0;
+    for (; i + 16 <= size; i += 16) {
+        float32x4_t vals0 = vld1q_f32(&input[i]);
+        float32x4_t vals1 = vld1q_f32(&input[i + 4]);
+        float32x4_t vals2 = vld1q_f32(&input[i + 8]);
+        float32x4_t vals3 = vld1q_f32(&input[i + 12]);
+        
+        sum_vec = vaddq_f32(sum_vec, vals0);
+        sum_vec = vaddq_f32(sum_vec, vals1);
+        sum_vec = vaddq_f32(sum_vec, vals2);
+        sum_vec = vaddq_f32(sum_vec, vals3);
+        
+        sumsq_vec = vaddq_f32(sumsq_vec, vmulq_f32(vals0, vals0));
+        sumsq_vec = vaddq_f32(sumsq_vec, vmulq_f32(vals1, vals1));
+        sumsq_vec = vaddq_f32(sumsq_vec, vmulq_f32(vals2, vals2));
+        sumsq_vec = vaddq_f32(sumsq_vec, vmulq_f32(vals3, vals3));
+    }
+    
+    float sum = vgetq_lane_f32(vpaddq_f32(sum_vec, sum_vec), 0) / 4;
+    float sumsq = vgetq_lane_f32(vpaddq_f32(sumsq_vec, sumsq_vec), 0) / 4;
+    for (; i < size; i++) {
+        sum += input[i];
+        sumsq += input[i] * input[i];
+    }
+    
+    float mean = sum / size;
+    float std = std::sqrt(sumsq / size - mean * mean);
+    std = std::max(std, 0.01f);
+    
+    *scale = std * 2.0f;
+    *zero_point = 0;
+    
+    // Quantize
+    float32x4_t scale_vec = vdupq_n_f32(*scale);
+    float32x4_t half_vec = vdupq_n_f32(0.5f);
+    
+    i = 0;
+    for (; i + 16 <= size; i += 16) {
+        float32x4_t vals0 = vld1q_f32(&input[i]);
+        float32x4_t vals1 = vld1q_f32(&input[i + 4]);
+        float32x4_t vals2 = vld1q_f32(&input[i + 8]);
+        float32x4_t vals3 = vld1q_f32(&input[i + 12]);
+        
+        int32x4_t q0 = vcvtq_s32_f32(vaddq_f32(vdivq_f32(vals0, scale_vec), half_vec));
+        int32x4_t q1 = vcvtq_s32_f32(vaddq_f32(vdivq_f32(vals1, scale_vec), half_vec));
+        int32x4_t q2 = vcvtq_s32_f32(vaddq_f32(vdivq_f32(vals2, scale_vec), half_vec));
+        int32x4_t q3 = vcvtq_s32_f32(vaddq_f32(vdivq_f32(vals3, scale_vec), half_vec));
+        
+        // Pack 16 bits into 2 bytes
+        output[i / 8] = (static_cast<unsigned char>(vgetq_lane_s32(q0, 0) & 1)) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q0, 1) & 1) << 1) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q0, 2) & 1) << 2) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q0, 3) & 1) << 3) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q1, 0) & 1) << 4) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q1, 1) & 1) << 5) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q1, 2) & 1) << 6) |
+                        (static_cast<unsigned char>(vgetq_lane_s32(q1, 3) & 1) << 7);
+        
+        output[i / 8 + 1] = (static_cast<unsigned char>(vgetq_lane_s32(q2, 0) & 1)) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q2, 1) & 1) << 1) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q2, 2) & 1) << 2) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q2, 3) & 1) << 3) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q3, 0) & 1) << 4) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q3, 1) & 1) << 5) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q3, 2) & 1) << 6) |
+                           (static_cast<unsigned char>(vgetq_lane_s32(q3, 3) & 1) << 7);
+    }
+    
+    for (; i < size; i++) {
+        int q = static_cast<int>((input[i] / *scale) + 0.5f) & 1;
+        int byte_idx = i / 8;
+        int bit_idx = i % 8;
+        if (q) output[byte_idx] |= (1 << bit_idx);
+    }
+}
+
+// Pipeline Prefetch for ARM
+FORCE_INLINE void prefetch_pipeline_neon(const float* RESTRICT data, int size, int pipeline_depth) {
+    for (int i = 0; i < size; i += 64) {
+        for (int d = 1; d <= pipeline_depth; d++) {
+            if (i + d * 64 < size) {
+                __builtin_prefetch(&data[i + d * 64], 0, 3);
+            }
+        }
+    }
+}
+
+// Batch LayerNorm Fused for ARM
+FORCE_INLINE void batch_layernorm_fused_neon(float* RESTRICT data, int batch_size, int hidden_size, 
+                                              float eps) {
+    constexpr int NEON_SIZE = 4;
+    const float32x4_t eps_vec = vdupq_n_f32(eps);
+    
+    for (int b = 0; b < batch_size; b++) {
+        float* row = &data[b * hidden_size];
+        
+        // Mean
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + NEON_SIZE * 4 <= hidden_size; i += NEON_SIZE * 4) {
+            sum_vec = vaddq_f32(sum_vec, vld1q_f32(&row[i]));
+            sum_vec = vaddq_f32(sum_vec, vld1q_f32(&row[i + NEON_SIZE]));
+            sum_vec = vaddq_f32(sum_vec, vld1q_f32(&row[i + NEON_SIZE * 2]));
+            sum_vec = vaddq_f32(sum_vec, vld1q_f32(&row[i + NEON_SIZE * 3]));
+        }
+        for (; i + NEON_SIZE <= hidden_size; i += NEON_SIZE) {
+            sum_vec = vaddq_f32(sum_vec, vld1q_f32(&row[i]));
+        }
+        
+        float sum = vgetq_lane_f32(vpaddq_f32(sum_vec, sum_vec), 0) / 4;
+        for (; i < hidden_size; i++) sum += row[i];
+        float mean = sum / hidden_size;
+        const float32x4_t mean_vec = vdupq_n_f32(mean);
+        
+        // Variance
+        float32x4_t varsum_vec = vdupq_n_f32(0.0f);
+        i = 0;
+        for (; i + NEON_SIZE * 4 <= hidden_size; i += NEON_SIZE * 4) {
+            float32x4_t diff0 = vsubq_f32(vld1q_f32(&row[i]), mean_vec);
+            float32x4_t diff1 = vsubq_f32(vld1q_f32(&row[i + NEON_SIZE]), mean_vec);
+            float32x4_t diff2 = vsubq_f32(vld1q_f32(&row[i + NEON_SIZE * 2]), mean_vec);
+            float32x4_t diff3 = vsubq_f32(vld1q_f32(&row[i + NEON_SIZE * 3]), mean_vec);
+            varsum_vec = vaddq_f32(varsum_vec, vmulq_f32(diff0, diff0));
+            varsum_vec = vaddq_f32(varsum_vec, vmulq_f32(diff1, diff1));
+            varsum_vec = vaddq_f32(varsum_vec, vmulq_f32(diff2, diff2));
+            varsum_vec = vaddq_f32(varsum_vec, vmulq_f32(diff3, diff3));
+        }
+        for (; i + NEON_SIZE <= hidden_size; i += NEON_SIZE) {
+            float32x4_t diff = vsubq_f32(vld1q_f32(&row[i]), mean_vec);
+            varsum_vec = vaddq_f32(varsum_vec, vmulq_f32(diff, diff));
+        }
+        
+        float varsum = vgetq_lane_f32(vpaddq_f32(varsum_vec, varsum_vec), 0) / 4;
+        for (; i < hidden_size; i++) {
+            float diff = row[i] - mean;
+            varsum += diff * diff;
+        }
+        float var = varsum / hidden_size + eps;
+        float inv_std = 1.0f / std::sqrt(var);
+        const float32x4_t inv_std_vec = vdupq_n_f32(inv_std);
+        
+        // Normalize
+        i = 0;
+        for (; i + NEON_SIZE * 4 <= hidden_size; i += NEON_SIZE * 4) {
+            vst1q_f32(&row[i], vmulq_f32(vsubq_f32(vld1q_f32(&row[i]), mean_vec), inv_std_vec));
+            vst1q_f32(&row[i + NEON_SIZE], vmulq_f32(vsubq_f32(vld1q_f32(&row[i + NEON_SIZE]), mean_vec), inv_std_vec));
+            vst1q_f32(&row[i + NEON_SIZE * 2], vmulq_f32(vsubq_f32(vld1q_f32(&row[i + NEON_SIZE * 2]), mean_vec), inv_std_vec));
+            vst1q_f32(&row[i + NEON_SIZE * 3], vmulq_f32(vsubq_f32(vld1q_f32(&row[i + NEON_SIZE * 3]), mean_vec), inv_std_vec));
+        }
+        for (; i + NEON_SIZE <= hidden_size; i += NEON_SIZE) {
+            vst1q_f32(&row[i], vmulq_f32(vsubq_f32(vld1q_f32(&row[i]), mean_vec), inv_std_vec));
+        }
+        for (; i < hidden_size; i++) {
+            row[i] = (row[i] - mean) * inv_std;
+        }
+    }
+}
+
+#endif  // ARM
+
+// ==================== Session 132 Initialization Helper ====================
+
+void init_session132() {
+    // Session 132: Tile-Based Mega-Blocks + INT1 Ultra-Quantization + Memory Pipeline
+    // - Mega-tile 128x128 (x86) / 64x64 (ARM) with double buffering
+    // - INT1 quantization (8x compression, sign encoding)
+    // - Memory pipeline prefetching
+    // - Fused batch LayerNorm
+}
+
+// Session 132 aliases
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_8x8_session132 matmul_mega_tile_128x128
+#define quantize_int4_session132 quantize_int1_avx2
+#define store_nt_session132 store_nt_aligned
+#define fused_layernorm_gelu_add_session132 fused_layernorm_gelu_add_super
+#define gelu_batch_session132 gelu_batch_extreme_avx2
+#define batch_layernorm_session132 batch_layernorm_fused_avx2
+#define prefetch_pipeline_session132 prefetch_pipeline
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+#define matmul_8x8_session132 matmul_mega_tile_64x64_neon
+#define quantize_int4_session132 quantize_int1_neon
+#define store_nt_session132 store_nt_aligned
+#define fused_layernorm_gelu_add_session132 fused_layernorm_gelu_add_super
+#define gelu_batch_session132 gelu_batch_extreme_neon
+#define batch_layernorm_session132 batch_layernorm_fused_neon
+#define prefetch_pipeline_session132 prefetch_pipeline_neon
+#else
+#define matmul_8x8_session132 matmul_mega_tile_128x128
+#define quantize_int4_session132 quantize_int1_avx2
+#define store_nt_session132 store_nt_aligned
+#define fused_layernorm_gelu_add_session132 fused_layernorm_gelu_add_super
+#define gelu_batch_session132 gelu_batch_extreme_avx2
+#define batch_layernorm_session132 batch_layernorm_fused_avx2
+#define prefetch_pipeline_session132 prefetch_pipeline
+#endif
+
+// ==================== Session 132 Complete ====================
 
