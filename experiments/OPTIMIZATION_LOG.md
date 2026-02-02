@@ -21099,3 +21099,14 @@ Key Differences:
 **Cumulative**: **20亿-6500亿倍** + Ultra-Extreme Optimizations (Sessions 95-120)  
 **Next Session**: Session 121 - GPU CUDA Kernels
 
+=== Mon Feb  2 19:05:12 CST 2026 ===
+## Round 1770030312: 并行化优化
+- 目标: 添加 pthread 并行化
+- ⏭️ 并行化已存在，优化并行度
+- 📦 已提交: c226914 docs: Add Session 120 optimization details to OPTIMIZATION_LOG.md
+
+=== Mon Feb  2 19:15:12 CST 2026 ===
+## Round 1770030912: 算法优化
+- 目标: 量化算法和查找表优化
+- 📦 已提交: c226914 docs: Add Session 120 optimization details to OPTIMIZATION_LOG.md
+
