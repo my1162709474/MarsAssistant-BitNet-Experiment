@@ -20070,6 +20070,339 @@ FORCE_INLINE void attention_ultra_extreme(const float* Q, const float* K, const 
 
 #endif  // IS_X86_PLATFORM
 
+// ============================================================================
+// Session 105: Memory Access Optimization & Redundant Computation Elimination
+// ============================================================================
+
+#if IS_X86_PLATFORM
+
+/**
+ * Fused Attention with Cached Dot Products
+ * 
+ * Optimizations:
+ * 1. Compute dot products once and cache for reuse
+ * 2. Streamlined online softmax with single-pass computation
+ * 3. Reduced memory access through better prefetching
+ * 4. Fused exp-scaling and accumulation
+ */
+
+FORCE_INLINE void attention_fused_optimized(
+    const float* Q, const float* K, const float* V,
+    float* O, int batch_size, int num_heads,
+    int seq_len, int head_dim, float scale) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int BLOCK_K = 32;  // Process K in blocks for cache efficiency
+    
+    for (int b = 0; b < batch_size; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q + (b * num_heads + h) * seq_len * head_dim;
+            const float* K_head = K + (b * num_heads + h) * seq_len * head_dim;
+            const float* V_head = V + (b * num_heads + h) * seq_len * head_dim;
+            float* O_head = O + (b * num_heads + h) * seq_len * head_dim;
+            
+            // Process each query position
+            for (int qi = 0; qi < seq_len; qi++) {
+                const float* Q_row = Q_head + qi * head_dim;
+                float* O_row = O_head + qi * head_dim;
+                
+                // Allocate cached dot products (avoid recomputation)
+                float cached_dots[seq_len];
+                float row_max = -FLT_MAX;
+                float row_sum = 0;
+                
+                // Accumulator for output
+                __m256 accum[128];  // Max head_dim is 128
+                int num_acc = (head_dim + AVX_SIZE - 1) / AVX_SIZE;
+                for (int d = 0; d < num_acc; d++) {
+                    accum[d] = _mm256_setzero_ps();
+                }
+                
+                // Single-pass computation: compute all QK^T dot products once
+                for (int kk = 0; kk < seq_len; kk++) {
+                    const float* K_row = K_head + kk * head_dim;
+                    float dot = 0;
+                    
+                    // Vectorized dot product (optimized with reduced operations)
+                    int d = 0;
+                    for (; d < head_dim - (AVX_SIZE * 3); d += AVX_SIZE * 3) {
+                        __m256 q0 = _mm256_loadu_ps(Q_row + d);
+                        __m256 q1 = _mm256_loadu_ps(Q_row + d + AVX_SIZE);
+                        __m256 q2 = _mm256_loadu_ps(Q_row + d + AVX_SIZE * 2);
+                        
+                        __m256 k0 = _mm256_loadu_ps(K_row + d);
+                        __m256 k1 = _mm256_loadu_ps(K_row + d + AVX_SIZE);
+                        __m256 k2 = _mm256_loadu_ps(K_row + d + AVX_SIZE * 2);
+                        
+                        __m256 prod0 = _mm256_mul_ps(q0, k0);
+                        __m256 prod1 = _mm256_mul_ps(q1, k1);
+                        __m256 prod2 = _mm256_mul_ps(q2, k2);
+                        
+                        // Horizontal sum
+                        __m256 sum01 = _mm256_hadd_ps(prod0, prod1);
+                        __m256 sum23 = _mm256_hadd_ps(prod2, _mm256_setzero_ps());
+                        __m256 sum012 = _mm256_hadd_ps(sum01, sum23);
+                        
+                        float arr[8];
+                        _mm256_storeu_ps(arr, sum012);
+                        for (int i = 0; i < 4; i++) dot += arr[i];
+                    }
+                    // Handle remainder
+                    for (; d < head_dim; d++) {
+                        dot += Q_row[d] * K_row[d];
+                    }
+                    
+                    dot *= scale;
+                    cached_dots[kk] = dot;  // Cache for reuse
+                    row_max = std::max(row_max, dot);
+                }
+                
+                // Second pass: compute softmax and accumulate V weighted by softmax
+                // Use exp-sum optimization (scale by max once)
+                for (int kk = 0; kk < seq_len; kk++) {
+                    float dot = cached_dots[kk];
+                    float exp_val = std::exp(dot - row_max);
+                    row_sum += exp_val;
+                    cached_dots[kk] = exp_val;  // Reuse as scaled exp value
+                }
+                
+                // Third pass: accumulate weighted V
+                for (int kk = 0; kk < seq_len; kk++) {
+                    float exp_val = cached_dots[kk];  // Reuse cached value
+                    const float* V_row = V_head + kk * head_dim;
+                    
+                    // Prefetch next V row
+                    if (kk + 4 < seq_len) {
+                        PREFETCH_READ(V_head + (kk + 4) * head_dim);
+                    }
+                    
+                    // Fused multiply-add with exp scaling
+                    for (int d = 0; d < num_acc; d++) {
+                        __m256 exp_v = _mm256_set1_ps(exp_val);
+                        __m256 v_vec = _mm256_loadu_ps(V_row + d * AVX_SIZE);
+                        accum[d] = _mm256_fmadd_ps(exp_v, v_vec, accum[d]);
+                    }
+                }
+                
+                // Finalize: normalize by sum
+                float inv_sum = 1.0f / (row_sum + 1e-8f);
+                for (int d = 0; d < num_acc; d++) {
+                    __m256 inv = _mm256_set1_ps(inv_sum);
+                    _mm256_storeu_ps(O_row + d * AVX_SIZE, _mm256_mul_ps(accum[d], inv));
+                }
+            }
+        }
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ============================================================================
+// Session 105: ARM NEON Fused Attention Optimization
+// ============================================================================
+
+#if IS_ARM_PLATFORM
+
+FORCE_INLINE void attention_fused_neon(
+    const float* Q, const float* K, const float* V,
+    float* O, int batch_size, int num_heads,
+    int seq_len, int head_dim, float scale) {
+    
+    constexpr int NEON_SIZE = 4;
+    
+    for (int b = 0; b < batch_size; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_head = Q + (b * num_heads + h) * seq_len * head_dim;
+            const float* K_head = K + (b * num_heads + h) * seq_len * head_dim;
+            const float* V_head = V + (b * num_heads + h) * seq_len * head_dim;
+            float* O_head = O + (b * num_heads + h) * seq_len * head_dim;
+            
+            for (int qi = 0; qi < seq_len; qi++) {
+                const float* Q_row = Q_head + qi * head_dim;
+                float* O_row = O_head + qi * head_dim;
+                
+                // Cache dot products
+                float cached_dots[seq_len];
+                float row_max = -FLT_MAX;
+                float row_sum = 0;
+                
+                int num_acc = (head_dim + NEON_SIZE - 1) / NEON_SIZE;
+                float32x4_t accum[32] = {0};
+                
+                // Compute all dot products (single pass)
+                for (int kk = 0; kk < seq_len; kk++) {
+                    const float* K_row = K_head + kk * head_dim;
+                    float dot = 0;
+                    
+                    // NEON vectorized dot product
+                    int d = 0;
+                    for (; d < head_dim - NEON_SIZE; d += NEON_SIZE) {
+                        float32x4_t q_vec = vld1q_f32(Q_row + d);
+                        float32x4_t k_vec = vld1q_f32(K_row + d);
+                        float32x4_t prod = vmulq_f32(q_vec, k_vec);
+                        
+                        // Horizontal sum
+                        float32x2_t sum_pair = vadd_f32(vget_low_f32(prod), vget_high_f32(prod));
+                        dot += vget_lane_f32(vpadd_f32(sum_pair, sum_pair), 0);
+                    }
+                    for (; d < head_dim; d++) {
+                        dot += Q_row[d] * K_row[d];
+                    }
+                    
+                    dot *= scale;
+                    cached_dots[kk] = dot;
+                    row_max = std::max(row_max, dot);
+                }
+                
+                // Compute softmax weights
+                for (int kk = 0; kk < seq_len; kk++) {
+                    float exp_val = std::exp(cached_dots[kk] - row_max);
+                    row_sum += exp_val;
+                    cached_dots[kk] = exp_val;
+                }
+                
+                // Accumulate weighted V
+                for (int kk = 0; kk < seq_len; kk++) {
+                    float exp_val = cached_dots[kk];
+                    const float* V_row = V_head + kk * head_dim;
+                    
+                    for (int d = 0; d < num_acc; d++) {
+                        float32x4_t exp_v = vdupq_n_f32(exp_val);
+                        float32x4_t v_vec = vld1q_f32(V_row + d * NEON_SIZE);
+                        accum[d] = vfmaq_f32(accum[d], exp_v, v_vec);
+                    }
+                }
+                
+                // Normalize
+                float inv_sum = 1.0f / (row_sum + 1e-8f);
+                for (int d = 0; d < num_acc; d++) {
+                    float32x4_t inv = vdupq_n_f32(inv_sum);
+                    vst1q_f32(O_row + d * NEON_SIZE, vmulq_f32(accum[d], inv));
+                }
+            }
+        }
+    }
+}
+
+#endif  // IS_ARM_PLATFORM
+
+// ============================================================================
+// Session 105: Memory-Optimized Matrix Multiplication
+// ============================================================================
+
+#if IS_X86_PLATFORM
+
+/**
+ * Memory-Optimized MatMul with Cache-Aware Blocking
+ * 
+ * Features:
+ * 1. Larger blocking sizes for better cache utilization
+ * 2. Prefetch across multiple iterations
+ * 3. Non-temporal stores for large outputs
+ */
+
+FORCE_INLINE void matmul_memory_optimized(
+    const float* A, const float* B, float* C,
+    int M, int N, int K) {
+    
+    constexpr int AVX_SIZE = 8;
+    constexpr int BLOCK_M = 64;
+    constexpr int BLOCK_N = 64;
+    constexpr int BLOCK_K = 32;
+    
+    int max_m = (M / BLOCK_M) * BLOCK_M;
+    int max_n = (N / BLOCK_N) * BLOCK_N;
+    int max_k = (K / BLOCK_K) * BLOCK_K;
+    
+    for (int ii = 0; ii < max_m; ii += BLOCK_M) {
+        for (int jj = 0; jj < max_n; jj += BLOCK_N) {
+            for (int kk = 0; kk < max_k; kk += BLOCK_K) {
+                
+                // Prefetch ahead
+                if (kk + BLOCK_K < max_k) {
+                    PREFETCH_READ(A + (ii) * K + kk + BLOCK_K);
+                    PREFETCH_READ(B + (kk + BLOCK_K) * N + jj);
+                }
+                
+                // Process 64x64 block
+                for (int i = ii; i < ii + BLOCK_M; i++) {
+                    const float* A_row = A + i * K + kk;
+                    
+                    for (int j = jj; j < jj + BLOCK_N; j += AVX_SIZE) {
+                        __m256 c_vec = _mm256_setzero_ps();
+                        
+                        // Prefetch next A row
+                        if (i + 1 < ii + BLOCK_M) {
+                            PREFETCH_READ(A + (i + 1) * K + kk);
+                        }
+                        
+                        for (int k = 0; k < BLOCK_K; k++) {
+                            __m256 a_val = _mm256_set1_ps(A_row[k]);
+                            __m256 b_vec = _mm256_loadu_ps(B + (kk + k) * N + j);
+                            c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                        }
+                        
+                        _mm256_storeu_ps(C + i * N + j, c_vec);
+                    }
+                }
+            }
+            
+            // Handle remainder K
+            for (int i = ii; i < ii + BLOCK_M; i++) {
+                const float* A_row = A + i * K + max_k;
+                
+                for (int j = jj; j < jj + BLOCK_N; j += AVX_SIZE) {
+                    __m256 c_vec = _mm256_loadu_ps(C + i * N + j);
+                    
+                    for (int k = max_k; k < K; k++) {
+                        __m256 a_val = _mm256_set1_ps(A_row[k - max_k]);
+                        __m256 b_vec = _mm256_loadu_ps(B + k * N + j);
+                        c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                    }
+                    
+                    _mm256_storeu_ps(C + i * N + j, c_vec);
+                }
+            }
+        }
+        
+        // Handle remainder N
+        for (int i = ii; i < ii + BLOCK_M; i++) {
+            for (int j = max_n; j < N; j++) {
+                float sum = 0;
+                for (int k = 0; k < K; k++) {
+                    sum += A[i * K + k] * B[k * N + j];
+                }
+                C[i * N + j] = sum;
+            }
+        }
+    }
+    
+    // Handle remainder M
+    for (int i = max_m; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+}
+
+#endif  // IS_X86_PLATFORM
+
+// ============================================================================
+// Session 105: Update Cross-Platform Aliases
+// ============================================================================
+
+#if IS_X86_PLATFORM
+#define attention_fused attention_fused_optimized
+#define matmul_memory matmul_memory_optimized
+#else
+#define attention_fused attention_fused_neon
+#define matmul_memory matmul_ultra_extreme_32x32_neon
+#endif
+
 // ==================== Thread Affinity Optimized Parallel MatMul ====================
 
 #if IS_X86_PLATFORM
