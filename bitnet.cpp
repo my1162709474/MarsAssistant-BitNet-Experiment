@@ -50976,4 +50976,247 @@ void init_session127_luts() {
 #define layernorm_gelu_session127 layernorm_gelu_fused
 #endif
 
-// ==================== Session 127 Complete ====================
+// ==================== Session 128: Sigmoid LUT + ReLU6 + Swish Activation ====================
+
+// ==================== Sigmoid Lookup Table (256 entries) ====================
+
+constexpr int SIGMOID_LUT_SIZE = 256;
+static float sigmoid_lut[SIGMOID_LUT_SIZE];
+
+void init_sigmoid_lut() {
+    // Initialize sigmoid LUT for range [-10, 10]
+    for (int i = 0; i < SIGMOID_LUT_SIZE; i++) {
+        float x = -10.0f + (20.0f * i) / (SIGMOID_LUT_SIZE - 1);
+        sigmoid_lut[i] = 1.0f / (1.0f + std::exp(-x));
+    }
+}
+
+FORCE_INLINE float sigmoid_lut_lookup(float x) {
+    // Clamp to LUT range
+    if (x >= 10.0f) return 1.0f;
+    if (x <= -10.0f) return 0.0f;
+    
+    // Convert to LUT index
+    int idx = static_cast<int>((x + 10.0f) / 20.0f * (SIGMOID_LUT_SIZE - 1));
+    return sigmoid_lut[idx];
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+
+FORCE_INLINE __m256 sigmoid_avx2(__m256 x) {
+    // Vectorized sigmoid using LUT
+    __m256i idx = _mm256_cvttps_epi32(_mm256_mul_ps(
+        _mm256_add_ps(x, _mm256_set1_ps(10.0f)),
+        _mm256_set1_ps((SIGMOID_LUT_SIZE - 1) / 20.0f)
+    ));
+    
+    // Clamp indices
+    __m256i zero = _mm256_setzero_si256();
+    __m256i max_idx = _mm256_set1_epi32(SIGMOID_LUT_SIZE - 1);
+    idx = _mm256_max_epi32(_mm256_min_epi32(idx, max_idx), zero);
+    
+    // Convert to float and gather from LUT
+    // Note: For simplicity, use scalar fallback in vectorized form
+    float vals[8];
+    _mm256_storeu_ps(vals, x);
+    
+    for (int i = 0; i < 8; i++) {
+        vals[i] = sigmoid_lut_lookup(vals[i]);
+    }
+    
+    return _mm256_loadu_ps(vals);
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+FORCE_INLINE float32x4_t sigmoid_neon(float32x4_t x) {
+    // NEON sigmoid using LUT
+    float32x4_t clamped = vmaxq_f32(vminq_f32(x, vdupq_n_f32(10.0f)), vdupq_n_f32(-10.0f));
+    float32x4_t scaled = vmulq_f32(vaddq_f32(clamped, vdupq_n_f32(10.0f)), 
+                                    vdupq_n_f32((SIGMOID_LUT_SIZE - 1) / 20.0f));
+    
+    // Convert to int and lookup (simplified scalar fallback)
+    float vals[4];
+    vst1q_f32(vals, x);
+    for (int i = 0; i < 4; i++) {
+        vals[i] = sigmoid_lut_lookup(vals[i]);
+    }
+    return vld1q_f32(vals);
+}
+
+#endif  // ARM
+
+// ==================== ReLU6 Optimization ====================
+
+FORCE_INLINE float relu6_scalar(float x) {
+    return x > 0.0f ? (x < 6.0f ? x : 6.0f) : 0.0f;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+
+FORCE_INLINE void relu6_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    __m256 zero = _mm256_setzero_ps();
+    __m256 six = _mm256_set1_ps(6.0f);
+    int i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        // relu6: clamp(x, 0, 6)
+        __m256 relu = _mm256_max_ps(zero, vals);
+        __m256 relu6 = _mm256_min_ps(relu, six);
+        _mm256_storeu_ps(&data[i], relu6);
+    }
+    
+    for (; i < size; i++) {
+        data[i] = relu6_scalar(data[i]);
+    }
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+FORCE_INLINE void relu6_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    float32x4_t six = vdupq_n_f32(6.0f);
+    int i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        float32x4_t relu = vmaxq_f32(zero, vals);
+        float32x4_t relu6 = vminq_f32(relu, six);
+        vst1q_f32(&data[i], relu6);
+    }
+    
+    for (; i < size; i++) {
+        data[i] = relu6_scalar(data[i]);
+    }
+}
+
+#endif  // ARM
+
+// ==================== Swish Activation (x * sigmoid(x)) ====================
+
+FORCE_INLINE float swish_scalar(float x) {
+    return x * sigmoid_lut_lookup(x);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+
+FORCE_INLINE void swish_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    int i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        __m256 sigmoid_x = sigmoid_avx2(x);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(x, sigmoid_x));
+    }
+    
+    for (; i < size; i++) {
+        data[i] = swish_scalar(data[i]);
+    }
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+FORCE_INLINE void swish_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    int i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        float32x4_t sigmoid_x = sigmoid_neon(x);
+        vst1q_f32(&data[i], vmulq_f32(x, sigmoid_x));
+    }
+    
+    for (; i < size; i++) {
+        data[i] = swish_scalar(data[i]);
+    }
+}
+
+#endif  // ARM
+
+// ==================== Fused ReLU6 + Add ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+FORCE_INLINE void fused_relu6_add_avx2(float* output, const float* input, int size) {
+    constexpr int AVX_SIZE = 8;
+    __m256 zero = _mm256_setzero_ps();
+    __m256 six = _mm256_set1_ps(6.0f);
+    int i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 out = _mm256_loadu_ps(&output[i]);
+        __m256 inp = _mm256_loadu_ps(&input[i]);
+        __m256 sum = _mm256_add_ps(out, inp);
+        __m256 relu = _mm256_max_ps(zero, sum);
+        __m256 relu6 = _mm256_min_ps(relu, six);
+        _mm256_storeu_ps(&output[i], relu6);
+    }
+    
+    for (; i < size; i++) {
+        float sum = output[i] + input[i];
+        output[i] = sum > 0.0f ? (sum < 6.0f ? sum : 6.0f) : 0.0f;
+    }
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+FORCE_INLINE void fused_relu6_add_neon(float* output, const float* input, int size) {
+    constexpr int NEON_SIZE = 4;
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    float32x4_t six = vdupq_n_f32(6.0f);
+    int i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t out = vld1q_f32(&output[i]);
+        float32x4_t inp = vld1q_f32(&input[i]);
+        float32x4_t sum = vaddq_f32(out, inp);
+        float32x4_t relu = vmaxq_f32(zero, sum);
+        float32x4_t relu6 = vminq_f32(relu, six);
+        vst1q_f32(&output[i], relu6);
+    }
+    
+    for (; i < size; i++) {
+        float sum = output[i] + input[i];
+        output[i] = sum > 0.0f ? (sum < 6.0f ? sum : 6.0f) : 0.0f;
+    }
+}
+
+#endif  // ARM
+
+// ==================== Session 128 Initialization Helper ====================
+
+void init_session128_luts() {
+    init_sigmoid_lut();
+}
+
+// Session 128 aliases for cross-platform compatibility
+#if defined(__x86_64__) || defined(__i386__)
+#define sigmoid_session128 sigmoid_avx2
+#define relu6_session128 relu6_avx2
+#define swish_session128 swish_avx2
+#define fused_relu6_add_session128 fused_relu6_add_avx2
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+#define sigmoid_session128 sigmoid_neon
+#define relu6_session128 relu6_neon
+#define swish_session128 swish_neon
+#define fused_relu6_add_session128 fused_relu6_add_neon
+#else
+#define sigmoid_session128 sigmoid_lut_lookup
+#define relu6_session128 relu6_scalar
+#define swish_session128 swish_scalar
+#define fused_relu6_add_session128 relu6_scalar  // Simplified fallback
+#endif
+
+// ==================== Session 128 Complete ====================
