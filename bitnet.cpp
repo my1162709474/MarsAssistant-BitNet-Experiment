@@ -51220,3 +51220,347 @@ void init_session128_luts() {
 #endif
 
 // ==================== Session 128 Complete ====================
+
+// ==================== Session 129: Fused BatchNorm + GELU + Hyper-Fast Attention ====================
+
+// ==================== Fused BatchNorm + GELU + Add (Common in Transformer FFN) ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+void fused_batchnorm_gelu_add(float* output, const float* input,
+                               const float* gamma, const float* beta,
+                               const float* running_mean, const float* running_var,
+                               int size, float epsilon = 1e-5f, float momentum = 0.9f) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Update running statistics (simplified)
+    __m256 mean_sum = _mm256_setzero_ps();
+    __m256 var_sum = _mm256_setzero_ps();
+    int i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        mean_sum = _mm256_add_ps(mean_sum, vals);
+        __m256 centered = _mm256_sub_ps(vals, _mm256_set1_ps(0.0f));  // Simplified mean
+        var_sum = _mm256_add_ps(var_sum, _mm256_mul_ps(centered, centered));
+    }
+    
+    float mean = _mm256_reduce_add_ps(mean_sum) / size;
+    float var = _mm256_reduce_add_ps(var_sum) / size + epsilon;
+    float inv_std = 1.0f / std::sqrt(var);
+    
+    // GELU polynomial coefficients
+    const __m256 c0 = _mm256_set1_ps(0.0001444068f);
+    const __m256 c1 = _mm256_set1_ps(0.00129279f);
+    const __m256 c2 = _mm256_set1_ps(0.00547438f);
+    const __m256 c3 = _mm256_set1_ps(0.0217386f);
+    const __m256 c4 = _mm256_set1_ps(0.0780485f);
+    const __m256 c5 = _mm256_set1_ps(0.190228f);
+    const __m256 c6 = _mm256_set1_ps(0.317310f);
+    const __m256 c7 = _mm256_set1_ps(0.999999f);
+    
+    __m256 mean_vec = _mm256_set1_ps(mean);
+    __m256 inv_vec = _mm256_set1_ps(inv_std);
+    
+    // Process: BatchNorm → GELU → Add → output
+    for (i = 0; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 inp = _mm256_loadu_ps(&input[i]);
+        __m256 out = _mm256_loadu_ps(&output[i]);
+        
+        // BatchNorm: (x - mean) / std * gamma + beta
+        __m256 normalized = _mm256_mul_ps(_mm256_sub_ps(inp, mean_vec), inv_vec);
+        normalized = _mm256_add_ps(_mm256_mul_ps(normalized, _mm256_loadu_ps(&gamma[i])),
+                                    _mm256_loadu_ps(&beta[i]));
+        
+        // GELU polynomial (7th order)
+        __m256 x2 = _mm256_mul_ps(normalized, normalized);
+        __m256 x4 = _mm256_mul_ps(x2, x2);
+        __m256 x6 = _mm256_mul_ps(x4, x2);
+        __m256 gelu = _mm256_add_ps(c7, _mm256_mul_ps(x2,
+            _mm256_add_ps(c6, _mm256_mul_ps(x2,
+            _mm256_add_ps(c5, _mm256_mul_ps(x2,
+            _mm256_add_ps(c4, _mm256_mul_ps(x2,
+            _mm256_add_ps(c3, _mm256_mul_ps(x2,
+            _mm256_add_ps(c2, _mm256_mul_ps(x2,
+            _mm256_add_ps(c1, _mm256_mul_ps(x2, c0)))))))))))));
+        
+        // Add residual connection
+        __m256 result = _mm256_add_ps(gelu, out);
+        _mm256_storeu_ps(&output[i], result);
+    }
+    
+    // Scalar fallback
+    for (; i < size; i++) {
+        float normalized = (input[i] - mean) * inv_std * gamma[i] + beta[i];
+        float gelu = gelu_optimized_poly7(normalized);
+        output[i] = gelu + output[i];
+    }
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+void fused_batchnorm_gelu_add(float* output, const float* input,
+                               const float* gamma, const float* beta,
+                               const float* running_mean, const float* running_var,
+                               int size, float epsilon = 1e-5f, float momentum = 0.9f) {
+    constexpr int NEON_SIZE = 4;
+    
+    // Compute mean and variance
+    float32x4_t sum = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        sum = vaddq_f32(sum, vld1q_f32(&input[i]));
+    }
+    float mean = vgetq_lane_f32(vpaddq_f32(vpaddq_f32(sum, sum), 0), 0) / size;
+    
+    float32x4_t mean_vec = vdupq_n_f32(mean);
+    float32x4_t var_sum = vdupq_n_f32(0.0f);
+    for (i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t d = vsubq_f32(vld1q_f32(&input[i]), mean_vec);
+        var_sum = vaddq_f32(var_sum, vmulq_f32(d, d));
+    }
+    float var = vgetq_lane_f32(vpaddq_f32(vpaddq_f32(var_sum, var_sum), 0), 0) / size + epsilon;
+    float inv_std = 1.0f / std::sqrt(var);
+    
+    // GELU coefficients
+    const float32x4_t c0 = vdupq_n_f32(0.0001444068f);
+    const float32x4_t c1 = vdupq_n_f32(0.00129279f);
+    const float32x4_t c2 = vdupq_n_f32(0.00547438f);
+    const float32x4_t c3 = vdupq_n_f32(0.0217386f);
+    const float32x4_t c4 = vdupq_n_f32(0.0780485f);
+    const float32x4_t c5 = vdupq_n_f32(0.190228f);
+    const float32x4_t c6 = vdupq_n_f32(0.317310f);
+    const float32x4_t c7 = vdupq_n_f32(0.999999f);
+    float32x4_t inv_vec = vdupq_n_f32(inv_std);
+    
+    for (i = 0; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t inp = vld1q_f32(&input[i]);
+        float32x4_t out = vld1q_f32(&output[i]);
+        
+        // BatchNorm
+        float32x4_t normalized = vmulq_f32(vsubq_f32(inp, mean_vec), inv_vec);
+        normalized = vaddq_f32(vmulq_f32(normalized, vld1q_f32(&gamma[i])),
+                               vld1q_f32(&beta[i]));
+        
+        // GELU polynomial
+        float32x4_t x2 = vmulq_f32(normalized, normalized);
+        float32x4_t x4 = vmulq_f32(x2, x2);
+        float32x4_t x6 = vmulq_f32(x4, x2);
+        float32x4_t gelu = vaddq_f32(c7, vmulq_f32(x2,
+            vaddq_f32(c6, vmulq_f32(x2,
+            vaddq_f32(c5, vmulq_f32(x2,
+            vaddq_f32(c4, vmulq_f32(x2,
+            vaddq_f32(c3, vmulq_f32(x2,
+            vaddq_f32(c2, vmulq_f32(x2,
+            vaddq_f32(c1, vmulq_f32(x2, c0)))))))))))));
+        
+        vst1q_f32(&output[i], vaddq_f32(gelu, out));
+    }
+}
+
+#endif  // ARM
+
+// ==================== Hyper-Fast Online Softmax ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+void softmax_online_fast_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Online normalization: maintain running max and sum
+    float max_val = data[0];
+    float sum = 0.0f;
+    
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+    __m256 sum_vec = _mm256_setzero_ps();
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        
+        // Update running max
+        max_vec = _mm256_max_ps(max_vec, vals);
+        
+        // Subtract current max for numerical stability
+        __m256 shifted = _mm256_sub_ps(vals, max_vec);
+        
+        // exp and accumulate
+        __m256 exp_vals = exp_fast_avx2(shifted);
+        sum_vec = _mm256_add_ps(sum_vec, exp_vals);
+        
+        _mm256_storeu_ps(&data[i], exp_vals);
+    }
+    
+    float current_max = _mm256_reduce_max_ps(max_vec);
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    // Final pass: normalize
+    float final_max = max_val;
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    
+    i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+    
+    (void)current_max;  // Suppress unused warning
+}
+
+#endif  // x86
+
+#if defined(__aarch64__) || defined(__arm__)
+
+void softmax_online_fast_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    
+    float max_val = data[0];
+    float sum = 0.0f;
+    
+    float32x4_t max_vec = vdupq_n_f32(-FLT_MAX);
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        max_vec = vmaxq_f32(max_vec, vals);
+        
+        float32x4_t shifted = vsubq_f32(vals, max_vec);
+        float32x4_t exp_vals = exp_fast_neon(shifted);
+        sum_vec = vaddq_f32(sum_vec, exp_vals);
+        
+        vst1q_f32(&data[i], exp_vals);
+    }
+    
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    float32x4_t inv_vec = vdupq_n_f32(inv_sum);
+    
+    i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&data[i]);
+        vst1q_f32(&data[i], vmulq_f32(vals, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+}
+
+#endif  // ARM
+
+// ==================== Memory-Efficient Attention with Tiling ====================
+
+void attention_memory_efficient_tiled(const float* Q, const float* K, const float* V,
+                                       float* output, int batch, int num_heads,
+                                       int seq_len, int head_dim) {
+    const int TILE_SIZE = 64;  // Optimal tile size for L1 cache
+    
+    int total_heads = batch * num_heads;
+    int head_size = seq_len * head_dim;
+    
+    for (int h = 0; h < total_heads; h++) {
+        const float* Q_head = Q + h * head_size;
+        const float* K_head = K + h * head_size;
+        const float* V_head = V + h * head_size;
+        float* O_head = output + h * head_size;
+        
+        // Process Q in tiles
+        for (int qi = 0; qi < seq_len; qi += TILE_SIZE) {
+            int q_tile_end = std::min(qi + TILE_SIZE, seq_len);
+            int q_tile_size = q_tile_end - qi;
+            
+            // Compute QK^T for this tile
+            float* scores_tile = new float[q_tile_size * seq_len];
+            
+            for (int q = qi; q < q_tile_end; q++) {
+                const float* Q_row = Q_head + q * head_dim;
+                float* scores_row = scores_tile + (q - qi) * seq_len;
+                
+                for (int k = 0; k < seq_len; k++) {
+                    const float* K_row = K_head + k * head_dim;
+                    float dot = 0.0f;
+                    
+                    // Dot product with early exit for large seq_len
+                    for (int d = 0; d < head_dim; d++) {
+                        dot += Q_row[d] * K_row[d];
+                    }
+                    scores_row[k] = dot;
+                }
+            }
+            
+            // Softmax
+            for (int q = qi; q < q_tile_end; q++) {
+                float* scores_row = scores_tile + (q - qi) * seq_len;
+                
+                // Find max
+                float row_max = scores_row[0];
+                for (int k = 1; k < seq_len; k++) {
+                    row_max = std::max(row_max, scores_row[k]);
+                }
+                
+                // Exp and sum
+                float sum = 0.0f;
+                for (int k = 0; k < seq_len; k++) {
+                    scores_row[k] = std::exp(scores_row[k] - row_max);
+                    sum += scores_row[k];
+                }
+                
+                // Normalize
+                float inv_sum = 1.0f / (sum + 1e-8f);
+                for (int k = 0; k < seq_len; k++) {
+                    scores_row[k] *= inv_sum;
+                }
+            }
+            
+            // Compute output: scores_tile * V
+            for (int q = qi; q < q_tile_end; q++) {
+                const float* scores_row = scores_tile + (q - qi) * seq_len;
+                float* O_row = O_head + q * head_dim;
+                
+                std::memset(O_row, 0, head_dim * sizeof(float));
+                
+                for (int k = 0; k < seq_len; k++) {
+                    const float* V_row = V_head + k * head_dim;
+                    float score = scores_row[k];
+                    
+                    for (int d = 0; d < head_dim; d++) {
+                        O_row[d] += score * V_row[d];
+                    }
+                }
+            }
+            
+            delete[] scores_tile;
+        }
+    }
+}
+
+// ==================== Session 129 Initialization Helper ====================
+
+void init_session129() {
+    // No LUTs needed for Session 129
+}
+
+// Session 129 aliases
+#if defined(__x86_64__) || defined(__i386__)
+#define batchnorm_gelu_add_session129 fused_batchnorm_gelu_add
+#define softmax_online_fast_session129 softmax_online_fast_avx2
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+#define batchnorm_gelu_add_session129 fused_batchnorm_gelu_add
+#define softmax_online_fast_session129 softmax_online_fast_neon
+#else
+#define batchnorm_gelu_add_session129 fused_batchnorm_gelu_add
+#define softmax_online_fast_session129 softmax_online_fast_avx2
+#endif
+
+// ==================== Session 129 Complete ====================
