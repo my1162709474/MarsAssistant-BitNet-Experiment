@@ -51564,3 +51564,502 @@ void init_session129() {
 #endif
 
 // ==================== Session 129 Complete ====================
+
+// ============================================================================
+// Session 130: Ultra-Extreme Matrix Microkernel + Advanced Quantization + Memory Optimization
+// ============================================================================
+
+// ==================== Ultra-Extreme 8x8 Matrix Microkernel ====================
+// Processes 8x8 block with maximum instruction-level parallelism
+
+#if defined(__x86_64__) || defined(__i386__)
+
+void matmul_8x8_microkernel_extreme(const float* A, const float* B, float* C,
+                                    int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int BLOCK = 8;
+    
+    // Initialize 8 output vectors
+    __m256 c00 = _mm256_setzero_ps();
+    __m256 c01 = _mm256_setzero_ps();
+    __m256 c02 = _mm256_setzero_ps();
+    __m256 c03 = _mm256_setzero_ps();
+    __m256 c04 = _mm256_setzero_ps();
+    __m256 c05 = _mm256_setzero_ps();
+    __m256 c06 = _mm256_setzero_ps();
+    __m256 c07 = _mm256_setzero_ps();
+    
+    // Process K in chunks of 4 for maximum efficiency
+    int k = 0;
+    for (; k + 3 < K; k += 4) {
+        // Load A values (broadcast)
+        __m256 a0 = _mm256_set1_ps(A[k]);
+        __m256 a1 = _mm256_set1_ps(A[k + 1]);
+        __m256 a2 = _mm256_set1_ps(A[k + 2]);
+        __m256 a3 = _mm256_set1_ps(A[k + 3]);
+        
+        // Load B row (8 floats)
+        __m256 b0 = _mm256_loadu_ps(B + k * BLOCK);
+        __m256 b1 = _mm256_loadu_ps(B + (k + 1) * BLOCK);
+        __m256 b2 = _mm256_loadu_ps(B + (k + 2) * BLOCK);
+        __m256 b3 = _mm256_loadu_ps(B + (k + 3) * BLOCK);
+        
+        // Multiply-accumulate with maximum unrolling
+        c00 = _mm256_fmadd_ps(a0, b0, c00);
+        c01 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 8), c01);
+        c02 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 16), c02);
+        c03 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 24), c03);
+        c04 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 32), c04);
+        c05 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 40), c05);
+        c06 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 48), c06);
+        c07 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(B + k * BLOCK + 56), c07);
+        
+        c00 = _mm256_fmadd_ps(a1, b1, c00);
+        c01 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 8), c01);
+        c02 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 16), c02);
+        c03 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 24), c03);
+        c04 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 32), c04);
+        c05 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 40), c05);
+        c06 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 48), c06);
+        c07 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(B + (k + 1) * BLOCK + 56), c07);
+        
+        c00 = _mm256_fmadd_ps(a2, b2, c00);
+        c01 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 8), c01);
+        c02 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 16), c02);
+        c03 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 24), c03);
+        c04 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 32), c04);
+        c05 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 40), c05);
+        c06 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 48), c06);
+        c07 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(B + (k + 2) * BLOCK + 56), c07);
+        
+        c00 = _mm256_fmadd_ps(a3, b3, c00);
+        c01 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 8), c01);
+        c02 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 16), c02);
+        c03 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 24), c03);
+        c04 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 32), c04);
+        c05 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 40), c05);
+        c06 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 48), c06);
+        c07 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(B + (k + 3) * BLOCK + 56), c07);
+    }
+    
+    // Scalar remainder
+    for (; k < K; k++) {
+        float a_val = A[k];
+        const float* B_k = B + k * BLOCK;
+        for (int j = 0; j < BLOCK; j++) {
+            C[j] += a_val * B_k[j];
+        }
+    }
+    
+    // Store results with horizontal reduction
+    float c0_arr[8], c1_arr[8], c2_arr[8], c3_arr[8];
+    float c4_arr[8], c5_arr[8], c6_arr[8], c7_arr[8];
+    
+    _mm256_storeu_ps(c0_arr, c00);
+    _mm256_storeu_ps(c1_arr, c01);
+    _mm256_storeu_ps(c2_arr, c02);
+    _mm256_storeu_ps(c3_arr, c03);
+    _mm256_storeu_ps(c4_arr, c04);
+    _mm256_storeu_ps(c5_arr, c05);
+    _mm256_storeu_ps(c6_arr, c06);
+    _mm256_storeu_ps(c7_arr, c07);
+    
+    // Horizontal reduction for each output
+    C[0] = c0_arr[0] + c0_arr[1] + c0_arr[2] + c0_arr[3] + c0_arr[4] + c0_arr[5] + c0_arr[6] + c0_arr[7];
+    C[1] = c1_arr[0] + c1_arr[1] + c1_arr[2] + c1_arr[3] + c1_arr[4] + c1_arr[5] + c1_arr[6] + c1_arr[7];
+    C[2] = c2_arr[0] + c2_arr[1] + c2_arr[2] + c2_arr[3] + c2_arr[4] + c2_arr[5] + c2_arr[6] + c2_arr[7];
+    C[3] = c3_arr[0] + c3_arr[1] + c3_arr[2] + c3_arr[3] + c3_arr[4] + c3_arr[5] + c3_arr[6] + c3_arr[7];
+    C[4] = c4_arr[0] + c4_arr[1] + c4_arr[2] + c4_arr[3] + c4_arr[4] + c4_arr[5] + c4_arr[6] + c4_arr[7];
+    C[5] = c5_arr[0] + c5_arr[1] + c5_arr[2] + c5_arr[3] + c5_arr[4] + c5_arr[5] + c5_arr[6] + c5_arr[7];
+    C[6] = c6_arr[0] + c6_arr[1] + c6_arr[2] + c6_arr[3] + c6_arr[4] + c6_arr[5] + c6_arr[6] + c6_arr[7];
+    C[7] = c7_arr[0] + c7_arr[1] + c7_arr[2] + c7_arr[3] + c7_arr[4] + c7_arr[5] + c7_arr[6] + c7_arr[7];
+}
+
+#endif  // x86
+
+// ARM NEON 8x8 microkernel
+#if defined(__aarch64__) || defined(__arm__)
+
+void matmul_8x8_microkernel_extreme_neon(const float* A, const float* B, float* C, int K) {
+    constexpr int NEON_SIZE = 4;
+    constexpr int BLOCK = 8;
+    
+    // Initialize 8 output vectors
+    float32x4_t c00 = vdupq_n_f32(0.0f);
+    float32x4_t c01 = vdupq_n_f32(0.0f);
+    float32x4_t c02 = vdupq_n_f32(0.0f);
+    float32x4_t c03 = vdupq_n_f32(0.0f);
+    float32x4_t c04 = vdupq_n_f32(0.0f);
+    float32x4_t c05 = vdupq_n_f32(0.0f);
+    float32x4_t c06 = vdupq_n_f32(0.0f);
+    float32x4_t c07 = vdupq_n_f32(0.0f);
+    
+    int k = 0;
+    for (; k + 3 < K; k += 4) {
+        float32x4_t a0 = vdupq_n_f32(A[k]);
+        float32x4_t a1 = vdupq_n_f32(A[k + 1]);
+        float32x4_t a2 = vdupq_n_f32(A[k + 2]);
+        float32x4_t a3 = vdupq_n_f32(A[k + 3]);
+        
+        for (int row = 0; row < 2; row++) {
+            float32x4_t b = vld1q_f32(B + k * BLOCK + row * 4);
+            c00 = vfmaq_f32(c00, a0, b);
+            c01 = vfmaq_f32(c01, a0, vld1q_f32(B + k * BLOCK + row * 4 + 8));
+            c02 = vfmaq_f32(c02, a0, vld1q_f32(B + k * BLOCK + row * 4 + 16));
+            c03 = vfmaq_f32(c03, a0, vld1q_f32(B + k * BLOCK + row * 4 + 24));
+            c04 = vfmaq_f32(c04, a0, vld1q_f32(B + k * BLOCK + row * 4 + 32));
+            c05 = vfmaq_f32(c05, a0, vld1q_f32(B + k * BLOCK + row * 4 + 40));
+            c06 = vfmaq_f32(c06, a0, vld1q_f32(B + k * BLOCK + row * 4 + 48));
+            c07 = vfmaq_f32(c07, a0, vld1q_f32(B + k * BLOCK + row * 4 + 56));
+            
+            b = vld1q_f32(B + (k + 1) * BLOCK + row * 4);
+            c00 = vfmaq_f32(c00, a1, b);
+            c01 = vfmaq_f32(c01, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 8));
+            c02 = vfmaq_f32(c02, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 16));
+            c03 = vfmaq_f32(c03, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 24));
+            c04 = vfmaq_f32(c04, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 32));
+            c05 = vfmaq_f32(c05, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 40));
+            c06 = vfmaq_f32(c06, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 48));
+            c07 = vfmaq_f32(c07, a1, vld1q_f32(B + (k + 1) * BLOCK + row * 4 + 56));
+            
+            b = vld1q_f32(B + (k + 2) * BLOCK + row * 4);
+            c00 = vfmaq_f32(c00, a2, b);
+            c01 = vfmaq_f32(c01, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 8));
+            c02 = vfmaq_f32(c02, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 16));
+            c03 = vfmaq_f32(c03, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 24));
+            c04 = vfmaq_f32(c04, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 32));
+            c05 = vfmaq_f32(c05, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 40));
+            c06 = vfmaq_f32(c06, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 48));
+            c07 = vfmaq_f32(c07, a2, vld1q_f32(B + (k + 2) * BLOCK + row * 4 + 56));
+            
+            b = vld1q_f32(B + (k + 3) * BLOCK + row * 4);
+            c00 = vfmaq_f32(c00, a3, b);
+            c01 = vfmaq_f32(c01, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 8));
+            c02 = vfmaq_f32(c02, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 16));
+            c03 = vfmaq_f32(c03, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 24));
+            c04 = vfmaq_f32(c04, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 32));
+            c05 = vfmaq_f32(c05, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 40));
+            c06 = vfmaq_f32(c06, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 48));
+            c07 = vfmaq_f32(c07, a3, vld1q_f32(B + (k + 3) * BLOCK + row * 4 + 56));
+        }
+    }
+    
+    // Scalar remainder
+    for (; k < K; k++) {
+        float a_val = A[k];
+        const float* B_k = B + k * BLOCK;
+        for (int j = 0; j < BLOCK; j++) {
+            C[j] += a_val * B_k[j];
+        }
+    }
+    
+    // Horizontal reduction
+    float c0_arr[4], c1_arr[4], c2_arr[4], c3_arr[4];
+    float c4_arr[4], c5_arr[4], c6_arr[4], c7_arr[4];
+    
+    vst1q_f32(c0_arr, c00);
+    vst1q_f32(c1_arr, c01);
+    vst1q_f32(c2_arr, c02);
+    vst1q_f32(c3_arr, c03);
+    vst1q_f32(c4_arr, c04);
+    vst1q_f32(c5_arr, c05);
+    vst1q_f32(c6_arr, c06);
+    vst1q_f32(c7_arr, c07);
+    
+    C[0] = c0_arr[0] + c0_arr[1] + c0_arr[2] + c0_arr[3];
+    C[1] = c1_arr[0] + c1_arr[1] + c1_arr[2] + c1_arr[3];
+    C[2] = c2_arr[0] + c2_arr[1] + c2_arr[2] + c2_arr[3];
+    C[3] = c3_arr[0] + c3_arr[1] + c3_arr[2] + c3_arr[3];
+    C[4] = c4_arr[0] + c4_arr[1] + c4_arr[2] + c4_arr[3];
+    C[5] = c5_arr[0] + c5_arr[1] + c5_arr[2] + c5_arr[3];
+    C[6] = c6_arr[0] + c6_arr[1] + c6_arr[2] + c6_arr[3];
+    C[7] = c7_arr[0] + c7_arr[1] + c7_arr[2] + c7_arr[3];
+}
+
+#endif  // ARM
+
+// ==================== Advanced INT4 Quantization with SIMD ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// INT4 quantization with AVX2 (pack 2 INT4 per byte)
+void quantize_int4_avx2(const float* input, unsigned char* output, int size,
+                        float* scale, int* zero_point) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Find min/max
+    __m256 min_vec = _mm256_set1_ps(FLT_MAX);
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+    
+    int i = 0;
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        min_vec = _mm256_min_ps(min_vec, vals);
+        max_vec = _mm256_max_ps(max_vec, vals);
+    }
+    
+    float min_val = _mm256_reduce_min_ps(min_vec);
+    float max_val = _mm256_reduce_max_ps(max_vec);
+    for (; i < size; i++) {
+        min_val = std::min(min_val, input[i]);
+        max_val = std::max(max_val, input[i]);
+    }
+    
+    // Compute scale and zero point for INT4 range [-8, 7]
+    *scale = (max_val - min_val) / 15.0f;
+    if (*scale < 1e-5f) *scale = 1.0f;
+    *zero_point = static_cast<int>(-min_val / *scale + 8.0f);
+    
+    __m256 scale_vec = _mm256_set1_ps(1.0f / *scale);
+    __m256 zp_vec = _mm256_set1_ps(static_cast<float>(*zero_point));
+    
+    i = 0;
+    // Process 16 elements (8 bytes) at a time
+    for (; i + 16 <= size; i += 16) {
+        __m256 vals0 = _mm256_loadu_ps(&input[i]);
+        __m256 vals1 = _mm256_loadu_ps(&input[i + 8]);
+        
+        __m256 scaled0 = _mm256_mul_ps(_mm256_add_ps(vals0, zp_vec), scale_vec);
+        __m256 scaled1 = _mm256_mul_ps(_mm256_add_ps(vals1, zp_vec), scale_vec);
+        
+        // Round to nearest
+        __m256i q0 = _mm256_cvtps_epi32(_mm256_round_ps(scaled0, _MM_ROUND_NEAREST));
+        __m256i q1 = _mm256_cvtps_epi32(_mm256_round_ps(scaled1, _MM_ROUND_NEAREST));
+        
+        // Pack 2 INT4 per byte
+        int32_t q0_arr[8], q1_arr[8];
+        _mm256_storeu_si256((__m256i*)q0_arr, q0);
+        _mm256_storeu_si256((__m256i*)q1_arr, q1);
+        
+        for (int j = 0; j < 8; j++) {
+            int q_val0 = std::max(-8, std::min(7, q0_arr[j]));
+            int q_val1 = std::max(-8, std::min(7, q1_arr[j]));
+            output[i / 2 + j] = static_cast<unsigned char>((q_val0 & 0xF) | ((q_val1 & 0xF) << 4));
+        }
+    }
+    
+    // Scalar remainder
+    for (; i < size; i++) {
+        int q_val = static_cast<int>((input[i] + *zero_point) / *scale);
+        q_val = std::max(-8, std::min(7, q_val));
+        if (i % 2 == 0) {
+            output[i / 2] = q_val & 0xF;
+        } else {
+            output[i / 2] = (output[i / 2] & 0xF) | ((q_val & 0xF) << 4);
+        }
+    }
+}
+
+// INT4 dequantization with AVX2
+void dequantize_int4_avx2(const unsigned char* input, float* output, int size,
+                          float scale, int zero_point) {
+    constexpr int AVX_SIZE = 8;
+    __m256 scale_vec = _mm256_set1_ps(scale);
+    __m256 zp_vec = _mm256_set1_ps(static_cast<float>(zero_point));
+    
+    int i = 0;
+    for (; i + 16 <= size; i += 16) {
+        unsigned char bytes[16];
+        for (int j = 0; j < 8; j++) {
+            unsigned char byte = input[i / 2 + j];
+            bytes[j * 2] = byte & 0xF;
+            bytes[j * 2 + 1] = (byte >> 4) & 0xF;
+        }
+        
+        // Sign extend
+        __m256i idx0 = _mm256_cvtepi8_epi32(_mm_loadu_si128((__m128i*)bytes));
+        __m256i idx1 = _mm256_cvtepi8_epi32(_mm_loadu_si128((__m128i*)(bytes + 4)));
+        __m256i idx2 = _mm256_cvtepi8_epi32(_mm_loadu_si128((__m128i*)(bytes + 8)));
+        __m256i idx3 = _mm256_cvtepi8_epi32(_mm_loadu_si128((__m128i*)(bytes + 12)));
+        
+        // Convert to float and dequantize
+        __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(idx0), scale_vec);
+        __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(idx1), scale_vec);
+        __m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(idx2), scale_vec);
+        __m256 f3 = _mm256_mul_ps(_mm256_cvtepi32_ps(idx3), scale_vec);
+        
+        _mm256_storeu_ps(&output[i], f0);
+        _mm256_storeu_ps(&output[i + 8], f1);
+        _mm256_storeu_ps(&output[i + 8], f2);
+        _mm256_storeu_ps(&output[i + 16], f3);
+    }
+    
+    for (; i < size; i++) {
+        unsigned char byte = input[i / 2];
+        int q_val = (i % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+        if (q_val >= 8) q_val -= 16;
+        output[i] = static_cast<float>(q_val) * scale;
+    }
+}
+
+#endif  // x86
+
+// ARM NEON INT4 quantization
+#if defined(__aarch64__) || defined(__arm__)
+
+void quantize_int4_neon(const float* input, unsigned char* output, int size,
+                        float* scale, int* zero_point) {
+    constexpr int NEON_SIZE = 4;
+    
+    // Find min/max
+    float32x4_t min_vec = vdupq_n_f32(FLT_MAX);
+    float32x4_t max_vec = vdupq_n_f32(-FLT_MAX);
+    
+    int i = 0;
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t vals = vld1q_f32(&input[i]);
+        min_vec = vminq_f32(min_vec, vals);
+        max_vec = vmaxq_f32(max_vec, vals);
+    }
+    
+    float min_val = vgetq_lane_f32(vpaddq_f32(min_vec, min_vec), 0) / 4;
+    float max_val = vgetq_lane_f32(vpaddq_f32(max_vec, max_vec), 0) / 4;
+    for (; i < size; i++) {
+        min_val = std::min(min_val, input[i]);
+        max_val = std::max(max_val, input[i]);
+    }
+    
+    *scale = (max_val - min_val) / 15.0f;
+    if (*scale < 1e-5f) *scale = 1.0f;
+    *zero_point = static_cast<int>(-min_val / *scale + 8.0f);
+    
+    float32x4_t inv_scale = vdupq_n_f32(1.0f / *scale);
+    float32x4_t zp_vec = vdupq_n_f32(static_cast<float>(*zero_point));
+    
+    i = 0;
+    for (; i + 8 <= size; i += 8) {
+        float32x4_t vals0 = vld1q_f32(&input[i]);
+        float32x4_t vals1 = vld1q_f32(&input[i + 4]);
+        
+        float32x4_t scaled0 = vmulq_f32(vaddq_f32(vals0, zp_vec), inv_scale);
+        float32x4_t scaled1 = vmulq_f32(vaddq_f32(vals1, zp_vec), inv_scale);
+        
+        int32x4_t q0 = vcvtnq_s32_f32(scaled0);
+        int32x4_t q1 = vcvtnq_s32_f32(scaled1);
+        
+        int32_t q0_arr[4], q1_arr[4];
+        vst1q_s32(q0_arr, q0);
+        vst1q_s32(q1_arr, q1);
+        
+        for (int j = 0; j < 4; j++) {
+            int v0 = std::max(-8, std::min(7, q0_arr[j]));
+            int v1 = std::max(-8, std::min(7, q1_arr[j]));
+            output[i / 2 + j] = static_cast<unsigned char>((v0 & 0xF) | ((v1 & 0xF) << 4));
+        }
+    }
+    
+    for (; i < size; i++) {
+        int q_val = static_cast<int>((input[i] + *zero_point) / *scale);
+        q_val = std::max(-8, std::min(7, q_val));
+        if (i % 2 == 0) {
+            output[i / 2] = q_val & 0xF;
+        } else {
+            output[i / 2] = (output[i / 2] & 0xF) | ((q_val & 0xF) << 4);
+        }
+    }
+}
+
+#endif  // ARM
+
+// ==================== Non-Temporal Store with Cache Hierarchy Optimization ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Aligned non-temporal store for large transfers
+FORCE_INLINE void store_nt_aligned(float* RESTRICT dest, const float* RESTRICT src, size_t count) {
+    constexpr int AVX_SIZE = 8;
+    size_t i = 0;
+    
+    // Non-temporal stores work best with 64-byte aligned accesses
+    for (; i + AVX_SIZE * 8 <= count; i += AVX_SIZE * 8) {
+        __m256 v0 = _mm256_load_ps(src + i);
+        __m256 v1 = _mm256_load_ps(src + i + AVX_SIZE);
+        __m256 v2 = _mm256_load_ps(src + i + AVX_SIZE * 2);
+        __m256 v3 = _mm256_load_ps(src + i + AVX_SIZE * 3);
+        __m256 v4 = _mm256_load_ps(src + i + AVX_SIZE * 4);
+        __m256 v5 = _mm256_load_ps(src + i + AVX_SIZE * 5);
+        __m256 v6 = _mm256_load_ps(src + i + AVX_SIZE * 6);
+        __m256 v7 = _mm256_load_ps(src + i + AVX_SIZE * 7);
+        
+        _mm256_stream_ps(dest + i, v0);
+        _mm256_stream_ps(dest + i + AVX_SIZE, v1);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 2, v2);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 3, v3);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 4, v4);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 5, v5);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 6, v6);
+        _mm256_stream_ps(dest + i + AVX_SIZE * 7, v7);
+    }
+    
+    // Regular stores for remainder
+    for (; i < count; i++) {
+        dest[i] = src[i];
+    }
+    
+    _mm_sfence();  // Ensure ordering
+}
+
+#endif  // x86
+
+// ==================== Super-Optimized Fused Operations ====================
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Fused LayerNorm + GELU + Add with maximum vectorization
+FORCE_INLINE void fused_layernorm_gelu_add_super(float* RESTRICT output,
+                                                   const float* RESTRICT input,
+                                                   const float* RESTRICT residual,
+                                                   const float* RESTRICT gamma,
+                                                   const float* RESTRICT beta,
+                                                   int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;
+    
+    // Single-pass mean and variance computation
+    __m256 sum_vec = _mm256_setzero_ps();
+    __m256 sq_sum_vec = _mm256_setzero_ps();
+    
+    int i = 0;
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        __m256 vals0 = _mm256_loadu_ps(&input[i]);
+        __m256 vals1 = _mm256_loadu_ps(&input[i + AVX_SIZE]);
+        __m256 vals2 = _mm256_loadu_ps(&input[i + AVX_SIZE * 2]);
+        __m256 vals3 = _mm256_loadu_ps(&input[i + AVX_SIZE * 3]);
+        
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(_mm256_add_ps(vals0, vals1),
+                                                        _mm256_add_ps(vals2, vals3)));
+        sq_sum_vec = _mm256_add_ps(sq_sum_vec, _mm256_add_ps(_mm256_mul_ps(vals0, vals0),
+                                                              _mm256_add_ps(_mm256_mul_ps(vals1, vals1),
+                                                                            _mm256_add_ps(_mm256_mul_ps(vals2, vals2),
+                                                                                          _mm256_mul_ps(vals3, vals3)))));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 vals = _mm256_loadu_ps(&input[i]);
+        sum_vec = _mm256_add_ps(sum_vec, vals);
+        sq_sum_vec = _mm256_add_ps(sq_sum_vec, _mm256_mul_ps(vals, vals));
+    }
+    
+    float mean = _mm256_reduce_add_ps(sum_vec) / size;
+    float sq_mean = _mm256_reduce_add_ps(sq_sum_vec) / size;
+    for (; i < size; i++) {
+        mean += input[i];
+        sq_mean += input[i] * input[i];
+    }
+    mean /= size;
+    sq_mean /= size;
+    
+    float var = sq_mean - mean * mean + 1e-5f;
+    float inv_std = 1.0f / std::sqrt(var);
+    
+    // GELU polynomial coefficients (optimized)
+    const __m256 c0 = _mm256_set1_ps(0.0001444068f);
+    const __m256 c1 = _mm256_set1_ps(0.00129279f);
+    const __m256 c2 = _mm256_set1_ps(0.00547438f);
+    const __m256 c3 = _mm256_set1_ps(0.0217386f);
+    const __m256 c4 = _mm256_set1_ps(0.0780485f);
+    const __m256 c5 = _mm256_set1_ps(0.190228f);
+    const __m256 c6 = _mm256_set1_ps(0.317310f);
+    const __m256 c7 = _mm256_set1_ps(0.999999f);
+    
+    __m256 mean_vec = _mm256_set1_ps
