@@ -54194,3 +54194,203 @@ FORCE_INLINE int select_optimal_stride(int dim) {
 #define matmul_best matmul_parallel_session136
 #endif
 
+
+// ==================== Session 137 Start ====================
+// Focus: INT4 Quantization + Memory Prefetch Optimization
+
+// Session 137 aliases
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_session137 matmul_int4_quantized
+#else
+#define matmul_session137 matmul_int8_blocked
+#endif
+
+// INT4 quantized matmul with bit-packing (2 values per byte)
+void matmul_int4_bitpack(const uint8_t* RESTRICT A_packed, const uint8_t* RESTRICT B_packed,
+                         float* RESTRICT C, float scale_a, float scale_b,
+                         int M, int N, int K) {
+    // Unpack and compute
+    std::vector<int> accumulator(M * N, 0);
+    
+    // K is the logical dimension, actual bytes = K/2
+    int K_bytes = (K + 1) / 2;
+    
+    for (int k = 0; k < K; k++) {
+        int byte_idx = k / 2;
+        int bit_offset = (k % 2) * 4;
+        
+        for (int i = 0; i < M; i++) {
+            // Extract high nibble if k even, low nibble if k odd
+            uint8_t a_raw = A_packed[i * K_bytes + byte_idx];
+            int8_t a_val = (k % 2 == 0) ? ((a_raw >> 4) & 0x0F) : (a_raw & 0x0F);
+            // Sign extend from 4 bits
+            a_val = (a_val >= 8) ? (a_val - 16) : a_val;
+            
+            for (int j = 0; j < N; j++) {
+                uint8_t b_raw = B_packed[byte_idx * N + j];
+                int8_t b_val = (k % 2 == 0) ? ((b_raw >> 4) & 0x0F) : (b_raw & 0x0F);
+                b_val = (b_val >= 8) ? (b_val - 16) : b_val;
+                
+                accumulator[i * N + j] += a_val * b_val;
+            }
+        }
+    }
+    
+    // Dequantize
+    float scale = scale_a * scale_b;
+    for (int i = 0; i < M * N; i++) {
+        C[i] = static_cast<float>(accumulator[i]) * scale;
+    }
+}
+
+// Hybrid INT4/FP32 matmul - uses INT4 for weight matrix, FP32 for activations
+void matmul_hybrid_int4_fp32(const float* RESTRICT A_fp32, const uint8_t* RESTRICT B_packed,
+                             float* RESTRICT C, float scale_b, int M, int N, int K) {
+    // Quantize A on-the-fly and multiply with packed INT4 B
+    int K_bytes = (K + 1) / 2;
+    
+    std::vector<int> accumulator(M * N, 0);
+    
+    for (int k = 0; k < K; k++) {
+        int byte_idx = k / 2;
+        int bit_offset = (k % 2) * 4;
+        
+        for (int i = 0; i < M; i++) {
+            // Quantize A element to INT4 range [-8, 7]
+            float a_raw = A_fp32[i * K + k];
+            int8_t a_val = static_cast<int8_t>(std::max(-8.0f, std::min(7.0f, a_raw)));
+            
+            for (int j = 0; j < N; j++) {
+                uint8_t b_raw = B_packed[byte_idx * N + j];
+                int8_t b_val = (k % 2 == 0) ? ((b_raw >> 4) & 0x0F) : (b_raw & 0x0F);
+                b_val = (b_val >= 8) ? (b_val - 16) : b_val;
+                
+                accumulator[i * N + j] += a_val * b_val;
+            }
+        }
+    }
+    
+    // Dequantize
+    for (int i = 0; i < M * N; i++) {
+        C[i] = static_cast<float>(accumulator[i]) * scale_b;
+    }
+}
+
+// Hardware prefetch-aware matrix multiplication
+void matmul_hardware_prefetch(const float* RESTRICT A, const float* RESTRICT B,
+                              float* RESTRICT C, int M, int N, int K) {
+    const int block_i = 64;
+    const int block_j = 64;
+    const int block_k = 16;
+    
+    // Hint to compiler about access patterns
+    __builtin_prefetch(A, 0, 3);
+    __builtin_prefetch(B, 0, 3);
+    
+    for (int i = 0; i < M; i += block_i) {
+        int M_block = std::min(block_i, M - i);
+        
+        for (int j = 0; j < N; j += block_j) {
+            int N_block = std::min(block_j, N - j);
+            
+            // Prefetch next block of B
+            if (j + block_j < N) {
+                __builtin_prefetch(B + (j + block_j) * K, 0, 2);
+            }
+            
+            for (int k = 0; k < K; k += block_k) {
+                int K_block = std::min(block_k, K - k);
+                
+                // Prefetch next block of A
+                if (i + block_i < M) {
+                    __builtin_prefetch(A + (i + block_i) * K + k, 0, 1);
+                }
+                
+                // Block multiplication
+                #pragma omp parallel for collapse(2)
+                for (int ii = 0; ii < M_block; ii++) {
+                    for (int jj = 0; jj < N_block; jj++) {
+                        float sum = 0.0f;
+                        const float* a_row = A + (i + ii) * K + k;
+                        const float* b_row = B + k * N + j;
+                        
+                        for (int kk = 0; kk < K_block; kk++) {
+                            sum += a_row[kk] * b_row[jj];
+                        }
+                        C[(i + ii) * N + (j + jj)] += sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// SIMD-optimized INT4 unpacking and accumulation
+FORCE_INLINE void unpack_and_accumulate_4x4(const uint8_t* RESTRICT a_packed,
+                                            const uint8_t* RESTRICT b_packed,
+                                            int* RESTRICT accum,
+                                            int lda, int ldb, int M, int N) {
+    // Unpack 4 INT4 values from each byte
+    uint8_t a_vals[4], b_vals[4];
+    
+    for (int t = 0; t < 4; t++) {
+        a_vals[t] = (t < M) ? (a_packed[t/2] >> ((t%2)*4)) & 0x0F : 0;
+        b_vals[t] = (t < N) ? (b_packed[t/2] >> ((t%2)*4)) & 0x0F : 0;
+        
+        // Sign extend
+        a_vals[t] = (a_vals[t] >= 8) ? (a_vals[t] - 16) : a_vals[t];
+        b_vals[t] = (b_vals[t] >= 8) ? (b_vals[t] - 16) : b_vals[t];
+    }
+    
+    // Accumulate outer products
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            accum[i * lda + j] += a_vals[i] * b_vals[j];
+        }
+    }
+}
+
+// Bit manipulation utilities for quantization
+FORCE_INLINE void quantize_float_to_int4(const float* RESTRICT src, uint8_t* RESTRICT dst,
+                                          int size, float scale) {
+    for (int i = 0; i < size; i++) {
+        int q = static_cast<int>(std::round(src[i] / scale));
+        q = std::max(-8, std::min(7, q));
+        // Store two values per byte
+        if (i % 2 == 0) {
+            dst[i/2] = (q & 0x0F);
+        } else {
+            dst[i/2] |= ((q & 0x0F) << 4);
+        }
+    }
+}
+
+// ==================== Session 137 Complete ====================
+
+// Unified session dispatcher (updated)
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_best matmul_session137
+#else
+#define matmul_best matmul_hardware_prefetch
+#endif
+
+// Performance tracking for Session 137
+struct Session137Stats {
+    std::atomic<size_t> int4_executions{0};
+    std::atomic<size_t> int8_executions{0};
+    std::atomic<size_t> prefetch_executions{0};
+
+    void record_int4() { int4_executions.fetch_add(1); }
+    void record_int8() { int8_executions.fetch_add(1); }
+    void record_prefetch() { prefetch_executions.fetch_add(1); }
+
+    void print_stats() {
+        printf("Session 137 Stats:\n");
+        printf("  INT4 executions: %zu\n", int4_executions.load());
+        printf("  INT8 executions: %zu\n", int8_executions.load());
+        printf("  Prefetch executions: %zu\n", prefetch_executions.load());
+    }
+};
+
+static Session137Stats session137_stats;
+
