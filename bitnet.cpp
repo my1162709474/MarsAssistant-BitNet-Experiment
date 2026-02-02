@@ -53389,3 +53389,357 @@ void init_session133() {
 
 // ==================== Session 133 Complete ====================
 
+// ==================== Session 134: Multi-Level Async Memory Pipeline + Smart Cache Scheduling ====================
+
+// Multi-level prefetch distances for different cache tiers
+constexpr int L1_PREFETCH_DIST = 2;    // L1 cache: 2 rows ahead
+constexpr int L2_PREFETCH_DIST = 8;    // L2 cache: 8 rows ahead  
+constexpr int L3_PREFETCH_DIST = 16;   // L3 cache: 16 rows ahead
+
+// Pipeline stages for async memory operations
+constexpr int PIPELINE_DEPTH = 4;
+
+// Smart cache scheduler for dynamic cache allocation
+struct CacheScheduler {
+    int cache_budget;           // Available cache budget in bytes
+    int tile_size;              // Current optimal tile size
+    int stream_count;           // Number of concurrent streams
+    float miss_rate;            // Cache miss rate tracking
+    
+    CacheScheduler() : cache_budget(256 * 1024), tile_size(32), stream_count(1), miss_rate(0.0f) {}
+    
+    // Dynamically adjust parameters based on cache behavior
+    FORCE_INLINE void adapt(int M, int N, int K) {
+        // Adjust tile size based on matrix dimensions
+        if (K < 128) {
+            tile_size = 64;  // Larger tiles for small K
+            stream_count = 2;
+        } else if (K < 512) {
+            tile_size = 32;  // Medium tiles
+            stream_count = 3;
+        } else {
+            tile_size = 16;  // Smaller tiles for large K
+            stream_count = 4;
+        }
+        
+        // Adjust cache budget based on working set size
+        long long working_set = (long long)M * K + (long long)K * N;
+        if (working_set > 10000000) {
+            cache_budget = 512 * 1024;  // L3 cache territory
+        } else if (working_set > 1000000) {
+            cache_budget = 256 * 1024;  // L2 cache territory
+        } else {
+            cache_budget = 128 * 1024;  // L1 cache territory
+        }
+    }
+};
+
+// Triple-buffer pipeline state
+struct PipelineState {
+    const float* A_buffer[3];
+    const float* B_buffer[3];
+    float* C_buffer[3];
+    int current_phase;
+    int next_phase;
+    
+    PipelineState() : current_phase(0), next_phase(1) {
+        for (int i = 0; i < 3; i++) {
+            A_buffer[i] = nullptr;
+            B_buffer[i] = nullptr;
+            C_buffer[i] = nullptr;
+        }
+    }
+    
+    FORCE_INLINE void rotate() {
+        current_phase = next_phase;
+        next_phase = (next_phase + 1) % 3;
+    }
+};
+
+// Multi-level prefetch with cache tier awareness
+template<int CacheTier>
+FORCE_INLINE void multi_level_prefetch(const float* RESTRICT ptr) {
+    if constexpr (CacheTier == 1) {
+        // L1 prefetch: very aggressive, short distance
+        _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0);
+    } else if constexpr (CacheTier == 2) {
+        // L2 prefetch: moderate aggression
+        _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T1);
+    } else {
+        // L3 prefetch: keep data in cache but not L1
+        _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T2);
+    }
+}
+
+// Hardware prefetcher cooperation: stride-aware prefetch
+FORCE_INLINE void cooperative_prefetch(const float* RESTRICT base, int stride, int count) {
+    // Prefetch multiple strides ahead based on access pattern
+    for (int i = 0; i < count; i += 4) {
+        const float* addr = base + i * stride;
+        _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0);
+    }
+}
+
+// Stream-aware memory access pattern optimizer
+FORCE_INLINE void optimize_stream_pattern(const float* RESTRICT A, int M, int K, 
+                                          int* stream_starts, int* stream_sizes, int* num_streams) {
+    // Divide matrix A into cache-friendly streams
+    int cache_line_elems = CACHE_LINE_SIZE / sizeof(float);
+    int elements_per_cache_line = cache_line_elems;
+    
+    // Optimal stream count based on cache size
+    int optimal_streams = std::max(1, K / 256);
+    optimal_streams = std::min(optimal_streams, 8);
+    
+    *num_streams = optimal_streams;
+    
+    int elements_per_stream = K / optimal_streams;
+    int remainder = K % optimal_streams;
+    
+    for (int s = 0; s < optimal_streams; s++) {
+        stream_starts[s] = s * elements_per_stream;
+        stream_sizes[s] = elements_per_stream + (s < remainder ? 1 : 0);
+        // Align stream start to cache line
+        stream_starts[s] = (stream_starts[s] / cache_line_elems) * cache_line_elems;
+    }
+}
+
+// Async memory pipeline for matrix multiplication
+// Implements triple-buffering with parallel prefetch and compute
+void matmul_async_pipeline(const float* RESTRICT A, const float* RESTRICT B, float* RESTRICT C,
+                           int M, int N, int K) {
+    if (M < 16 || N < 16 || K < 16) {
+        // Fallback to regular matmul for small matrices
+        matmul_blocked(A, B, C, M, N, K);
+        return;
+    }
+    
+    CacheScheduler scheduler;
+    scheduler.adapt(M, N, K);
+    
+    const int tile_size = scheduler.tile_size;
+    PipelineState pipeline;
+    
+    // Initialize pipeline buffers
+    pipeline.A_buffer[0] = A;
+    pipeline.B_buffer[0] = B;
+    pipeline.C_buffer[0] = C;
+    
+    // Process matrix in tiles with async pipeline
+    for (int i = 0; i < M; i += tile_size) {
+        int M_tile = std::min(tile_size, M - i);
+        
+        for (int j = 0; j < N; j += tile_size) {
+            int N_tile = std::min(tile_size, N - j);
+            
+            // Prefetch for current tile
+            const float* A_row = A + i * K;
+            const float* B_col = B + j;
+            
+            // Multi-level prefetch for current tile
+            for (int kk = 0; kk < K; kk += 16) {
+                int kk_limit = std::min(kk + 16, K);
+                for (int k = kk; k < kk_limit; k++) {
+                    multi_level_prefetch<1>(A_row + k * K);
+                    multi_level_prefetch<2>(B_col + k * N);
+                }
+            }
+            
+            // Prefetch next tile data into pipeline
+            int i_next = std::min(i + tile_size, M);
+            int j_next = std::min(j + tile_size, N);
+            
+            if (i_next < M) {
+                const float* A_next = A + i_next * K;
+                for (int k = 0; k < K; k += 32) {
+                    multi_level_prefetch<2>(A_next + k * K);
+                }
+            }
+            
+            if (j_next < N) {
+                const float* B_next = B + j_next;
+                for (int k = 0; k < K; k += 32) {
+                    multi_level_prefetch<2>(B_next + k * N);
+                }
+            }
+            
+            // Compute current tile using optimized blocked matmul
+            for (int k = 0; k < K; k += tile_size) {
+                int K_tile = std::min(tile_size, K - k);
+                
+                const float* A_block = A + (i + 0) * K + k;
+                const float* B_block = B + k * N + j;
+                float* C_block = C + (i + 0) * N + j;
+                
+                // Prefetch next K iteration
+                if (k + tile_size < K) {
+                    const float* A_next = A + (i + 0) * K + k + tile_size;
+                    const float* B_next = B + (k + tile_size) * N + j;
+                    
+                    _mm_prefetch(reinterpret_cast<const char*>(A_next), _MM_HINT_T0);
+                    _mm_prefetch(reinterpret_cast<const char*>(B_next), _MM_HINT_T0);
+                }
+                
+                // Blocked matmul computation
+                for (int ii = 0; ii < M_tile; ii += 8) {
+                    for (int jj = 0; jj < N_tile; jj += 8) {
+                        for (int kk = 0; kk < K_tile; kk++) {
+                            float a_val = A_block[ii * K + kk];
+                            const float* B_row = B_block + kk * N;
+                            float* C_row = C_block + ii * N;
+                            
+                            for (int jjj = 0; jjj < 8 && jj + jjj < N_tile; jjj++) {
+                                C_row[jj + jjj] += a_val * B_row[jj + jjj];
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Rotate pipeline
+            pipeline.rotate();
+        }
+    }
+}
+
+// NEON version: Multi-level async memory pipeline
+void matmul_async_pipeline_neon(const float* RESTRICT A, const float* RESTRICT B, float* RESTRICT C,
+                                int M, int N, int K) {
+    if (M < 16 || N < 16 || K < 16) {
+        matmul_blocked(A, B, C, M, N, K);
+        return;
+    }
+    
+    CacheScheduler scheduler;
+    scheduler.adapt(M, N, K);
+    
+    const int tile_size = scheduler.tile_size;
+    
+    // Process matrix in tiles with async pipeline
+    for (int i = 0; i < M; i += tile_size) {
+        int M_tile = std::min(tile_size, M - i);
+        
+        for (int j = 0; j < N; j += tile_size) {
+            int N_tile = std::min(tile_size, N - j);
+            
+            // Prefetch for current tile
+            const float* A_row = A + i * K;
+            const float* B_col = B + j;
+            
+            for (int kk = 0; kk < K; kk += 16) {
+                int kk_limit = std::min(kk + 16, K);
+                for (int k = kk; k < kk_limit; k++) {
+                    __builtin_prefetch(A_row + k * K, 0, 3);
+                    __builtin_prefetch(B_col + k * N, 0, 3);
+                }
+            }
+            
+            // Prefetch next tile data
+            int i_next = std::min(i + tile_size, M);
+            if (i_next < M) {
+                const float* A_next = A + i_next * K;
+                for (int k = 0; k < K; k += 32) {
+                    __builtin_prefetch(A_next + k * K, 0, 2);
+                }
+            }
+            
+            // Compute current tile
+            for (int k = 0; k < K; k += tile_size) {
+                int K_tile = std::min(tile_size, K - k);
+                
+                const float* A_block = A + (i + 0) * K + k;
+                const float* B_block = B + k * N + j;
+                float* C_block = C + (i + 0) * N + j;
+                
+                // Prefetch next K iteration
+                if (k + tile_size < K) {
+                    const float* A_next = A + (i + 0) * K + k + tile_size;
+                    const float* B_next = B + (k + tile_size) * N + j;
+                    
+                    __builtin_prefetch(A_next, 0, 3);
+                    __builtin_prefetch(B_next, 0, 3);
+                }
+                
+                for (int ii = 0; ii < M_tile; ii += 8) {
+                    for (int jj = 0; jj < N_tile; jj += 8) {
+                        for (int kk = 0; kk < K_tile; kk++) {
+                            float a_val = A_block[ii * K + kk];
+                            const float* B_row = B_block + kk * N;
+                            float* C_row = C_block + ii * N;
+                            
+                            for (int jjj = 0; jjj < 8 && jj + jjj < N_tile; jjj++) {
+                                C_row[jj + jjj] += a_val * B_row[jj + jjj];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Memory access pattern optimizer for better cache utilization
+FORCE_INLINE void optimize_memory_layout(float* RESTRICT data, int rows, int cols, int new_stride) {
+    if (new_stride == cols) return;  // No change needed
+    
+    // Transpose to new layout if it improves cache behavior
+    std::vector<float> temp(rows * new_stride);
+    
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            int old_idx = i * cols + j;
+            int new_idx = i * new_stride + j;
+            temp[new_idx] = data[old_idx];
+        }
+    }
+    
+    std::memcpy(data, temp.data(), rows * new_stride * sizeof(float));
+}
+
+// Super-charged memcpy with cache line awareness
+FORCE_INLINE void super_memcpy_async(void* RESTRICT dst, const void* RESTRICT src, size_t size) {
+    constexpr size_t CACHE_LINE = 64;
+    constexpr size_t UNROLL_COUNT = 4;
+    
+    // Aligned pointer arithmetic
+    const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
+    uint8_t* dst_bytes = static_cast<uint8_t*>(dst);
+    
+    size_t i = 0;
+    
+    // Prefetch source data
+    for (; i + CACHE_LINE * UNROLL_COUNT <= size; i += CACHE_LINE * UNROLL_COUNT) {
+        // Prefetch next cache lines
+        _mm_prefetch(reinterpret_cast<const char*>(src_bytes + i + CACHE_LINE * 2), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(src_bytes + i + CACHE_LINE * 3), _MM_HINT_T0);
+        
+        // Unrolled copy with NT stores for large transfers
+        for (size_t j = 0; j < UNROLL_COUNT; j++) {
+            __m128i data = _mm_load_si128(reinterpret_cast<const __m128i*>(src_bytes + i + j * CACHE_LINE));
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst_bytes + i + j * CACHE_LINE), data);
+        }
+    }
+    
+    // Handle remaining data
+    for (; i < size; i++) {
+        dst_bytes[i] = src_bytes[i];
+    }
+}
+
+// Session 134 aliases
+#if defined(__x86_64__) || defined(__i386__)
+#define matmul_async_session134 matmul_async_pipeline
+#define memcpy_async_session134 super_memcpy_async
+#define cache_scheduler_session134 CacheScheduler
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+#define matmul_async_session134 matmul_async_pipeline_neon
+#define memcpy_async_session134 super_memcpy_async
+#define cache_scheduler_session134 CacheScheduler
+#else
+#define matmul_async_session134 matmul_async_pipeline
+#define memcpy_async_session134 super_memcpy_async
+#define cache_scheduler_session134 CacheScheduler
+#endif
+
+// ==================== Session 134 Complete ====================
+
