@@ -27214,3 +27214,14 @@ Potential areas for future optimization:
 - **Dynamic Routing**: Auto-select optimal kernel per layer
 - **Continuous Batching**: Better throughput for variable sequences
 - **Speculative Decoding**: Faster autoregressive generation
+=== Tue Feb  3 20:55:41 CST 2026 ===
+## Round 1770123341: 并行化优化
+- 目标: 添加 pthread 并行化
+- ⏭️ 并行化已存在，优化并行度
+- 📦 已提交: 6550932 Session 151: Flash Attention 2.0 + Advanced INT4 + Optimized Softmax
+
+=== Tue Feb  3 21:05:42 CST 2026 ===
+## Round 1770123942: 算法优化
+- 目标: 量化算法和查找表优化
+- 📦 已提交: 6550932 Session 151: Flash Attention 2.0 + Advanced INT4 + Optimized Softmax
+
