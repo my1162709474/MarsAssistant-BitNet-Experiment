@@ -1057,6 +1057,116 @@ void benchmark(const std::string& name,
 
 #if defined(__x86_64__) || defined(__i386__)
 // Simple benchmark stub for x86
+// ==================== Session 156: Advanced Memory & Quantization Optimization ====================
+// Date: 2026-02-03 22:08
+// Focus: Cache-aware blocking, quantization improvements, memory access patterns
+
+// Session 156: Advanced Memory Access & Quantization Optimization
+constexpr int SESSION156_BLOCK_L1 = 32;    // L1 cache block size
+constexpr int SESSION156_BLOCK_L2 = 128;  // L2 cache block size  
+constexpr int SESSION156_BLOCK_L3 = 512;  // L3 cache block size
+
+// Pre-initialize Session 156 buffers
+static bool session156_initialized = false;
+static float* session156_buffer_l1 = nullptr;
+static float* session156_buffer_l2 = nullptr;
+
+FORCE_INLINE void init_session156() {
+    if (session156_initialized) return;
+    
+    // Pre-allocate cache-friendly buffers
+    posix_memalign((void**)&session156_buffer_l1, 64, sizeof(float) * SESSION156_BLOCK_L1 * SESSION156_BLOCK_L1);
+    posix_memalign((void**)&session156_buffer_l2, 64, sizeof(float) * SESSION156_BLOCK_L2 * SESSION156_BLOCK_L2);
+    
+    session156_initialized = true;
+}
+
+FORCE_INLINE void cleanup_session156() {
+    if (!session156_initialized) return;
+    free(session156_buffer_l1);
+    free(session156_buffer_l2);
+    session156_initialized = false;
+}
+
+// Session 156: Cache-aware matrix multiplication with multi-level blocking
+#if IS_X86_PLATFORM
+void matmul_session156(const float* A, const float* B, float* C,
+                       int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Multi-level blocking for L1/L2/L3 cache hierarchy
+    for (int i3 = 0; i3 < M; i3 += SESSION156_BLOCK_L3) {
+        for (int j3 = 0; j3 < N; j3 += SESSION156_BLOCK_L3) {
+            for (int k3 = 0; k3 < K; k3 += SESSION156_BLOCK_L3) {
+                for (int i2 = i3; i2 < std::min(i3 + SESSION156_BLOCK_L3, M); i2 += SESSION156_BLOCK_L2) {
+                    for (int j2 = j3; j2 < std::min(j3 + SESSION156_BLOCK_L3, N); j2 += SESSION156_BLOCK_L2) {
+                        for (int k2 = k3; k2 < std::min(k3 + SESSION156_BLOCK_L3, K); k2 += SESSION156_BLOCK_L2) {
+                            for (int i = i2; i < std::min(i2 + SESSION156_BLOCK_L2, M); i += SESSION156_BLOCK_L1) {
+                                for (int j = j2; j < std::min(j2 + SESSION156_BLOCK_L2, N); j += SESSION156_BLOCK_L1) {
+                                    for (int k = k2; k < std::min(k2 + SESSION156_BLOCK_L2, K); k += SESSION156_BLOCK_L1) {
+                                        // Process 32x32x32 block
+                                        for (int ii = i; ii < std::min(i + SESSION156_BLOCK_L1, M); ii++) {
+                                            const float* A_row = A + ii * K;
+                                            float* C_row = C + ii * N;
+                                            
+                                            for (int kk = k; kk < std::min(k + SESSION156_BLOCK_L1, K); kk++) {
+                                                __m256 a_val = _mm256_set1_ps(A_row[kk]);
+                                                const float* B_k = B + kk * N;
+                                                
+                                                for (int jj = j; jj < std::min(j + SESSION156_BLOCK_L1, N); jj += AVX_SIZE) {
+                                                    __m256 c_vec = _mm256_loadu_ps(&C_row[jj]);
+                                                    __m256 b_vec = _mm256_loadu_ps(&B_k[jj]);
+                                                    _mm256_storeu_ps(&C_row[jj], _mm256_fmadd_ps(a_val, b_vec, c_vec));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
+// Session 156: Quantization-aware matrix multiplication
+void matmul_quantization_aware_session156(const float* A, const float* B, float* C,
+                                          int M, int N, int K, float scale_factor) {
+    // INT8 quantization-aware matmul with runtime scale adaptation
+    constexpr int BLOCK_SIZE = 64;
+    
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j += BLOCK_SIZE) {
+            for (int k = 0; k < K; k += BLOCK_SIZE) {
+                // Quantize block on-the-fly
+                float block_max = 0.0f;
+                for (int ii = i; ii < std::min(i + BLOCK_SIZE, M); ii++) {
+                    for (int kk = k; kk < std::min(k + BLOCK_SIZE, K); kk++) {
+                        block_max = std::max(block_max, std::abs(A[ii * K + kk]));
+                    }
+                }
+                
+                float block_scale = (block_max > 1e-5f) ? 127.0f / block_max : 1.0f;
+                
+                for (int ii = i; ii < std::min(i + BLOCK_SIZE, M); ii++) {
+                    for (int jj = j; jj < std::min(j + BLOCK_SIZE, N); jj++) {
+                        float sum = 0.0f;
+                        for (int kk = k; kk < std::min(k + BLOCK_SIZE, K); kk++) {
+                            int8_t a_q = static_cast<int8_t>(std::round(A[ii * K + kk] * block_scale));
+                            int8_t b_q = static_cast<int8_t>(std::round(B[kk * N + jj] * block_scale));
+                            sum += static_cast<float>(a_q * b_q);
+                        }
+                        C[ii * N + jj] += sum / (block_scale * block_scale) * scale_factor;
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main() {
     std::cout << "BitNet Performance Optimization Demo (x86)" << std::endl;
     std::cout << "Run with optimized settings." << std::endl;
@@ -1073,6 +1183,14 @@ int main() {
     // Initialize Session 127 lookup tables
     init_session127_luts();
     std::cout << "Session 127 LUTs initialized (Tanh: " << TANH_LUT_SIZE << " entries)" << std::endl;
+
+    // Initialize Session 156 buffers
+    init_session156();
+    std::cout << "Session 156 initialized (L1: " << SESSION156_BLOCK_L1 
+              << ", L2: " << SESSION156_BLOCK_L2 << ", L3: " << SESSION156_BLOCK_L3 << ")" << std::endl;
+
+    // Cleanup
+    cleanup_session156();
 
     return 0;
 }
@@ -41585,7 +41703,6 @@ FORCE_INLINE void fused_attention_adaptive(const float* Q, const float* K, const
         precision = 8;  // INT8 for long sequences
     }
     
-    constexpr int AVX_SIZE = 8;
     constexpr int BLOCK = 64;
     
     // Blocked attention with selected precision
@@ -41611,6 +41728,8 @@ FORCE_INLINE void fused_attention_adaptive(const float* Q, const float* K, const
                     const float* Q_ptr = Q_b + qi * d + h;
                     const float* K_ptr = K_b + ki * d + h;
                     
+#if defined(__x86_64__) || defined(__i386__)
+                    constexpr int AVX_SIZE = 8;
                     int j = 0;
                     for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
                         __m256 qv = _mm256_loadu_ps(Q_ptr + j);
@@ -41624,10 +41743,28 @@ FORCE_INLINE void fused_attention_adaptive(const float* Q, const float* K, const
                         sum = _mm_hadd_ps(sum, sum);
                         dot += _mm_cvtss_f32(sum);
                     }
-                    
                     for (; j < block_h; j++) {
                         dot += Q_ptr[j] * K_ptr[j];
                     }
+#elif defined(__aarch64__) || defined(__arm__)
+                    constexpr int NEON_SIZE = 4;
+                    int j = 0;
+                    for (; j + NEON_SIZE <= block_h; j += NEON_SIZE) {
+                        float32x4_t qv = vld1q_f32(Q_ptr + j);
+                        float32x4_t kv = vld1q_f32(K_ptr + j);
+                        float32x4_t prod = vmulq_f32(qv, kv);
+                        float arr[4];
+                        vst1q_f32(arr, prod);
+                        for (int k = 0; k < 4; k++) dot += arr[k];
+                    }
+                    for (; j < block_h; j++) {
+                        dot += Q_ptr[j] * K_ptr[j];
+                    }
+#else
+                    for (int j = 0; j < block_h; j++) {
+                        dot += Q_ptr[j] * K_ptr[j];
+                    }
+#endif
                     
                     dot *= scale;
                     temp_buf[qi * T + ki] = dot;
@@ -41649,6 +41786,8 @@ FORCE_INLINE void fused_attention_adaptive(const float* Q, const float* K, const
                     const float* V_row = V_b + ki * d + h;
                     float* O_row = O_b + qi * d + h;
                     
+#if defined(__x86_64__) || defined(__i386__)
+                    constexpr int AVX_SIZE = 8;
                     int j = 0;
                     for (; j + AVX_SIZE <= block_h; j += AVX_SIZE) {
                         __m256 ov = _mm256_loadu_ps(O_row + j);
@@ -41656,10 +41795,26 @@ FORCE_INLINE void fused_attention_adaptive(const float* Q, const float* K, const
                         __m256 wv = _mm256_set1_ps(weight);
                         _mm256_storeu_ps(O_row + j, _mm256_fmadd_ps(wv, vv, ov));
                     }
-                    
                     for (; j < block_h; j++) {
                         O_row[j] += weight * V_row[j];
                     }
+#elif defined(__aarch64__) || defined(__arm__)
+                    constexpr int NEON_SIZE = 4;
+                    int j = 0;
+                    for (; j + NEON_SIZE <= block_h; j += NEON_SIZE) {
+                        float32x4_t ov = vld1q_f32(O_row + j);
+                        float32x4_t vv = vld1q_f32(V_row + j);
+                        float32x4_t wv = vdupq_n_f32(weight);
+                        vst1q_f32(O_row + j, vmlaq_f32(ov, wv, vv));
+                    }
+                    for (; j < block_h; j++) {
+                        O_row[j] += weight * V_row[j];
+                    }
+#else
+                    for (int j = 0; j < block_h; j++) {
+                        O_row[j] += weight * V_row[j];
+                    }
+#endif
                 }
             }
         }
