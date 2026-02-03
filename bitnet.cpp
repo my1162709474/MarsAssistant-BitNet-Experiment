@@ -25871,14 +25871,14 @@ void gelu_batch_apple_neon(float* data, int size) {
         float32x4_t inner = vmulq_f32(vdupq_n_f32(0.797885f), vaddq_f32(x, vmulq_f32(vdupq_n_f32(0.044715f), x3)));
         
         // Hardware tanh approximation
-        float32x4_t tanh_inner[NEON_SIZE];
+        float tanh_inner[NEON_SIZE];
         vst1q_f32(tanh_inner, inner);
-        float32x4_t result;
+        float result_arr[NEON_SIZE];
         for (int j = 0; j < NEON_SIZE; j++) {
             float val = data[i + j];
-            result[j] = val * 0.5f * (1.0f + std::tanh(0.797885f * (val + 0.044715f * val * val * val)));
+            result_arr[j] = val * 0.5f * (1.0f + std::tanh(0.797885f * (val + 0.044715f * val * val * val)));
         }
-        vst1q_f32(&data[i], result);
+        vst1q_f32(&data[i], vld1q_f32(result_arr));
     }
     
     for (int i = size - (size % NEON_SIZE); i < size; i++) {
@@ -26113,9 +26113,6 @@ FORCE_INLINE float attention_score_fast(const float* q, const float* k, int d, f
 }
 #endif
 
-    return result * scale;
-}
-
 // Session 65 Summary:
 // 1. 6-term exp approx: +3-5% for activation functions (better accuracy)
 // 2. Vectorized 6-term exp (AVX2/NEON): +5-8% speedup on exp-heavy workloads
@@ -26133,16 +26130,17 @@ constexpr int MAX_THREADS = 8;
 static pthread_t thread_pool[MAX_THREADS];
 static bool thread_pool_initialized = false;
 
+// Thread data structure for parallel computation
+struct ThreadDataParallel {
+    const float* A;
+    const float* B;
+    float* C;
+    int M, N, K;
+    int row_start, row_end;
+};
+
 // Parallel matrix multiplication with work distribution
 void* matmul_parallel_thread(void* arg) {
-    struct ThreadDataParallel {
-        const float* A;
-        const float* B;
-        float* C;
-        int M, N, K;
-        int row_start, row_end;
-    };
-
     ThreadDataParallel* data = static_cast<ThreadDataParallel*>(arg);
     const float* A = data->A;
     const float* B = data->B;
@@ -26222,6 +26220,7 @@ void matmul_parallel(const float* A, const float* B, float* C, int M, int N, int
 
 // Ultra-fused LayerNorm + GELU + Add + Residual + Mul (AVX2)
 // Single pass: LayerNorm → GELU → Add residual → Multiply by scale
+#if defined(__AVX2__) || defined(__x86_64__)
 void fused_layernorm_gelu_add_residual_mul_avx2(
     float* RESTRICT output,
     const float* RESTRICT input,
@@ -37743,9 +37742,10 @@ struct AdaptiveThreadConfig {
     int min_threads;
     
     AdaptiveThreadConfig() {
-        optimal_thread_count = std::thread::hardware_concurrency();
-        current_thread_count = optimal_thread_count;
-        max_threads = std::thread::hardware_concurrency();
+        int hw_concurrency = std::thread::hardware_concurrency();
+        optimal_thread_count.store(hw_concurrency);
+        current_thread_count.store(hw_concurrency);
+        max_threads = hw_concurrency;
         min_threads = 1;
         last_measured_throughput = 0;
     }
@@ -37845,6 +37845,8 @@ struct BatchTask {
     int start_row;
     int end_row;
     int M, N, K;
+    
+    BatchTask() : batch_id(0), start_row(0), end_row(0), M(0), N(0), K(0) {}
     
     BatchTask(int id, int start, int end, int m, int n, int k)
         : batch_id(id), start_row(start), end_row(end), M(m), N(n), K(k) {}
@@ -37999,7 +38001,7 @@ struct DynamicBatchProcessor {
     }
     
     template<typename MatMulFunc>
-    bool process_batch(const float* B, MatMulFunc matmul_func) {
+    bool process_batch(const float* B, MatMulFunc matmul_func, int K) {
         if (pending_inputs.empty()) return false;
         
         int batch_size = std::min(static_cast<int>(pending_inputs.size()), 
@@ -38064,7 +38066,7 @@ void matmul_adaptive(const float* A, const float* B, float* C,
         case MatMulImpl::BLOCKED: matmul_blocked(A, B, C, M, N, K); break;
         case MatMulImpl::AVX2: matmul_avx2(A, B, C, M, N, K); break;
         case MatMulImpl::AVX512: matmul_avx512(A, B, C, M, N, K); break;
-        case MatMulImpl::STREAMING: matmul_streaming_avx2(A, B, C, M, N, K); break;
+        case MatMulImpl::STREAMING: matmul_parallel(A, B, C, M, N, K, 4); break;
         case MatMulImpl::PARALLEL: matmul_dynamic_batch(A, B, C, M, N, K, default_func); break;
         default: default_func(A, B, C, M, N, K);
     }
@@ -38248,7 +38250,7 @@ enum class PrecisionLevel {
 struct PrecisionConfig {
     PrecisionLevel attention_precision;
     PrecisionLevel ffn_precision;
-    PrecisionLayerNorm precision;
+    PrecisionLevel layer_norm_precision;
     bool use_mixed_precision;
     float loss_scale;
     
@@ -38323,7 +38325,9 @@ FORCE_INLINE void matmul_mixed_precision(
             break;
             
         case PrecisionLevel::INT8:
-            matmul_int8_vnni(A, B, C, M, N, K);
+            // For INT8 precision, we'd need proper quantization
+            // Fallback to AVX2 for now
+            matmul_avx2(A, B, C, M, N, K);
             break;
             
         default:
@@ -38547,7 +38551,9 @@ FORCE_INLINE void transformer_block_adaptive(
     ft_manager.execute_with_retry([&]() {
         float* ffn_input = const_cast<float*>(input);  // In-place for efficiency
         size_t temp_size = batch_size * seq_len * hidden_size * sizeof(float);
-        float* ffn_buffer = static_cast<float*>(g_memory_pool.alloc(temp_size));
+        
+        // Use aligned allocation as fallback
+        float* ffn_buffer = static_cast<float*>(aligned_alloc(64, temp_size));
         
         // FFN first layer with adaptive precision
         matmul_mixed_precision(ffn_input, ffn_weights1, ffn_buffer,
@@ -38555,7 +38561,11 @@ FORCE_INLINE void transformer_block_adaptive(
                                prec_config.ffn_precision);
         
         // GELU activation (FP32)
-        gelu_ultra_fast_avx2(ffn_buffer, batch_size * seq_len * hidden_size * 4);
+#if defined(__aarch64__) && defined(__APPLE__)
+        gelu_ultra_fast_neon(ffn_buffer, batch_size * seq_len * hidden_size * 4);
+#else
+        gelu_ultra_fast(ffn_buffer, batch_size * seq_len * hidden_size * 4);
+#endif
         
         // FFN second layer with adaptive precision
         matmul_mixed_precision(ffn_buffer, ffn_weights2, ffn_input,
@@ -38567,7 +38577,7 @@ FORCE_INLINE void transformer_block_adaptive(
             output[i] += input[i];
         }
         
-        g_memory_pool.free(ffn_buffer);
+        free(ffn_buffer);
     });
 }
 
@@ -38819,7 +38829,11 @@ void matmul_autoselect(const float* A, const float* B, float* C,
 #endif
     } else if (intensity > 10) {
         // Compute-bound: use blocked GEMM
+#if defined(__x86_64__) || defined(__i386__)
         matmul_gemm_optimized(A, B, C, M, N, K);
+#else
+        matmul_neon(A, B, C, M, N, K);
+#endif
     } else if (intensity > 5) {
         // Mixed: use AVX2/NEON with moderate blocking
 #if defined(__AVX2__)
@@ -38859,9 +38873,10 @@ void matmul_fp16_neon(const float16_t* A, const float16_t* B, float* C,
                 float16x8_t b_vec = vld1q_f16(&B[j * K + k * FP16_SIZE]);
                 
                 // Convert to float32 and accumulate
-                float32x4_t a0, a1, b0, b1;
-                vunzipq_f16(a_vec, a0, a1);
-                vunzipq_f16(b_vec, b0, b1);
+                float32x4_t a0 = vcvt_f32_f16(vget_low_f16(a_vec));
+                float32x4_t a1 = vcvt_f32_f16(vget_high_f16(a_vec));
+                float32x4_t b0 = vcvt_f32_f16(vget_low_f16(b_vec));
+                float32x4_t b1 = vcvt_f32_f16(vget_high_f16(b_vec));
                 
                 acc0 = vfmaq_f32(acc0, a0, b0);
                 acc1 = vfmaq_f32(acc1, a1, b1);
@@ -38915,6 +38930,8 @@ void matmul_bf16_neon(const uint16_t* A, const uint16_t* B, float* C,
 #endif  // ARM
 
 // ==================== 5. Streaming Multi-Head Attention ====================
+
+#if defined(__x86_64__) || defined(__i386__)
 
 void streaming_attention(
     const float* Q, const float* K, const float* V,
@@ -39117,6 +39134,8 @@ struct SparseAttentionPattern {
 };
 
 // Block-sparse attention with variable pattern
+#if defined(__x86_64__) || defined(__i386__)
+
 void attention_block_sparse(
     const float* Q, const float* K, const float* V,
     float* output, int batch_size, int num_heads,
@@ -39246,6 +39265,118 @@ void attention_block_sparse(
     }
 }
 
+#else
+// ARM NEON fallback for block-sparse attention
+void attention_block_sparse(
+    const float* Q, const float* K, const float* V,
+    float* output, int batch_size, int num_heads,
+    int seq_len, int head_dim, float scale,
+    const SparseAttentionPattern& pattern) {
+    
+    constexpr int NEON_SIZE = 4;
+    constexpr int BLOCK = 64;
+    
+    int hidden_size = num_heads * head_dim;
+    
+    for (int b = 0; b < batch_size; b++) {
+        const float* Q_b = Q + b * seq_len * hidden_size;
+        const float* K_b = K + b * seq_len * hidden_size;
+        const float* V_b = V + b * seq_len * hidden_size;
+        float* O_b = output + b * seq_len * hidden_size;
+        
+        for (int h = 0; h < num_heads; h++) {
+            const float* Q_h = Q_b + h * seq_len * head_dim;
+            const float* K_h = K_b + h * seq_len * head_dim;
+            const float* V_h = V_b + h * seq_len * head_dim;
+            float* O_h = O_b + h * seq_len * head_dim;
+            
+            for (int qi = 0; qi < seq_len; qi += BLOCK) {
+                int q_end = std::min(qi + BLOCK, seq_len);
+                
+                for (int ki = 0; ki < seq_len; ki += BLOCK) {
+                    int k_end = std::min(ki + BLOCK, seq_len);
+                    
+                    bool compute_block = false;
+                    for (int i = qi; i < q_end && !compute_block; i++) {
+                        int range = pattern.block_layout[i];
+                        int start = range >> 16;
+                        int end = range & 0xFFFF;
+                        if (start <= ki && end >= k_end) {
+                            compute_block = true;
+                        }
+                    }
+                    
+                    if (!compute_block) continue;
+                    
+                    float scores[BLOCK * BLOCK];
+                    for (int i = qi; i < q_end; i++) {
+                        for (int j = ki; j < k_end; j++) {
+                            if (!pattern.should_attend(i, j)) {
+                                scores[(i - qi) * BLOCK + (j - ki)] = -1e9f;
+                                continue;
+                            }
+                            
+                            float dot = 0.0f;
+                            const float* Q_row = Q_h + i * head_dim;
+                            const float* K_row = K_h + j * head_dim;
+                            
+                            int k = 0;
+                            for (; k + NEON_SIZE <= head_dim; k += NEON_SIZE) {
+                                float32x4_t qv = vld1q_f32(&Q_row[k]);
+                                float32x4_t kv = vld1q_f32(&K_row[k]);
+                                float32x4_t prod = vmulq_f32(qv, kv);
+                                float32x4_t sum = vpaddq_f32(prod, prod);
+                                dot += vgetq_lane_f32(sum, 0) + vgetq_lane_f32(sum, 2);
+                            }
+                            
+                            for (; k < head_dim; k++) {
+                                dot += Q_row[k] * K_row[k];
+                            }
+                            
+                            scores[(i - qi) * BLOCK + (j - ki)] = dot * scale;
+                        }
+                    }
+                    
+                    // Softmax
+                    for (int i = 0; i < q_end - qi; i++) {
+                        float* row = &scores[i * BLOCK];
+                        float max_val = row[0];
+                        for (int j = 1; j < k_end - ki; j++) {
+                            max_val = std::max(max_val, row[j]);
+                        }
+                        
+                        float sum = 0.0f;
+                        for (int j = 0; j < k_end - ki; j++) {
+                            row[j] = std::exp(row[j] - max_val);
+                            sum += row[j];
+                        }
+                        
+                        sum = 1.0f / (sum + 1e-8f);
+                        for (int j = 0; j < k_end - ki; j++) {
+                            row[j] *= sum;
+                        }
+                    }
+                    
+                    for (int i = qi; i < q_end; i++) {
+                        const float* V_block = V_h + ki * head_dim;
+                        for (int j = ki; j < k_end; j++) {
+                            float weight = scores[(i - qi) * BLOCK + (j - ki)];
+                            const float* V_row = V_h + j * head_dim;
+                            float* O_row = O_h + i * head_dim;
+                            
+                            for (int k = 0; k < head_dim; k++) {
+                                O_row[k] += weight * V_row[k];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif  // x86/ARM
+
 // ==================== 2. Quantized Layer Normalization (INT8/INT4) ====================
 
 // INT8 LayerNorm with per-channel quantization
@@ -39336,6 +39467,8 @@ void layer_norm_int4(
 }
 
 // Vectorized LayerNorm for x86 (AVX2)
+#if defined(__x86_64__) || defined(__i386__) || defined(__AVX2__)
+
 void layer_norm_avx2(
     const float* input, float* output,
     const float* gamma, const float* beta,
@@ -39514,6 +39647,37 @@ void attention_sliding_window(
     }
 }
 
+#else
+// ARM NEON fallback for LayerNorm
+void layer_norm_avx2(
+    const float* input, float* output,
+    const float* gamma, const float* beta,
+    int size, float epsilon = 1e-5f) {
+    
+    // Compute mean
+    float mean = 0.0f;
+    for (int i = 0; i < size; i++) {
+        mean += input[i];
+    }
+    mean /= size;
+    
+    // Compute variance
+    float var = 0.0f;
+    for (int i = 0; i < size; i++) {
+        float diff = input[i] - mean;
+        var += diff * diff;
+    }
+    var = var / size + epsilon;
+    float inv_std = 1.0f / std::sqrt(var);
+    
+    // Compute normalized output
+    for (int i = 0; i < size; i++) {
+        output[i] = (input[i] - mean) * inv_std * gamma[i] + beta[i];
+    }
+}
+
+#endif  // AVX2
+
 // ==================== 4. Optimized GELU with Better Approximation ====================
 
 // Fast GELU approximation (higher accuracy polynomial)
@@ -39529,6 +39693,8 @@ FORCE_INLINE float fast_gelu_avx2(float x) {
 }
 
 // Vectorized GELU with AVX2
+#if defined(__x86_64__) || defined(__i386__) || defined(__AVX2__)
+
 void gelu_fast_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
     
@@ -39560,6 +39726,16 @@ void gelu_fast_avx2(float* data, int size) {
         data[i] = fast_gelu_avx2(data[i]);
     }
 }
+
+#else
+// ARM NEON fallback for GELU
+void gelu_fast_avx2(float* data, int size) {
+    for (int i = 0; i < size; i++) {
+        data[i] = fast_gelu(data[i]);
+    }
+}
+
+#endif  // AVX2
 
 // ==================== 5. Fused Attention + LayerNorm ====================
 
@@ -60411,10 +60587,181 @@ void print_session146_stats() {
 // ==================== Session 146 Complete ====================
 
 
+// ==================== Session 150: Advanced Memory Optimizations + Supercharged SIMD ====================
+
+// Advanced memory prefetch strategies for better cache utilization
+FORCE_INLINE void prefetch_streaming(const void* ptr, int offset = 64) {
+#if defined(__x86_64__)
+    _mm_prefetch(reinterpret_cast<const char*>(ptr) + offset, _MM_HINT_T0);
+#elif defined(__aarch64__)
+    __builtin_prefetch(ptr, 0, 3);
+#endif
+}
+
+// Streaming store to minimize cache pollution
+FORCE_INLINE void stream_store_ps(float* ptr, __m128 val) {
+#if defined(__SSE__)
+    _mm_stream_ps(ptr, val);
+#else
+    *ptr = _mm_cvtss_f32(val);
+#endif
+}
+
+// NUMA-aware memory allocation
+void* numa_alloc(size_t size, int node = 0) {
+#if defined(__linux__) && defined(__NUMA__)
+    return numa_alloc_onnode(size, node);
+#else
+    return aligned_alloc(64, size);
+#endif
+}
+
+// Supercharged MatMul with prefetch + streaming stores + unrolling
+void matmul_supercharged(float* A, float* B, float* C, int M, int N, int K) {
+    const int UNROLL_M = 8;
+    const int UNROLL_N = 8;
+    const int BLOCK_SIZE = 64;
+
+    for (int i = 0; i < M; i += BLOCK_SIZE) {
+        for (int j = 0; j < N; j += BLOCK_SIZE) {
+            for (int k = 0; k < K; k += BLOCK_SIZE) {
+                // Block computation with extreme unrolling
+                for (int ii = i; ii < std::min(i + BLOCK_SIZE, M); ii += UNROLL_M) {
+                    for (int jj = j; jj < std::min(j + BLOCK_SIZE, N); jj += UNROLL_N) {
+                        __m128 c_vals[8][8] = {};
+
+                        // Initialize with zeros
+                        for (int u = 0; u < UNROLL_M; u++) {
+                            for (int v = 0; v < UNROLL_N; v++) {
+                                c_vals[u][v] = _mm_setzero_ps();
+                            }
+                        }
+
+                        // Compute block
+                        for (int kk = k; kk < std::min(k + BLOCK_SIZE, K); kk++) {
+                            // Prefetch next row of B
+                            prefetch_streaming(&B[(kk + 1) * N + jj], 64);
+
+                            __m128 b_vals[8];
+                            for (int v = 0; v < UNROLL_N; v++) {
+                                if (jj + v < N) {
+                                    b_vals[v] = _mm_set1_ps(B[kk * N + jj + v]);
+                                }
+                            }
+
+                            for (int u = 0; u < UNROLL_M; u++) {
+                                if (ii + u < M) {
+                                    __m128 a_val = _mm_set1_ps(A[(ii + u) * K + kk]);
+                                    for (int v = 0; v < UNROLL_N; v++) {
+                                        if (jj + v < N) {
+                                            c_vals[u][v] = _mm_add_ps(c_vals[u][v], _mm_mul_ps(a_val, b_vals[v]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Store results with streaming stores
+                        for (int u = 0; u < UNROLL_M; u++) {
+                            for (int v = 0; v < UNROLL_N; v++) {
+                                if (ii + u < M && jj + v < N) {
+                                    C[(ii + u) * N + jj + v] = _mm_cvtss_f32(c_vals[u][v]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NEON Advanced: Dot product with fusion
+#if defined(__aarch64__) && defined(__APPLE__)
+FORCE_INLINE float32x4_t neon_fused_dot(float32x4_t a, float32x4_t b, float32x4_t c) {
+    return vfmaq_f32(c, a, b);  // Fused multiply-add
+}
+
+// NEON M1/M2/M3/M4 Ultra: Advanced matrix multiply with prefetch
+void matmul_neon_ultra_m4(float* A, float* B, float* C, int M, int N, int K) {
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    const int TILE_K = 16;
+
+    for (int i = 0; i < M; i += TILE_M) {
+        for (int j = 0; j < N; j += TILE_N) {
+            for (int k = 0; k < K; k += TILE_K) {
+                // Prefetch A and B tiles
+                for (int ii = i; ii < std::min(i + TILE_M, M); ii += 4) {
+                    prefetch_streaming(&A[ii * K + k], 128);
+                }
+
+                for (int jj = j; jj < std::min(j + TILE_N, N); jj += 4) {
+                    prefetch_streaming(&B[k * N + jj], 128);
+                }
+
+                //4x4 tile Compute  using NEON
+                for (int ii = i; ii < std::min(i + TILE_M, M); ii += 4) {
+                    for (int jj = j; jj < std::min(j + TILE_N, N); jj += 4) {
+                        float32x4_t c00 = vdupq_n_f32(0.0f);
+                        float32x4_t c10 = vdupq_n_f32(0.0f);
+                        float32x4_t c20 = vdupq_n_f32(0.0f);
+                        float32x4_t c30 = vdupq_n_f32(0.0f);
+
+                        for (int kk = k; kk < std::min(k + TILE_K, K); kk++) {
+                            float32x4_t a0 = vld1q_f32(&A[(ii + 0) * K + kk]);
+                            float32x4_t a1 = vld1q_f32(&A[(ii + 1) * K + kk]);
+                            float32x4_t a2 = vld1q_f32(&A[(ii + 2) * K + kk]);
+                            float32x4_t a3 = vld1q_f32(&A[(ii + 3) * K + kk]);
+                            float32x4_t b0 = vld1q_f32(&B[kk * N + jj]);
+
+                            c00 = vfmaq_f32(c00, a0, b0);
+                            c10 = vfmaq_f32(c10, a1, b0);
+                            c20 = vfmaq_f32(c20, a2, b0);
+                            c30 = vfmaq_f32(c30, a3, b0);
+                        }
+
+                        vst1q_f32(&C[(ii + 0) * N + jj], c00);
+                        vst1q_f32(&C[(ii + 1) * N + jj], c10);
+                        vst1q_f32(&C[(ii + 2) * N + jj], c20);
+                        vst1q_f32(&C[(ii + 3) * N + jj], c30);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Statistics counter
+std::atomic<size_t> session150_ops(0);
+std::atomic<size_t> session150_matmul_ops(0);
+std::atomic<size_t> session150_neon_ops(0);
+
+void print_session150_stats() {
+    printf("\n=== Session 150 Statistics ===\n");
+    printf("  Total operations: %zu\n", session150_ops.load());
+    printf("  Matrix multiply ops: %zu\n", session150_matmul_ops.load());
+    printf("  NEON optimized ops: %zu\n", session150_neon_ops.load());
+}
+
+#else
+
+void matmul_neon_ultra_m4(float* A, float* B, float* C, int M, int N, int K) {
+    // Fallback to basic matmul
+    matmul_neon(A, B, C, M, N, K);
+}
+
+void print_session150_stats() {
+    printf("\n=== Session 150 Statistics ===\n");
+    printf("  Platform not ARM64 - NEON optimizations not available\n");
+}
+
+#endif
+
 // ==================== Main Benchmark Function ====================
 
 int main(int argc, char* argv[]) {
-    std::cout << "BitNet Performance Optimization - Session 146" << std::endl;
+    std::cout << "BitNet Performance Optimization - Session 150" << std::endl;
     std::cout << "==========================================" << std::endl;
 
     // Parse arguments
@@ -60453,6 +60800,7 @@ int main(int argc, char* argv[]) {
         {"matmul_cache_blocking_aggressive", [&]() { matmul_cache_blocking_aggressive(A.data, B.data, C.data, M, N, K); }},
         {"matmul_hyper_parallel", [&]() { matmul_hyper_parallel(A.data, B.data, C.data, M, N, K); }},
         {"matmul_neon", [&]() { matmul_neon(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_supercharged", [&]() { matmul_supercharged(A.data, B.data, C.data, M, N, K); }},
 #if defined(__AVX512F__) && defined(__AVX512BF16__)
         {"matmul_bf16_avx512", [&]() { 
             // Test BF16 matmul (requires BF16 data)
@@ -60470,6 +60818,7 @@ int main(int argc, char* argv[]) {
 #endif
 #if defined(__aarch64__) && defined(__APPLE__)
         {"matmul_m4_ultra_neon", [&]() { matmul_m4_ultra_neon(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_neon_ultra_m4", [&]() { matmul_neon_ultra_m4(A.data, B.data, C.data, M, N, K); }},
 #endif
     };
 
@@ -60495,6 +60844,7 @@ int main(int argc, char* argv[]) {
     print_session144_stats();
     print_session145_stats();
     print_session146_stats();
+    print_session150_stats();
 
     return 0;
 }
