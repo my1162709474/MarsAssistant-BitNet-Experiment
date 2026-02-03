@@ -11,12 +11,20 @@
 #include <cmath>
 #include <cstring>
 #include <cfloat>
+#include <type_traits>
 
 // Platform-specific SIMD headers
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #elif defined(__aarch64__) || defined(__arm__)
 #include <arm_neon.h>
+#endif
+
+// Track platform capabilities for conditional compilation
+#if defined(__x86_64__) || defined(__i386__)
+#define IS_X86_PLATFORM 1
+#else
+#define IS_X86_PLATFORM 0
 #endif
 
 // Forward declarations for functions used before definition
@@ -255,6 +263,13 @@ struct BitNetConfig {
 #define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 3)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 #define ASSUME_ALIGNED(ptr, align) __builtin_assume_aligned((ptr), align)
+
+// Session 162: Ultra Aggressive Optimization Extensions
+#define PREFETCH_READ_HINT(addr) __builtin_prefetch((addr), 0, 2)
+#define PREFETCH_WRITE_HINT(addr) __builtin_prefetch((addr), 1, 2)
+#define MEMORY_FENCE __asm__ __volatile__("" ::: "memory")
+#define READ_ONCE(x) (*(__volatile__ typeof(x) *)&(x))
+#define WRITE_ONCE(x, val) do { *(volatile typeof(x) *)&(x) = (val); } while(0)
 #else
 #define FORCE_INLINE inline
 #define PREFETCH_READ(addr)
@@ -1009,35 +1024,118 @@ void relu_naive(float* data, int size) {
     }
 }
 
+// ==================== Session 162: Ultra-Fast ReLU with Branch Prediction ====================
+
 #if defined(__x86_64__) || defined(__i386__)
 
-void relu_avx2(float* data, int size) {
+// Ultra-fast ReLU with branch prediction hints and 8x unrolling
+void relu_ultra_fast_avx2(float* data, int size) {
     constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 8;  // Session 162: 8x unrolling
     __m256 zero = _mm256_setzero_ps();
-    
-    for (int i = 0; i < size; i += AVX_SIZE) {
+
+    int i = 0;
+
+    // Session 162: 8x unrolled main loop with prefetch
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        PREFETCH_READ(&data[i + AVX_SIZE * 16]);  // Prefetch far ahead
+
+        __m256 vals0 = _mm256_loadu_ps(&data[i]);
+        __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        __m256 vals2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
+        __m256 vals3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+        __m256 vals4 = _mm256_loadu_ps(&data[i + AVX_SIZE * 4]);
+        __m256 vals5 = _mm256_loadu_ps(&data[i + AVX_SIZE * 5]);
+        __m256 vals6 = _mm256_loadu_ps(&data[i + AVX_SIZE * 6]);
+        __m256 vals7 = _mm256_loadu_ps(&data[i + AVX_SIZE * 7]);
+
+        vals0 = _mm256_max_ps(vals0, zero);
+        vals1 = _mm256_max_ps(vals1, zero);
+        vals2 = _mm256_max_ps(vals2, zero);
+        vals3 = _mm256_max_ps(vals3, zero);
+        vals4 = _mm256_max_ps(vals4, zero);
+        vals5 = _mm256_max_ps(vals5, zero);
+        vals6 = _mm256_max_ps(vals6, zero);
+        vals7 = _mm256_max_ps(vals7, zero);
+
+        _mm256_storeu_ps(&data[i], vals0);
+        _mm256_storeu_ps(&data[i + AVX_SIZE], vals1);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 2], vals2);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 3], vals3);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 4], vals4);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 5], vals5);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 6], vals6);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 7], vals7);
+    }
+
+    // Handle remaining blocks
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         __m256 vals = _mm256_loadu_ps(&data[i]);
-        vals = _mm256_max_ps(vals, zero);
-        _mm256_storeu_ps(&data[i], vals);
+        _mm256_storeu_ps(&data[i], _mm256_max_ps(vals, zero));
+    }
+
+    // Scalar tail
+    for (; i < size; i++) {
+        if (LIKELY(data[i] > 0)) continue;  // Branch prediction hint
+        data[i] = 0.0f;
     }
 }
 
 #elif defined(__aarch64__) || defined(__arm__)
 
-void relu_neon(float* data, int size) {
+// ARM NEON Ultra-Fast ReLU with 8x unrolling
+void relu_ultra_fast_neon(float* data, int size) {
     constexpr int NEON_SIZE = 4;
+    constexpr int UNROLL = 8;
     float32x4_t zero = vdupq_n_f32(0.0f);
-    
-    for (int i = 0; i < size; i += NEON_SIZE) {
+
+    int i = 0;
+
+    for (; i + NEON_SIZE * UNROLL <= size; i += NEON_SIZE * UNROLL) {
+        PREFETCH_READ(&data[i + NEON_SIZE * 16]);
+
+        float32x4_t vals0 = vld1q_f32(&data[i]);
+        float32x4_t vals1 = vld1q_f32(&data[i + NEON_SIZE]);
+        float32x4_t vals2 = vld1q_f32(&data[i + NEON_SIZE * 2]);
+        float32x4_t vals3 = vld1q_f32(&data[i + NEON_SIZE * 3]);
+        float32x4_t vals4 = vld1q_f32(&data[i + NEON_SIZE * 4]);
+        float32x4_t vals5 = vld1q_f32(&data[i + NEON_SIZE * 5]);
+        float32x4_t vals6 = vld1q_f32(&data[i + NEON_SIZE * 6]);
+        float32x4_t vals7 = vld1q_f32(&data[i + NEON_SIZE * 7]);
+
+        vals0 = vmaxq_f32(vals0, zero);
+        vals1 = vmaxq_f32(vals1, zero);
+        vals2 = vmaxq_f32(vals2, zero);
+        vals3 = vmaxq_f32(vals3, zero);
+        vals4 = vmaxq_f32(vals4, zero);
+        vals5 = vmaxq_f32(vals5, zero);
+        vals6 = vmaxq_f32(vals6, zero);
+        vals7 = vmaxq_f32(vals7, zero);
+
+        vst1q_f32(&data[i], vals0);
+        vst1q_f32(&data[i + NEON_SIZE], vals1);
+        vst1q_f32(&data[i + NEON_SIZE * 2], vals2);
+        vst1q_f32(&data[i + NEON_SIZE * 3], vals3);
+        vst1q_f32(&data[i + NEON_SIZE * 4], vals4);
+        vst1q_f32(&data[i + NEON_SIZE * 5], vals5);
+        vst1q_f32(&data[i + NEON_SIZE * 6], vals6);
+        vst1q_f32(&data[i + NEON_SIZE * 7], vals7);
+    }
+
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
         float32x4_t vals = vld1q_f32(&data[i]);
-        vals = vmaxq_f32(vals, zero);
-        vst1q_f32(&data[i], vals);
+        vst1q_f32(&data[i], vmaxq_f32(vals, zero));
+    }
+
+    for (; i < size; i++) {
+        if (LIKELY(data[i] > 0)) continue;
+        data[i] = 0.0f;
     }
 }
 
 // Alias for compatibility
-void relu_avx2(float* data, int size) {
-    relu_neon(data, size);
+void relu_ultra_fast_avx2(float* data, int size) {
+    relu_ultra_fast_neon(data, size);
 }
 
 #endif
@@ -4400,29 +4498,51 @@ FORCE_INLINE void matmul_tiled_cache_friendly_avx2(
                     PREFETCH_READ(&B[(k + 1) * N]);
                 }
                 
-                // Unrolled computation
-                for (int j = 0; j < N - AVX_SIZE * UNROLL; j += AVX_SIZE * UNROLL) {
-                    PREFETCH_WRITE(&C_row[j + 256]);
-                    
+                // Session 162: Ultra-aggressive 8x unrolling with enhanced prefetch
+                for (int j = 0; j < N - AVX_SIZE * UNROLL * 2; j += AVX_SIZE * UNROLL * 2) {
+                    // Prefetch far ahead (Session 162: 512 bytes ahead)
+                    PREFETCH_READ(&B[(k + 2) * N + j + 512]);
+                    PREFETCH_WRITE(&C_row[j + 512]);
+
+                    // Load 8 output values
                     __m256 c0 = _mm256_loadu_ps(&C_row[j]);
                     __m256 c1 = _mm256_loadu_ps(&C_row[j + AVX_SIZE]);
                     __m256 c2 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 2]);
                     __m256 c3 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 3]);
-                    
+                    __m256 c4 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 4]);
+                    __m256 c5 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 5]);
+                    __m256 c6 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 6]);
+                    __m256 c7 = _mm256_loadu_ps(&C_row[j + AVX_SIZE * 7]);
+
+                    // Load 8 B values
                     __m256 b0 = _mm256_loadu_ps(&B_k[j]);
                     __m256 b1 = _mm256_loadu_ps(&B_k[j + AVX_SIZE]);
                     __m256 b2 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 2]);
                     __m256 b3 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 3]);
-                    
+                    __m256 b4 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 4]);
+                    __m256 b5 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 5]);
+                    __m256 b6 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 6]);
+                    __m256 b7 = _mm256_loadu_ps(&B_k[j + AVX_SIZE * 7]);
+
+                    // FMA operations (8 at once)
                     c0 = _mm256_fmadd_ps(a_vec, b0, c0);
                     c1 = _mm256_fmadd_ps(a_vec, b1, c1);
                     c2 = _mm256_fmadd_ps(a_vec, b2, c2);
                     c3 = _mm256_fmadd_ps(a_vec, b3, c3);
-                    
+                    c4 = _mm256_fmadd_ps(a_vec, b4, c4);
+                    c5 = _mm256_fmadd_ps(a_vec, b5, c5);
+                    c6 = _mm256_fmadd_ps(a_vec, b6, c6);
+                    c7 = _mm256_fmadd_ps(a_vec, b7, c7);
+
+                    // Store results
                     _mm256_storeu_ps(&C_row[j], c0);
                     _mm256_storeu_ps(&C_row[j + AVX_SIZE], c1);
                     _mm256_storeu_ps(&C_row[j + AVX_SIZE * 2], c2);
                     _mm256_storeu_ps(&C_row[j + AVX_SIZE * 3], c3);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 4], c4);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 5], c5);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 6], c6);
+                    _mm256_storeu_ps(&C_row[j + AVX_SIZE * 7], c7);
                 }
                 
                 // Handle remainder
@@ -4446,20 +4566,25 @@ FORCE_INLINE void matmul_tiled_cache_friendly_avx2(
 // Improved softmax with better numerical stability and faster reduction
 void softmax_avx2_improved(float* data, int size) {
     constexpr int AVX_SIZE = 8;
-    constexpr int UNROLL_FACTOR = 4;
+    constexpr int UNROLL_FACTOR = 8;  // Session 162: 8x unrolling for maximum ILP
 
-    if (size <= 0) return;
+    if (UNLIKELY(size <= 0)) return;
 
-    // Step 1: Find maximum with vectorized reduction
+    // Step 1: Find maximum with vectorized reduction (8x unrolled)
     __m256 max_vec = _mm256_loadu_ps(data);
     int i = AVX_SIZE;
 
-    // Process in chunks of AVX_SIZE * UNROLL_FACTOR
+    // Session 162: Ultra-aggressive 8x unrolling for max reduction
     for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        PREFETCH_READ_HINT(&data[i + AVX_SIZE * 8]);  // Prefetch ahead
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE]));
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 2]));
         max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 3]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 4]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 5]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 6]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 7]));
     }
 
     // Handle remaining chunks
@@ -4478,29 +4603,46 @@ void softmax_avx2_improved(float* data, int size) {
         max_val = std::max(max_val, data[i]);
     }
 
-    // Step 2: Exp with max subtraction and sum
+    // Step 2: Exp with max subtraction and sum (8x unrolled)
     __m256 max_scalar = _mm256_set1_ps(max_val);
     __m256 sum_vec = _mm256_setzero_ps();
     i = 0;
 
     for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        PREFETCH_READ_HINT(&data[i + AVX_SIZE * 8]);  // Session 162: Prefetch next block
+
         __m256 vals0 = _mm256_loadu_ps(&data[i]);
         __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
         __m256 vals2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
         __m256 vals3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+        __m256 vals4 = _mm256_loadu_ps(&data[i + AVX_SIZE * 4]);
+        __m256 vals5 = _mm256_loadu_ps(&data[i + AVX_SIZE * 5]);
+        __m256 vals6 = _mm256_loadu_ps(&data[i + AVX_SIZE * 6]);
+        __m256 vals7 = _mm256_loadu_ps(&data[i + AVX_SIZE * 7]);
 
         vals0 = fast_exp_avx(_mm256_sub_ps(vals0, max_scalar));
         vals1 = fast_exp_avx(_mm256_sub_ps(vals1, max_scalar));
         vals2 = fast_exp_avx(_mm256_sub_ps(vals2, max_scalar));
         vals3 = fast_exp_avx(_mm256_sub_ps(vals3, max_scalar));
+        vals4 = fast_exp_avx(_mm256_sub_ps(vals4, max_scalar));
+        vals5 = fast_exp_avx(_mm256_sub_ps(vals5, max_scalar));
+        vals6 = fast_exp_avx(_mm256_sub_ps(vals6, max_scalar));
+        vals7 = fast_exp_avx(_mm256_sub_ps(vals7, max_scalar));
 
         _mm256_storeu_ps(&data[i], vals0);
         _mm256_storeu_ps(&data[i + AVX_SIZE], vals1);
         _mm256_storeu_ps(&data[i + AVX_SIZE * 2], vals2);
         _mm256_storeu_ps(&data[i + AVX_SIZE * 3], vals3);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 4], vals4);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 5], vals5);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 6], vals6);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 7], vals7);
 
-        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals0, vals1));
-        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(vals2, vals3));
+        // Tree reduction for sum accumulation
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(_mm256_add_ps(vals0, vals1),
+                                                       _mm256_add_ps(vals2, vals3)));
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(_mm256_add_ps(vals4, vals5),
+                                                       _mm256_add_ps(vals6, vals7)));
     }
 
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
@@ -4520,21 +4662,31 @@ void softmax_avx2_improved(float* data, int size) {
         sum += data[i];
     }
 
-    // Step 3: Normalize
+    // Step 3: Normalize (8x unrolled)
     float inv_sum = 1.0f / (sum + 1e-8f);
     __m256 inv_vec = _mm256_set1_ps(inv_sum);
     i = 0;
 
     for (; i + AVX_SIZE * UNROLL_FACTOR <= size; i += AVX_SIZE * UNROLL_FACTOR) {
+        PREFETCH_WRITE_HINT(&data[i + AVX_SIZE * 8]);  // Session 162: Prefetch write
+
         __m256 vals0 = _mm256_loadu_ps(&data[i]);
         __m256 vals1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
         __m256 vals2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
         __m256 vals3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+        __m256 vals4 = _mm256_loadu_ps(&data[i + AVX_SIZE * 4]);
+        __m256 vals5 = _mm256_loadu_ps(&data[i + AVX_SIZE * 5]);
+        __m256 vals6 = _mm256_loadu_ps(&data[i + AVX_SIZE * 6]);
+        __m256 vals7 = _mm256_loadu_ps(&data[i + AVX_SIZE * 7]);
 
         _mm256_storeu_ps(&data[i], _mm256_mul_ps(vals0, inv_vec));
         _mm256_storeu_ps(&data[i + AVX_SIZE], _mm256_mul_ps(vals1, inv_vec));
         _mm256_storeu_ps(&data[i + AVX_SIZE * 2], _mm256_mul_ps(vals2, inv_vec));
         _mm256_storeu_ps(&data[i + AVX_SIZE * 3], _mm256_mul_ps(vals3, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 4], _mm256_mul_ps(vals4, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 5], _mm256_mul_ps(vals5, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 6], _mm256_mul_ps(vals6, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 7], _mm256_mul_ps(vals7, inv_vec));
     }
 
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
@@ -38575,7 +38727,7 @@ public:
     
     template<typename Func>
     auto execute_with_retry(Func compute, int max_retries = 3) 
-        -> std::result_of_t<Func()> {
+        -> std::invoke_result_t<Func> {
         
         int retry_count = 0;
         while (retry_count < max_retries) {
@@ -41346,7 +41498,7 @@ FORCE_INLINE void hyper_memory_optimizer(float* RESTRICT data, int size) {
         // Process data...
         _mm256_stream_ps(&data[i], vals);  // Non-temporal store
     }
-#elif defined(__aarch64__) || defined(__arm__)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     // ARM cache maintenance
     for (int i = 0; i < size; i += 64) {
         __builtin_arm_dc_civac(&data[i]);  // Clean and invalidate
