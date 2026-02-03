@@ -60742,6 +60742,480 @@ void print_session150_stats() {
     printf("  Total operations: %zu\n", session150_ops.load());
     printf("  Matrix multiply ops: %zu\n", session150_matmul_ops.load());
     printf("  NEON optimized ops: %zu\n", session150_neon_ops.load());
+// ==================== Session 150: KV Cache + SIMD RoPE + Enhanced GELU ====================
+
+#include <atomic>
+
+// Session 150 operation counters
+static std::atomic<size_t> session150_kv_cache_ops(0);
+static std::atomic<size_t> session150_rope_ops(0);
+static std::atomic<size_t> session150_gelu_lut_ops(0);
+static std::atomic<size_t> session150_fused_attention_ops(0);
+static std::atomic<size_t> session150_mixed_precision_ops(0);
+
+// ==================== 1. Paged KV Cache Optimization ====================
+
+struct PagedKVCacheSession150 {
+    static constexpr int NUM_LAYERS = 32;
+    static constexpr int NUM_HEADS = 32;
+    static constexpr int HEAD_DIM = 128;
+    static constexpr int BLOCK_SIZE = 16;  // Tokens per block
+    static constexpr int MAX_BLOCKS = 256;
+    
+    // Key-value blocks [layer][head][block][token]
+    float k_cache[NUM_LAYERS][NUM_HEADS][MAX_BLOCKS][BLOCK_SIZE];
+    float v_cache[NUM_LAYERS][NUM_HEADS][MAX_BLOCKS][BLOCK_SIZE];
+    int current_block[NUM_LAYERS];
+    int current_token[NUM_LAYERS];
+    int max_seq_len;
+    
+    PagedKVCacheSession150(int max_sequence_length = 4096) : max_seq_len(max_sequence_length) {
+        for (int l = 0; l < NUM_LAYERS; l++) {
+            current_block[l] = 0;
+            current_token[l] = 0;
+        }
+    }
+    
+    FORCE_INLINE void append(int layer, int head, const float* key, const float* value) {
+        int block = current_block[layer];
+        int token = current_token[layer];
+        
+        // Store in current block
+        for (int d = 0; d < HEAD_DIM; d++) {
+            k_cache[layer][head][block][token] = key[d];
+            v_cache[layer][head][block][token] = value[d];
+        }
+        
+        token++;
+        current_token[layer] = token;
+        
+        // Move to next block if full
+        if (token >= BLOCK_SIZE) {
+            current_block[layer]++;
+            current_token[layer] = 0;
+        }
+        
+        session150_kv_cache_ops.fetch_add(HEAD_DIM * 2);
+    }
+    
+    FORCE_INLINE void get(int layer, int head, int token_idx, float* key_out, float* value_out) {
+        int block = token_idx / BLOCK_SIZE;
+        int offset = token_idx % BLOCK_SIZE;
+        
+        for (int d = 0; d < HEAD_DIM; d++) {
+            key_out[d] = k_cache[layer][head][block][offset];
+            value_out[d] = v_cache[layer][head][block][offset];
+        }
+    }
+    
+    FORCE_INLINE void evict_oldest(int num_blocks = 1) {
+        // Shift blocks to evict oldest tokens (rolling window)
+        for (int l = 0; l < NUM_LAYERS; l++) {
+            for (int b = 0; b < MAX_BLOCKS - num_blocks; b++) {
+                for (int h = 0; h < NUM_HEADS; h++) {
+                    for (int t = 0; t < BLOCK_SIZE; t++) {
+                        k_cache[l][h][b][t] = k_cache[l][h][b + num_blocks][t];
+                        v_cache[l][h][b][t] = v_cache[l][h][b + num_blocks][t];
+                    }
+                }
+            }
+            current_block[l] = std::max(0, current_block[l] - num_blocks);
+        }
+    }
+};
+
+// ==================== 2. SIMD-Optimized RoPE (Rotary Position Embedding) ====================
+
+constexpr int ROPE_LUT_SIZE = 1024;
+float rope_cos_lut[ROPE_LUT_SIZE];
+float rope_sin_lut[ROPE_LUT_SIZE];
+bool rope_lut_initialized = false;
+
+FORCE_INLINE void init_rope_luts() {
+    if (rope_lut_initialized) return;
+    
+    for (int i = 0; i < ROPE_LUT_SIZE; i++) {
+        float theta = static_cast<float>(i) / static_cast<float>(ROPE_LUT_SIZE);
+        rope_cos_lut[i] = std::cos(theta * M_PI * 2.0f);
+        rope_sin_lut[i] = std::sin(theta * M_PI * 2.0f);
+    }
+    rope_lut_initialized = true;
+}
+
+#if defined(__AVX2__) || defined(__x86_64__)
+
+FORCE_INLINE void apply_rope_avx2(float* data, int head_dim, int offset) {
+    constexpr int AVX_SIZE = 8;
+    int half_dim = head_dim / 2;
+    
+    for (int i = 0; i < half_dim; i += AVX_SIZE) {
+        int lut_idx = (offset + i) % ROPE_LUT_SIZE;
+        __m256 cos_vals = _mm256_loadu_ps(&rope_cos_lut[lut_idx]);
+        __m256 sin_vals = _mm256_loadu_ps(&rope_sin_lut[lut_idx]);
+        
+        // Load pairs [x0, x1], [x2, x3], ...
+        __m256 x0 = _mm256_loadu_ps(&data[i]);
+        __m256 x1 = _mm256_loadu_ps(&data[i + half_dim]);
+        
+        // Rotate: x_rotated = x * cos - x_rot * sin
+        __m256 x0_rot = _mm256_mul_ps(x0, cos_vals);
+        __m256 x1_rot = _mm256_mul_ps(x1, sin_vals);
+        __m256 x0_final = _mm256_sub_ps(x0_rot, x1_rot);
+        
+        // x_rotated_2 = x * sin + x_rot * cos
+        __m256 x0_sin = _mm256_mul_ps(x0, sin_vals);
+        __m256 x1_cos = _mm256_mul_ps(x1, cos_vals);
+        __m256 x1_final = _mm256_add_ps(x0_sin, x1_cos);
+        
+        _mm256_storeu_ps(&data[i], x0_final);
+        _mm256_storeu_ps(&data[i + half_dim], x1_final);
+    }
+    
+    session150_rope_ops.fetch_add(head_dim);
+}
+
+#elif defined(__aarch64__) && defined(__APPLE__)
+
+FORCE_INLINE void apply_rope_neon(float* data, int head_dim, int offset) {
+    constexpr int NEON_SIZE = 4;
+    int half_dim = head_dim / 2;
+    
+    for (int i = 0; i < half_dim; i += NEON_SIZE) {
+        int lut_idx = (offset + i) % ROPE_LUT_SIZE;
+        float32x4_t cos_vals = vld1q_f32(&rope_cos_lut[lut_idx]);
+        float32x4_t sin_vals = vld1q_f32(&rope_sin_lut[lut_idx]);
+        
+        float32x4_t x0 = vld1q_f32(&data[i]);
+        float32x4_t x1 = vld1q_f32(&data[i + half_dim]);
+        
+        float32x4_t x0_rot = vmulq_f32(x0, cos_vals);
+        float32x4_t x1_rot = vmulq_f32(x1, sin_vals);
+        float32x4_t x0_final = vsubq_f32(x0_rot, x1_rot);
+        
+        float32x4_t x0_sin = vmulq_f32(x0, sin_vals);
+        float32x4_t x1_cos = vmulq_f32(x1, cos_vals);
+        float32x4_t x1_final = vaddq_f32(x0_sin, x1_cos);
+        
+        vst1q_f32(&data[i], x0_final);
+        vst1q_f32(&data[i + half_dim], x1_final);
+    }
+    
+    session150_rope_ops.fetch_add(head_dim);
+}
+
+#else
+
+FORCE_INLINE void apply_rope_scalar(float* data, int head_dim, int offset) {
+    int half_dim = head_dim / 2;
+    
+    for (int i = 0; i < half_dim; i += 2) {
+        int lut_idx = (offset + i) % ROPE_LUT_SIZE;
+        float cos_val = rope_cos_lut[lut_idx];
+        float sin_val = rope_sin_lut[lut_idx];
+        
+        float x0 = data[i];
+        float x1 = data[i + 1];
+        
+        data[i] = x0 * cos_val - x1 * sin_val;
+        data[i + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    
+    session150_rope_ops.fetch_add(head_dim);
+}
+
+#endif
+
+// ==================== 3. Enhanced GELU LUT (1024 entries) ====================
+
+constexpr int GELU_LUT_SIZE_1024 = 1024;
+float gelu_lut_1024[GELU_LUT_SIZE_1024];
+
+FORCE_INLINE void init_gelu_lut_1024() {
+    for (int i = 0; i < GELU_LUT_SIZE_1024; i++) {
+        float x = (i - 512) / 64.0f;  // Range: [-8, 8]
+        float x2 = x * x;
+        float x3 = x2 * x;
+        float tanh_arg = 0.7978845608f * (x + 0.044715f * x3);
+        gelu_lut_1024[i] = 0.5f * x * (1.0f + std::tanh(tanh_arg));
+    }
+}
+
+FORCE_INLINE void gelu_lut_1024_apply(float* data, int size) {
+    for (int i = 0; i < size; i++) {
+        int idx = static_cast<int>((data[i] + 8.0f) * 64.0f);
+        idx = std::max(0, std::min(GELU_LUT_SIZE_1024 - 1, idx));
+        data[i] = gelu_lut_1024[idx];
+        session150_gelu_lut_ops++;
+    }
+}
+
+#if defined(__AVX2__) || defined(__x86_64__)
+
+FORCE_INLINE void gelu_lut_1024_avx2(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    int i = 0;
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 x = _mm256_loadu_ps(&data[i]);
+        
+        // Convert to LUT indices
+        __m256 idx_f = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(64.0f)), _mm256_set1_ps(512.0f));
+        __m256i idx = _mm256_cvtps_epi32(_mm256_max_ps(_mm256_set1_ps(0.0f), 
+                                  _mm256_min_ps(idx_f, _mm256_set1_ps(GELU_LUT_SIZE_1024 - 8.0f))));
+        
+        // Since we can't directly index __m256 with dynamic indices,
+        // use scalar fallback with SIMD load/store
+        for (int j = 0; j < AVX_SIZE; j++) {
+            int lut_idx = ((int*)&idx)[j];
+            data[i + j] = gelu_lut_1024[lut_idx];
+        }
+    }
+    
+    for (; i < size; i++) {
+        int idx = static_cast<int>((data[i] + 8.0f) * 64.0f);
+        idx = std::max(0, std::min(GELU_LUT_SIZE_1024 - 1, idx));
+        data[i] = gelu_lut_1024[idx];
+    }
+    
+    session150_gelu_lut_ops.fetch_add(size);
+}
+
+#elif defined(__aarch64__) && defined(__APPLE__)
+
+FORCE_INLINE void gelu_lut_1024_neon(float* data, int size) {
+    constexpr int NEON_SIZE = 4;
+    int i = 0;
+    
+    for (; i + NEON_SIZE <= size; i += NEON_SIZE) {
+        float32x4_t x = vld1q_f32(&data[i]);
+        
+        for (int j = 0; j < NEON_SIZE; j++) {
+            float val = data[i + j];
+            int idx = static_cast<int>((val + 8.0f) * 64.0f);
+            idx = std::max(0, std::min(GELU_LUT_SIZE_1024 - 1, idx));
+            data[i + j] = gelu_lut_1024[idx];
+        }
+    }
+    
+    for (; i < size; i++) {
+        int idx = static_cast<int>((data[i] + 8.0f) * 64.0f);
+        idx = std::max(0, std::min(GELU_LUT_SIZE_1024 - 1, idx));
+        data[i] = gelu_lut_1024[idx];
+    }
+    
+    session150_gelu_lut_ops.fetch_add(size);
+}
+
+#endif
+
+// ==================== 4. Fused QK^T + Softmax + V (Attention Fusion) ====================
+
+#if defined(__AVX2__) || defined(__x86_64__)
+
+FORCE_INLINE void fused_attention_qkv_avx2(
+    const float* Q, const float* K, const float* V,
+    float* output, int seq_len, int head_dim, float scale) {
+    
+    constexpr int AVX_SIZE = 8;
+    std::vector<float> scores(seq_len * seq_len);
+    std::vector<float> softmax_out(seq_len * seq_len);
+    
+    // QK^T computation
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j <= i; j++) {  // Causal mask
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d += AVX_SIZE) {
+                __m256 q = _mm256_loadu_ps(&Q[i * head_dim + d]);
+                __m256 k = _mm256_loadu_ps(&K[j * head_dim + d]);
+                dot += _mm256_dp_ps(q, k, 0xFF);
+            }
+            scores[i * seq_len + j] = dot * scale;
+        }
+    }
+    
+    // Softmax
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        max_val = std::max(max_val, scores[i]);
+    }
+    
+    float sum = 0.0f;
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        softmax_out[i] = std::exp(scores[i] - max_val);
+        sum += softmax_out[i];
+    }
+    
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        softmax_out[i] /= sum;
+    }
+    
+    // AV × Softmax
+    for (int i = 0; i < seq_len; i++) {
+        for (int d = 0; d < head_dim; d += AVX_SIZE) {
+            __m256 acc = _mm256_setzero_ps();
+            
+            for (int j = 0; j < seq_len; j++) {
+                __m256 attn = _mm256_broadcast_ss(&softmax_out[i * seq_len + j]);
+                __m256 v = _mm256_loadu_ps(&V[j * head_dim + d]);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(attn, v));
+            }
+            
+            _mm256_storeu_ps(&output[i * head_dim + d], acc);
+        }
+    }
+    
+    session150_fused_attention_ops.fetch_add(seq_len * seq_len * head_dim);
+}
+
+#elif defined(__aarch64__) && defined(__APPLE__)
+
+FORCE_INLINE void fused_attention_qkv_neon(
+    const float* Q, const float* K, const float* V,
+    float* output, int seq_len, int head_dim, float scale) {
+    
+    constexpr int NEON_SIZE = 4;
+    std::vector<float> scores(seq_len * seq_len);
+    std::vector<float> softmax_out(seq_len * seq_len);
+    
+    // QK^T computation
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j <= i; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d += NEON_SIZE) {
+                float32x4_t q = vld1q_f32(&Q[i * head_dim + d]);
+                float32x4_t k = vld1q_f32(&K[j * head_dim + d]);
+                dot += vaddvq_f32(vmulq_f32(q, k));
+            }
+            scores[i * seq_len + j] = dot * scale;
+        }
+    }
+    
+    // Softmax
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        max_val = std::max(max_val, scores[i]);
+    }
+    
+    float sum = 0.0f;
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        softmax_out[i] = std::exp(scores[i] - max_val);
+        sum += softmax_out[i];
+    }
+    
+    for (int i = 0; i < seq_len * seq_len; i++) {
+        softmax_out[i] /= sum;
+    }
+    
+    // AV × Softmax
+    for (int i = 0; i < seq_len; i++) {
+        for (int d = 0; d < head_dim; d += NEON_SIZE) {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            
+            for (int j = 0; j < seq_len; j++) {
+                float32x4_t attn = vdupq_n_f32(softmax_out[i * seq_len + j]);
+                float32x4_t v = vld1q_f32(&V[j * head_dim + d]);
+                acc = vaddq_f32(acc, vmulq_f32(attn, v));
+            }
+            
+            vst1q_f32(&output[i * head_dim + d], acc);
+        }
+    }
+    
+    session150_fused_attention_ops.fetch_add(seq_len * seq_len * head_dim);
+}
+
+#endif
+
+// ==================== 5. INT8 → INT4 Mixed Precision MatMul ====================
+
+struct INT4Quantized {
+    uint8_t data[4];  // 4 INT4 values per byte (packed)
+    float scale;
+    
+    INT4Quantized() : data{0, 0, 0, 0}, scale(1.0f) {}
+};
+
+FORCE_INLINE void quantize_int8_to_int4(
+    const float* src, INT4Quantized* dst, int size, float* global_scale) {
+    
+    // Find max absolute value for per-tensor scaling
+    float max_val = 0.0f;
+    for (int i = 0; i < size; i++) {
+        max_val = std::max(max_val, std::abs(src[i]));
+    }
+    
+    *global_scale = max_val / 7.0f;  // INT4 range: [-7, 7]
+    
+    for (int i = 0; i < size; i++) {
+        int idx_byte = i / 2;
+        int idx_nibble = i % 2;
+        int8_t q = static_cast<int8_t>(std::round(src[i] / *global_scale));
+        q = std::max(-7, std::min(7, q));
+        
+        if (idx_nibble == 0) {
+            dst[idx_byte].data[0] = static_cast<uint8_t>(q + 8);  // Offset to unsigned
+        } else {
+            dst[idx_byte].data[1] = static_cast<uint8_t>(q + 8);
+        }
+    }
+    
+    session150_mixed_precision_ops.fetch_add(size);
+}
+
+FORCE_INLINE void matmul_int8_to_int4(
+    const INT4Quantized* A, const INT4Quantized* B,
+    float* C, int M, int N, int K, float scale_a, float scale_b) {
+    
+    float scale = scale_a * scale_b;
+    
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t dot = 0;
+            
+            for (int k = 0; k < K; k++) {
+                int idx_a = k / 2;
+                int idx_ba = k % 2;
+                int8_t a = static_cast<int8_t>(A[i * ((K + 1) / 2)].data[idx_ba]) - 8;
+                
+                int idx_b = k / 2;
+                int idx_bb = k % 2;
+                int8_t b = static_cast<int8_t>(B[j * ((K + 1) / 2)].data[idx_bb]) - 8;
+                
+                dot += a * b;
+            }
+            
+            C[i * N + j] = static_cast<float>(dot) * scale;
+        }
+    }
+    
+    session150_mixed_precision_ops.fetch_add(M * N * K);
+}
+
+// ==================== Session 150 Statistics ====================
+
+void print_session150_stats() {
+    printf("\n=== Session 150 Statistics ===\n");
+    printf("  KV Cache operations: %zu\n", session150_kv_cache_ops.load());
+    printf("  RoPE operations: %zu\n", session150_rope_ops.load());
+    printf("  GELU LUT operations: %zu\n", session150_gelu_lut_ops.load());
+    printf("  Fused attention operations: %zu\n", session150_fused_attention_ops.load());
+    printf("  Mixed precision operations: %zu\n", session150_mixed_precision_ops.load());
+}
+
+#if defined(__aarch64__) && defined(__APPLE__)
+
+FORCE_INLINE void matmul_neon_ultra_m4(float* A, float* B, float* C, int M, int N, int K) {
+    // Fallback to basic matmul
+    matmul_neon(A, B, C, M, N, K);
+}
+
+void print_session150_stats_arm() {
+    printf("\n=== Session 150 Statistics (ARM64) ===\n");
+    printf("  KV Cache operations: %zu\n", session150_kv_cache_ops.load());
+    printf("  RoPE operations: %zu\n", session150_rope_ops.load());
+    printf("  GELU LUT operations: %zu\n", session150_gelu_lut_ops.load());
+    printf("  Fused attention operations: %zu\n", session150_fused_attention_ops.load());
+    printf("  Mixed precision operations: %zu\n", session150_mixed_precision_ops.load());
 }
 
 #else
@@ -60792,6 +61266,10 @@ int main(int argc, char* argv[]) {
 
     // Warmup
     matmul_avx2(A.data, B.data, C.data, M, N, K);
+
+    // Initialize Session 150 LUTs
+    init_rope_luts();
+    init_gelu_lut_1024();
 
     // Benchmark all methods
     std::vector<std::pair<std::string, std::function<void()>>> methods = {
