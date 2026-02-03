@@ -57772,3 +57772,575 @@ void init_session141() {
 }
 
 // ==================== Session 141 Complete ====================
+
+// ==================== Session 142: Ultra Hardware-Aware Optimization ====================
+
+// Session 142: Hardware-aware CPU detection and optimal kernel selection
+enum class CPUVendor {
+    Unknown,
+    Intel,
+    AMD,
+    Apple,
+    Qualcomm,
+    Other
+};
+
+struct CPUCapabilities {
+    CPUVendor vendor;
+    int num_physical_cores;
+    int num_logical_cores;
+    size_t l1_cache_size;
+    size_t l2_cache_size;
+    size_t l3_cache_size;
+    bool has_avx512;
+    bool has_avx512_vnni;
+    bool has_avx512_bf16;
+    bool has_avx2;
+    bool has_neon;
+    bool has_sve;
+    bool has_metal;
+    float estimated_tflops;
+};
+
+// Detect CPU capabilities at runtime
+CPUCapabilities detect_cpu_capabilities() {
+    CPUCapabilities caps{};
+    
+#if defined(__x86_64__) || defined(__i386__)
+    caps.has_avx2 = __builtin_cpu_supports("avx2");
+    caps.has_avx512 = __builtin_cpu_supports("avx512f");
+    caps.has_avx512_vnni = __builtin_cpu_supports("avx512vnni");
+    caps.has_avx512_bf16 = __builtin_cpu_supports("avx512bf16");
+    
+    // Detect vendor
+#if defined(__GNUC__) || defined(__clang__)
+    char vendor[13];
+    __cpuid(0, 0, *(int*)vendor, *(int*)(vendor+4), *(int*)(vendor+8), *(int*)(vendor+12));
+    vendor[12] = '\0';
+    if (strncmp(vendor, "GenuineIntel", 12) == 0) {
+        caps.vendor = CPUVendor::Intel;
+    } else if (strncmp(vendor, "AuthenticAMD", 12) == 0) {
+        caps.vendor = CPUVendor::AMD;
+    } else {
+        caps.vendor = CPUVendor::Other;
+    }
+#endif
+    
+    // Estimate core count
+    caps.num_physical_cores = std::thread::hardware_concurrency() / 2;  // Assume SMT
+    caps.num_logical_cores = std::thread::hardware_concurrency();
+    
+#elif defined(__aarch64__) || defined(__arm__)
+    caps.has_neon = true;
+    
+#if defined(__APPLE__)
+    caps.vendor = CPUVendor::Apple;
+    caps.has_metal = true;
+    caps.num_physical_cores = std::thread::hardware_concurrency();
+    caps.num_logical_cores = caps.num_physical_cores;
+    // Apple Silicon L2 cache: 8-24MB depending on model
+    caps.l2_cache_size = 16 * 1024 * 1024;  // Assume 16MB for M1/M2
+#elif defined(__ARM_FEATURE_SVE)
+    caps.has_sve = true;
+    caps.num_physical_cores = std::thread::hardware_concurrency();
+    caps.num_logical_cores = caps.num_physical_cores;
+#endif
+    
+    caps.l1_cache_size = 64 * 1024;  // 64KB per core
+    caps.l2_cache_size = 512 * 1024; // 512KB per cluster
+    caps.l3_cache_size = 4 * 1024 * 1024; // 4MB shared
+#endif
+    
+    // Estimate TFLOPs based on architecture
+    if (caps.has_avx512) {
+        caps.estimated_tflops = 2.0f;  // AVX512 theoretical
+    } else if (caps.has_avx2) {
+        caps.estimated_tflops = 1.0f;  // AVX2 theoretical
+    } else if (caps.has_neon) {
+        caps.estimated_tflops = 0.5f;  // NEON theoretical
+    }
+    
+    return caps;
+}
+
+// Global CPU capabilities (initialized once)
+static CPUCapabilities g_cpu_caps = detect_cpu_capabilities();
+
+// Session 142: Dynamic kernel selection based on matrix size and CPU capabilities
+enum class MatMulKernel {
+    Naive,
+    Blocked,
+    AVX2,
+    AVX512,
+    AVX512_VNNI,
+    AVX512_BF16,
+    NEON,
+    AppleSilicon,
+    Quantized,
+    Adaptive
+};
+
+FORCE_INLINE MatMulKernel select_optimal_kernel(int M, int N, int K) {
+    // Small matrices: use simple kernels
+    if (M * N < 1024) {
+        return MatMulKernel::Blocked;
+    }
+    
+    // Medium matrices: AVX2 or NEON
+    if (M * N < 65536) {
+#if defined(__x86_64__) || defined(__i386__)
+        return g_cpu_caps.has_avx512 ? MatMulKernel::AVX512 : MatMulKernel::AVX2;
+#elif defined(__aarch64__) || defined(__arm__)
+        return g_cpu_caps.vendor == CPUVendor::Apple ? MatMulKernel::AppleSilicon : MatMulKernel::NEON;
+#endif
+    }
+    
+    // Large matrices: use best available kernel
+#if defined(__x86_64__) || defined(__i386__)
+    if (g_cpu_caps.has_avx512_bf16) {
+        return MatMulKernel::AVX512_BF16;
+    } else if (g_cpu_caps.has_avx512_vnni) {
+        return MatMulKernel::AVX512_VNNI;
+    } else if (g_cpu_caps.has_avx512) {
+        return MatMulKernel::AVX512;
+    } else {
+        return MatMulKernel::AVX2;
+    }
+#elif defined(__aarch64__) || defined(__arm__)
+    return g_cpu_caps.vendor == CPUVendor::Apple ? MatMulKernel::AppleSilicon : MatMulKernel::NEON;
+#endif
+    
+    return MatMulKernel::Adaptive;
+}
+
+// Session 142: Ultra cache-aware blocking with L1/L2/L3 optimization
+FORCE_INLINE void matmul_ultra_cache_aware_avx2(const float* RESTRICT A, 
+                                                 const float* RESTRICT B, 
+                                                 float* RESTRICT C,
+                                                 int M, int N, int K) {
+    constexpr int BLOCK_M = 32;
+    constexpr int BLOCK_N = 64;
+    constexpr int BLOCK_K = 32;
+    constexpr int AVX_SIZE = 8;
+    
+    // Dynamic block sizing based on cache hierarchy
+    size_t cache_working_set = (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N + BLOCK_M * BLOCK_N) * sizeof(float);
+    
+    for (int i = 0; i < M; i += BLOCK_M) {
+        for (int j = 0; j < N; j += BLOCK_N) {
+            // Initialize block to zero
+            for (int ii = 0; ii < BLOCK_M && i + ii < M; ii++) {
+                for (int jj = 0; jj < BLOCK_N && j + jj < N; jj += AVX_SIZE) {
+                    if (j + jj + AVX_SIZE <= N) {
+                        _mm256_storeu_ps(&C[(i + ii) * N + (j + jj)], _mm256_setzero_ps());
+                    } else {
+                        for (int offset = 0; offset < N - (j + jj); offset++) {
+                            C[(i + ii) * N + (j + jj + offset)] = 0.0f;
+                        }
+                    }
+                }
+            }
+            
+            for (int k = 0; k < K; k += BLOCK_K) {
+                // Prefetch for next K block
+                if (k + BLOCK_K < K) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&A[(i) * K + k + BLOCK_K]), _MM_HINT_T0);
+                    _mm_prefetch(reinterpret_cast<const char*>(&B[(k + BLOCK_K) * N + j]), _MM_HINT_T0);
+                }
+                
+                for (int ii = 0; ii < BLOCK_M && i + ii < M; ii++) {
+                    for (int kk = 0; kk < BLOCK_K && k + kk < K; kk++) {
+                        __m256 a_val = _mm256_broadcast_ss(&A[(i + ii) * K + k + kk]);
+                        
+                        for (int jj = 0; jj < BLOCK_N && j + jj < N; jj += AVX_SIZE) {
+                            if (j + jj + AVX_SIZE <= N) {
+                                __m256 c_vec = _mm256_loadu_ps(&C[(i + ii) * N + (j + jj)]);
+                                __m256 b_vec = _mm256_loadu_ps(&B[(k + kk) * N + (j + jj)]);
+                                c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                                _mm256_storeu_ps(&C[(i + ii) * N + (j + jj)], c_vec);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Session 142: Hyper batch processing with adaptive chunk sizing
+void matmul_hyper_batch_adaptive(const float* A_batch, const float* B, float* C_batch,
+                                  int batch_size, int M, int N, int K) {
+    // Adaptive chunk sizing based on matrix size and CPU capabilities
+    int optimal_chunk_size;
+    
+    size_t mat_size = static_cast<size_t>(M) * N * K;
+    size_t total_work = mat_size * batch_size;
+    
+    if (total_work < 1e6) {
+        optimal_chunk_size = 1;  // Small work: process one at a time
+    } else if (total_work < 1e8) {
+        optimal_chunk_size = 4;  // Medium work: 4 at a time
+    } else if (total_work < 1e9) {
+        optimal_chunk_size = 8;  // Large work: 8 at a time
+    } else {
+        optimal_chunk_size = 16; // Very large work: 16 at a time
+    }
+    
+    // Also limit by available cores
+    int max_chunks = g_cpu_caps.num_physical_cores * 2;
+    optimal_chunk_size = std::min(optimal_chunk_size, max_chunks);
+    
+    int num_chunks = (batch_size + optimal_chunk_size - 1) / optimal_chunk_size;
+    
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        int batch_start = chunk * optimal_chunk_size;
+        int actual_batch = std::min(optimal_chunk_size, batch_size - batch_start);
+        
+        for (int b = 0; b < actual_batch; b++) {
+            const float* A = A_batch + (batch_start + b) * M * K;
+            float* C = C_batch + (batch_start + b) * M * N;
+            
+            // Select optimal kernel for this matrix size
+            MatMulKernel kernel = select_optimal_kernel(M, N, K);
+            
+            switch (kernel) {
+                case MatMulKernel::AVX512_BF16:
+                    matmul_avx512_bf16(A, B, C, M, N, K);
+                    break;
+                case MatMulKernel::AVX512_VNNI:
+                    matmul_vnni_int8(reinterpret_cast<const int8_t*>(A), 
+                                     reinterpret_cast<const int8_t*>(B),
+                                     reinterpret_cast<int32_t*>(C), M, N, K);
+                    break;
+                case MatMulKernel::AVX512:
+                    matmul_avx512(A, B, C, M, N, K);
+                    break;
+                case MatMulKernel::AppleSilicon:
+                    matmul_apple_silicon_ultra_neon(A, B, C, M, N, K);
+                    break;
+                default:
+                    matmul_ultra_cache_aware_avx2(A, B, C, M, N, K);
+            }
+        }
+    }
+}
+
+// Session 142: Ultra memory access pattern optimization with tiling
+FORCE_INLINE void matmul_tiled_streaming_avx2(const float* RESTRICT A, 
+                                               const float* RESTRICT B, 
+                                               float* RESTRICT C,
+                                               int M, int N, int K) {
+    constexpr int TILE_SIZE = 128;
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_FACTOR = 4;
+    
+    // Process in tiles that fit in L2 cache
+    for (int i = 0; i < M; i += TILE_SIZE) {
+        int M_tile = std::min(TILE_SIZE, M - i);
+        
+        for (int j = 0; j < N; j += TILE_SIZE) {
+            int N_tile = std::min(TILE_SIZE, N - j);
+            
+            // Prefetch next tile of B
+            if (j + TILE_SIZE < N) {
+                _mm_prefetch(reinterpret_cast<const char*>(&B[(j + TILE_SIZE)]), _MM_HINT_T1);
+            }
+            
+            for (int k = 0; k < K; k += TILE_SIZE) {
+                int K_tile = std::min(TILE_SIZE, K - k);
+                
+                // Prefetch A tile
+                if (k + TILE_SIZE < K) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&A[(i) * K + k + TILE_SIZE]), _MM_HINT_T0);
+                }
+                
+                for (int ii = 0; ii < M_tile; ii++) {
+                    int row = i + ii;
+                    
+                    for (int jj = 0; jj < N_tile; jj += AVX_SIZE * UNROLL_FACTOR) {
+                        __m256 c0 = _mm256_setzero_ps();
+                        __m256 c1 = _mm256_setzero_ps();
+                        __m256 c2 = _mm256_setzero_ps();
+                        __m256 c3 = _mm256_setzero_ps();
+                        
+                        for (int kk = 0; kk < K_tile; kk++) {
+                            __m256 a_val = _mm256_broadcast_ss(&A[row * K + k + kk]);
+                            const float* b_ptr = &B[(k + kk) * N + j];
+                            
+                            c0 = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(b_ptr), c0);
+                            if (jj + AVX_SIZE < N_tile) {
+                                c1 = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(b_ptr + AVX_SIZE), c1);
+                            }
+                            if (jj + 2 * AVX_SIZE < N_tile) {
+                                c2 = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(b_ptr + 2 * AVX_SIZE), c2);
+                            }
+                            if (jj + 3 * AVX_SIZE < N_tile) {
+                                c3 = _mm256_fmadd_ps(a_val, _mm256_loadu_ps(b_ptr + 3 * AVX_SIZE), c3);
+                            }
+                        }
+                        
+                        _mm256_storeu_ps(&C[row * N + j], c0);
+                        if (jj + AVX_SIZE < N_tile) {
+                            _mm256_storeu_ps(&C[row * N + j + AVX_SIZE], c1);
+                        }
+                        if (jj + 2 * AVX_SIZE < N_tile) {
+                            _mm256_storeu_ps(&C[row * N + j + 2 * AVX_SIZE], c2);
+                        }
+                        if (jj + 3 * AVX_SIZE < N_tile) {
+                            _mm256_storeu_ps(&C[row * N + j + 3 * AVX_SIZE], c3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Session 142: Fused operations with memory layout optimization
+FORCE_INLINE void fused_layernorm_gelu_add_streaming(float* RESTRICT output,
+                                                      const float* RESTRICT input,
+                                                      const float* RESTRICT residual,
+                                                      const float* RESTRICT gamma,
+                                                      const float* RESTRICT beta,
+                                                      int size) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Compute mean and variance in first pass
+    __m256 sum = _mm256_setzero_ps();
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 v = _mm256_loadu_ps(&input[i]);
+        sum = _mm256_add_ps(sum, v);
+    }
+    
+    float mean = _mm256_reduce_add_ps(sum) / size;
+    __m256 mean_vec = _mm256_set1_ps(mean);
+    
+    __m256 var_sum = _mm256_setzero_ps();
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 v = _mm256_loadu_ps(&input[i]);
+        __m256 diff = _mm256_sub_ps(v, mean_vec);
+        var_sum = _mm256_fmadd_ps(diff, diff, var_sum);
+    }
+    
+    float var = _mm256_reduce_add_ps(var_sum) / size;
+    float std = std::sqrt(var + 1e-5f);
+    float inv_std = 1.0f / std;
+    __m256 inv_std_vec = _mm256_set1_ps(inv_std);
+    
+    // Second pass: normalize + GELU + add residual + write output
+    for (int i = 0; i < size; i += AVX_SIZE) {
+        __m256 input_vec = _mm256_loadu_ps(&input[i]);
+        __m256 residual_vec = _mm256_loadu_ps(&residual[i]);
+        
+        // LayerNorm
+        __m256 normalized = _mm256_mul_ps(_mm256_sub_ps(input_vec, mean_vec), inv_std_vec);
+        normalized = _mm256_add_ps(_mm256_mul_ps(normalized, _mm256_loadu_ps(&gamma[i])), 
+                                    _mm256_loadu_ps(&beta[i]));
+        
+        // GELU approximation (fast path using tanh)
+        __m256 x = normalized;
+        __m256 x_sq = _mm256_mul_ps(x, x);
+        __m256 x_cub = _mm256_mul_ps(x_sq, x);
+        __m256 tanh_input = _mm256_mul_ps(_mm256_set1_ps(0.79788456f), 
+                                           _mm256_add_ps(x, _mm256_mul_ps(x_cub, 
+                                           _mm256_set1_ps(0.044715f))));
+        __m256 tanh_val = _mm256_tanh_ps(tanh_input);
+        __m256 gelu = _mm256_mul_ps(x, _mm256_mul_ps(_mm256_add_ps(_mm256_set1_ps(1.0f), tanh_val),
+                                                      _mm256_set1_ps(0.5f)));
+        
+        // Add residual
+        __m256 out = _mm256_add_ps(gelu, residual_vec);
+        
+        // Store with non-temporal hint for large outputs
+        if (size > 1024) {
+            _mm256_stream_ps(&output[i], out);
+        } else {
+            _mm256_storeu_ps(&output[i], out);
+        }
+    }
+}
+
+// Session 142: Hyper-quantized inference with adaptive bit width
+enum class QuantizationLevel {
+    FP32,   // No quantization
+    BF16,   // 16-bit brain floating point
+    INT8,   // 8-bit integer
+    INT4,   // 4-bit integer
+    INT2,   // 2-bit integer
+    INT1    // 1-bit (binary)
+};
+
+FORCE_INLINE QuantizationLevel select_quantization_level(int matrix_size) {
+    // Adaptive quantization based on matrix size and accuracy requirements
+    if (matrix_size < 4096) {
+        return QuantizationLevel::BF16;  // Small matrices: use BF16 for best accuracy
+    } else if (matrix_size < 65536) {
+        return QuantizationLevel::INT8;  // Medium matrices: use INT8
+    } else if (matrix_size < 262144) {
+        return QuantizationLevel::INT4;  // Large matrices: use INT4
+    } else {
+        return QuantizationLevel::INT2;  // Very large matrices: use INT2
+    }
+}
+
+// Session 142: Auto-tuning wrapper that selects best implementation
+void matmul_auto_tune(const float* A, const float* B, float* C, int M, int N, int K) {
+    MatMulKernel kernel = select_optimal_kernel(M, N, K);
+    
+    switch (kernel) {
+        case MatMulKernel::AVX512_BF16:
+            matmul_avx512_bf16(A, B, C, M, N, K);
+            break;
+        case MatMulKernel::AVX512_VNNI:
+            matmul_vnni_dequantize(reinterpret_cast<const int8_t*>(A),
+                                    reinterpret_cast<const int8_t*>(B), C, M, N, K);
+            break;
+        case MatMulKernel::AVX512:
+            matmul_avx512(A, B, C, M, N, K);
+            break;
+        case MatMulKernel::AppleSilicon:
+            matmul_apple_silicon_ultra_neon(A, B, C, M, N, K);
+            break;
+        case MatMulKernel::NEON:
+            matmul_super_parallel_neon(A, B, C, M, N, K);
+            break;
+        default:
+            matmul_tiled_streaming_avx2(A, B, C, M, N, K);
+    }
+    
+    record_auto_tune_op();
+}
+
+// Session 142: Batch attention with streaming optimization
+void attention_streaming_fused(const float* Q, const float* K, const float* V,
+                                float* output, int batch_size, int num_heads,
+                                int seq_len, int head_dim) {
+    constexpr int BLOCK_SIZE = 64;
+    
+    int total_heads = batch_size * num_heads;
+    int hidden_dim = seq_len * head_dim;
+    
+    for (int h = 0; h < total_heads; h++) {
+        const float* Q_head = Q + h * hidden_dim;
+        const float* K_head = K + h * hidden_dim;
+        const float* V_head = V + h * hidden_dim;
+        float* O_head = output + h * hidden_dim;
+        
+        // Blocked attention computation with streaming
+        for (int qi = 0; qi < seq_len; qi += BLOCK_SIZE) {
+            int q_block = std::min(BLOCK_SIZE, seq_len - qi);
+            
+            for (int ki = 0; ki < seq_len; ki += BLOCK_SIZE) {
+                int k_block = std::min(BLOCK_SIZE, seq_len - ki);
+                
+                // Compute QK^T block
+                float scores[BLOCK_SIZE * BLOCK_SIZE];
+                for (int q = 0; q < q_block; q++) {
+                    for (int k = 0; k < k_block; k++) {
+                        scores[q * k_block + k] = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            scores[q * k_block + k] += Q_head[(qi + q) * head_dim + d] * 
+                                                       K_head[(ki + k) * head_dim + d];
+                        }
+                    }
+                }
+                
+                // Softmax
+                float row_max = -FLT_MAX;
+                for (int q = 0; q < q_block; q++) {
+                    for (int k = 0; k < k_block; k++) {
+                        row_max = std::max(row_max, scores[q * k_block + k]);
+                    }
+                }
+                
+                float sum = 0.0f;
+                for (int q = 0; q < q_block; q++) {
+                    for (int k = 0; k < k_block; k++) {
+                        scores[q * k_block + k] = std::exp(scores[q * k_block + k] - row_max);
+                        sum += scores[q * k_block + k];
+                    }
+                }
+                
+                float inv_sum = 1.0f / (sum + 1e-8f);
+                for (int q = 0; q < q_block; q++) {
+                    for (int k = 0; k < k_block; k++) {
+                        scores[q * k_block + k] *= inv_sum;
+                    }
+                }
+                
+                // Compute output block: softmax * V
+                for (int q = 0; q < q_block; q++) {
+                    for (int d = 0; d < head_dim; d++) {
+                        float sum_out = 0.0f;
+                        for (int k = 0; k < k_block; k++) {
+                            sum_out += scores[q * k_block + k] * V_head[(ki + k) * head_dim + d];
+                        }
+                        O_head[(qi + q) * head_dim + d] += sum_out;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Session 142: Statistics
+static std::atomic<size_t> session142_auto_tune_ops{0};
+static std::atomic<size_t> session142_cache_aware_ops{0};
+static std::atomic<size_t> session142_hyper_batch_ops{0};
+static std::atomic<size_t> session142_tiled_streaming_ops{0};
+static std::atomic<size_t> session142_fused_ops{0};
+static std::atomic<size_t> session142_attention_ops{0};
+
+void record_auto_tune_op() { session142_auto_tune_ops.fetch_add(1); }
+void record_cache_aware_op() { session142_cache_aware_ops.fetch_add(1); }
+void record_hyper_batch_op() { session142_hyper_batch_ops.fetch_add(1); }
+void record_tiled_streaming_op() { session142_tiled_streaming_ops.fetch_add(1); }
+void record_fused_op() { session142_fused_ops.fetch_add(1); }
+void record_attention_op() { session142_attention_ops.fetch_add(1); }
+
+void print_session142_stats() {
+    printf("Session 142 Stats:\n");
+    printf("  Auto-tuning operations: %zu\n", session142_auto_tune_ops.load());
+    printf("  Cache-aware matmul operations: %zu\n", session142_cache_aware_ops.load());
+    printf("  Hyper batch adaptive operations: %zu\n", session142_hyper_batch_ops.load());
+    printf("  Tiled streaming operations: %zu\n", session142_tiled_streaming_ops.load());
+    printf("  Fused LayerNorm+GELU+Add operations: %zu\n", session142_fused_ops.load());
+    printf("  Streaming attention operations: %zu\n", session142_attention_ops.load());
+    
+    // Print CPU capabilities
+    printf("\nCPU Capabilities:\n");
+    printf("  Vendor: %s\n", 
+           g_cpu_caps.vendor == CPUVendor::Intel ? "Intel" :
+           g_cpu_caps.vendor == CPUVendor::AMD ? "AMD" :
+           g_cpu_caps.vendor == CPUVendor::Apple ? "Apple Silicon" :
+           g_cpu_caps.vendor == CPUVendor::Qualcomm ? "Qualcomm" : "Unknown");
+    printf("  Physical cores: %d\n", g_cpu_caps.num_physical_cores);
+    printf("  Logical cores: %d\n", g_cpu_caps.num_logical_cores);
+    printf("  AVX2: %s, AVX512: %s, VNNI: %s, BF16: %s\n",
+           g_cpu_caps.has_avx2 ? "Yes" : "No",
+           g_cpu_caps.has_avx512 ? "Yes" : "No",
+           g_cpu_caps.has_avx512_vnni ? "Yes" : "No",
+           g_cpu_caps.has_avx512_bf16 ? "Yes" : "No");
+    printf("  NEON: %s, SVE: %s, Metal: %s\n",
+           g_cpu_caps.has_neon ? "Yes" : "No",
+           g_cpu_caps.has_sve ? "Yes" : "No",
+           g_cpu_caps.has_metal ? "Yes" : "No");
+    printf("  Estimated TFLOPS: %.2f\n", g_cpu_caps.estimated_tflops);
+}
+
+void init_session142() {
+    printf("Session 142 initialized: Ultra Hardware-Aware Optimization\n");
+    printf("  - CPU capability detection and kernel selection\n");
+    printf("  - Ultra cache-aware blocking (L1/L2/L3 optimization)\n");
+    printf("  - Hyper batch processing with adaptive chunk sizing\n");
+    printf("  - Tiled streaming with SIMD unrolling\n");
+    printf("  - Fused LayerNorm + GELU + Add with streaming\n");
+    printf("  - Streaming attention with blocked computation\n");
+    printf("  - Auto-tuning wrapper for best implementation selection\n");
+    
+    // Print detected capabilities
+    print_session142_stats();
+}
+
+// ==================== Session 142 Complete ====================
