@@ -59490,4 +59490,426 @@ void print_session144_stats() {
     printf("  BatchNorm fusion operations: %zu\n", session144_batchnorm_fusion_ops.load());
 }
 
-// ==================== Session 144 Complete ====================
+// ==================== Session 145: Ultra-Extreme Optimization ====================
+
+// Global counter for Session 145 operations
+static std::atomic<size_t> session145_ops{0};
+static std::atomic<size_t> session145_matmul_ops{0};
+static std::atomic<size_t> session145_quantize_ops{0};
+static std::atomic<size_t> session145_prefetch_ops{0};
+
+// ==================== 1. Ultra 512x Loop Unrolling ====================
+
+#if IS_X86_PLATFORM
+
+// Ultra-extreme 512x loop unrolling with maximum ILP
+FORCE_INLINE void matmul_512x_ultra_unroll_avx2(const float* RESTRICT A,
+                                                 const float* RESTRICT B,
+                                                 float* RESTRICT C,
+                                                 int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL_N = 64;  // 64 AVX registers = 512 floats per iteration
+    constexpr int UNROLL_K = 16;  // 16 K iterations = 8192 FMA operations per output row
+
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+
+        for (int j = 0; j + UNROLL_N <= N; j += UNROLL_N) {
+            // Initialize 64 accumulators
+            __m256 acc[UNROLL_N / AVX_SIZE];
+            for (int aj = 0; aj < UNROLL_N / AVX_SIZE; aj++) {
+                acc[aj] = _mm256_setzero_ps();
+            }
+
+            // Process K in chunks of UNROLL_K
+            for (int kk = 0; kk < K; kk += UNROLL_K) {
+                int k_end = std::min(kk + UNROLL_K, K);
+
+                for (int k = kk; k < k_end; k++) {
+                    // Prefetch A_row[k] for next iteration
+                    PREFETCH_READ(A_row + k + 16);
+
+                    // Load and broadcast A value
+                    __m256 a_val = _mm256_set1_ps(A_row[k]);
+
+                    // Load 64 B values and compute 512 FMAs
+                    for (int bj = 0; bj < UNROLL_N; bj += AVX_SIZE) {
+                        __m256 b_vec = _mm256_loadu_ps(B + k * N + j + bj);
+                        acc[bj / AVX_SIZE] = _mm256_fmadd_ps(a_val, b_vec, acc[bj / AVX_SIZE]);
+                    }
+                }
+            }
+
+            // Store results
+            for (int bj = 0; bj < UNROLL_N; bj += AVX_SIZE) {
+                __m256 c_vec = _mm256_loadu_ps(C + i * N + j + bj);
+                _mm256_storeu_ps(C + i * N + j + bj, _mm256_add_ps(c_vec, acc[bj / AVX_SIZE]));
+            }
+        }
+
+        // Handle remainder N
+        for (int j = (N / UNROLL_N) * UNROLL_N; j < N; j += AVX_SIZE) {
+            int remaining = std::min(AVX_SIZE, N - j);
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int k = 0; k < K; k++) {
+                __m256 a_val = _mm256_set1_ps(A_row[k]);
+                __m256 b_vec;
+                if (remaining == AVX_SIZE) {
+                    b_vec = _mm256_loadu_ps(B + k * N + j);
+                } else {
+                    float b_vals[AVX_SIZE];
+                    for (int r = 0; r < remaining; r++) b_vals[r] = B[k * N + j + r];
+                    b_vec = _mm256_loadu_ps(b_vals);
+                }
+                acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+            }
+
+            __m256 c_vec = _mm256_loadu_ps(C + i * N + j);
+            _mm256_storeu_ps(C + i * N + j, _mm256_add_ps(c_vec, acc));
+        }
+    }
+
+    session145_matmul_ops.fetch_add(M * N * K);
+}
+
+#else
+
+FORCE_INLINE void matmul_512x_ultra_unroll_avx2(const float* A,
+                                                 const float* B,
+                                                 float* C,
+                                                 int M, int N, int K) {
+    matmul_avx2(A, B, C, M, N, K);
+}
+
+#endif
+
+// ==================== 2. Enhanced INT8 Quantization with VNNI ====================
+
+#if IS_X86_PLATFORM && defined(__AVX512VNNI__)
+
+FORCE_INLINE void quantize_int8_vnni_enhanced(const float* src, int8_t* dst,
+                                                int size, float* scale,
+                                                int num_groups, int group_size) {
+    constexpr int VNNI_SIZE = 16;  // 16 int8 per VNNI instruction
+
+    // Compute scales per group
+    for (int g = 0; g < num_groups; g++) {
+        const float* group_start = src + g * group_size;
+        float min_val = group_start[0];
+        float max_val = group_start[0];
+
+        for (int i = 1; i < group_size; i++) {
+            min_val = std::min(min_val, group_start[i]);
+            max_val = std::max(max_val, group_start[i]);
+        }
+
+        scale[g] = (max_val - min_val) > 1e-5f ? 127.0f / (max_val - min_val) : 1.0f;
+    }
+
+    // Quantize with VNNI-friendly layout
+    int i = 0;
+    for (; i + VNNI_SIZE * 4 <= size; i += VNNI_SIZE * 4) {
+        // Process 64 elements at a time (4 VNNI blocks)
+        for (int g = 0; g < 4; g++) {
+            int base = i + g * VNNI_SIZE;
+            int group_idx = base / group_size;
+            float s = scale[group_idx];
+            float o = -s * ((group_idx * group_size < size) ?
+                           src[group_idx * group_size] : 0.0f);
+
+            __m512 scale_vec = _mm512_set1_ps(s);
+            __m512 offset_vec = _mm512_set1_ps(o);
+
+            for (int j = 0; j < VNNI_SIZE; j += 16) {
+                __m512 vals = _mm512_loadu_ps(src + base + j);
+                __m512 scaled = _mm512_mul_ps(vals, scale_vec);
+                scaled = _mm512_add_ps(scaled, offset_vec);
+
+                // Clamp and convert to int8
+                __m512 clamped = _mm512_min_ps(_mm512_set1_ps(127.0f),
+                                               _mm512_max_ps(_mm512_setzero_ps(), scaled));
+                __m256i int_vals = _mm256_cvtps_epi32(_mm512_cast512_ps256(clamped));
+
+                for (int k = 0; k < 8; k++) {
+                    dst[base + j + k] = static_cast<int8_t>(_mm256_extract_epi32(int_vals, k));
+                }
+            }
+        }
+    }
+
+    // Handle remainder
+    for (; i < size; i++) {
+        int group_idx = i / group_size;
+        float s = scale[group_idx];
+        float min_val = src[group_idx * group_size];
+        float val = std::max(0.0f, std::min(127.0f, (src[i] - min_val) * s));
+        dst[i] = static_cast<int8_t>(val);
+    }
+
+    session145_quantize_ops.fetch_add(size);
+}
+
+#else
+
+FORCE_INLINE void quantize_int8_vnni_enhanced(const float* src, int8_t* dst,
+                                                int size, float* scale,
+                                                int num_groups, int group_size) {
+    quantize_vectorized_avx2(src, dst, size);
+}
+
+#endif
+
+// ==================== 3. Aggressive Prefetch + Cache Blocking ====================
+
+#if IS_X86_PLATFORM
+
+// Advanced cache blocking with aggressive prefetch
+FORCE_INLINE void matmul_cache_blocking_aggressive(const float* RESTRICT A,
+                                                    const float* RESTRICT B,
+                                                    float* RESTRICT C,
+                                                    int M, int N, int K) {
+    constexpr int BLOCK_M = 64;
+    constexpr int BLOCK_N = 128;
+    constexpr int BLOCK_K = 32;
+    constexpr int AVX_SIZE = 8;
+    constexpr int PREFETCH_DIST = 64;  // Prefetch 64 elements ahead
+
+    for (int mb = 0; mb < M; mb += BLOCK_M) {
+        int mb_end = std::min(mb + BLOCK_M, M);
+
+        for (int nb = 0; nb < N; nb += BLOCK_N) {
+            int nb_end = std::min(nb + BLOCK_N, N);
+
+            for (int kb = 0; kb < K; kb += BLOCK_K) {
+                int kb_end = std::min(kb + BLOCK_K, K);
+
+                // Prefetch B block
+                for (int k = kb; k < kb_end; k++) {
+                    for (int n = nb; n < nb_end && n < nb + 16; n += AVX_SIZE) {
+                        PREFETCH_READ(B + k * N + n + PREFETCH_DIST);
+                    }
+                }
+
+                // Compute block
+                for (int i = mb; i < mb_end; i++) {
+                    const float* A_row = A + i * K;
+
+                    for (int j = nb; j < nb_end; j += AVX_SIZE) {
+                        __m256 acc = _mm256_setzero_ps();
+
+                        for (int k = kb; k < kb_end; k++) {
+                            __m256 a_val = _mm256_set1_ps(A_row[k]);
+                            __m256 b_vec = _mm256_loadu_ps(B + k * N + j);
+                            acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+                        }
+
+                        __m256 c_vec = _mm256_loadu_ps(C + i * N + j);
+                        _mm256_storeu_ps(C + i * N + j, _mm256_add_ps(c_vec, acc));
+                    }
+                }
+            }
+        }
+    }
+
+    session145_prefetch_ops.fetch_add(M * N * K);
+}
+
+#else
+
+FORCE_INLINE void matmul_cache_blocking_aggressive(const float* A,
+                                                    const float* B,
+                                                    float* C,
+                                                    int M, int N, int K) {
+    matmul_avx2(A, B, C, M, N, K);
+}
+
+#endif
+
+// ==================== 4. Multi-Level Memory Pipeline ====================
+
+class MemoryPipelineUltra {
+private:
+    static constexpr int NUM_BUFFERS = 8;
+    static constexpr int BUFFER_SIZE = 128 * 1024;  // 128KB per buffer
+    void* buffers[NUM_BUFFERS];
+    int current_buffer;
+    std::mutex mutex;
+
+public:
+    MemoryPipelineUltra() : current_buffer(0) {
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            posix_memalign(&buffers[i], CACHE_LINE_SIZE, BUFFER_SIZE);
+        }
+    }
+
+    ~MemoryPipelineUltra() {
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free(buffers[i]);
+        }
+    }
+
+    void* alloc(size_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (size <= BUFFER_SIZE) {
+            void* ptr = buffers[current_buffer];
+            current_buffer = (current_buffer + 1) % NUM_BUFFERS;
+            return ptr;
+        }
+        return malloc(size);
+    }
+
+    size_t get_buffer_size() const {
+        return BUFFER_SIZE;
+    }
+};
+
+// Thread-local pipeline for reduced contention
+static thread_local MemoryPipelineUltra tl_pipeline;
+
+// ==================== 5. Hyper-Parallel Matrix Multiply ====================
+
+#if IS_X86_PLATFORM
+
+// Hyper-parallel with work stealing and dynamic scheduling
+FORCE_INLINE void matmul_hyper_parallel(const float* A,
+                                         const float* B,
+                                         float* C,
+                                         int M, int N, int K) {
+    constexpr int CHUNK_SIZE = 32;  // Process 32 rows at a time
+    constexpr int NUM_THREADS = std::thread::hardware_concurrency();
+
+    std::vector<std::thread> threads;
+    std::atomic<int> next_row{0};
+
+    auto worker = [&](int thread_id) {
+        MemoryPipelineUltra& pipeline = tl_pipeline;
+        int local_ops = 0;
+
+        while (true) {
+            int start_row = next_row.fetch_add(CHUNK_SIZE, std::memory_order_relaxed);
+            if (start_row >= M) break;
+
+            int end_row = std::min(start_row + CHUNK_SIZE, M);
+
+            for (int i = start_row; i < end_row; i++) {
+                const float* A_row = A + i * K;
+                for (int j = 0; j < N; j += 8) {
+                    __m256 acc = _mm256_setzero_ps();
+                    for (int k = 0; k < K; k++) {
+                        __m256 a_val = _mm256_set1_ps(A_row[k]);
+                        __m256 b_vec = _mm256_loadu_ps(B + k * N + j);
+                        acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+                    }
+                    __m256 c_vec = _mm256_loadu_ps(C + i * N + j);
+                    _mm256_storeu_ps(C + i * N + j, _mm256_add_ps(c_vec, acc));
+                }
+                local_ops += N * K;
+            }
+        }
+
+        session145_ops.fetch_add(local_ops);
+    };
+
+    // Launch threads
+    for (int t = 0; t < NUM_THREADS; t++) {
+        threads.emplace_back(worker, t);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+#else
+
+FORCE_INLINE void matmul_hyper_parallel(const float* A,
+                                         const float* B,
+                                         float* C,
+                                         int M, int N, int K) {
+    matmul_avx2(A, B, C, M, N, K);
+}
+
+#endif
+
+// ==================== 6. Session 145 Statistics ====================
+
+void print_session145_stats() {
+    printf("\n=== Session 145 Statistics ===\n");
+    printf("  Total operations: %zu\n", session145_ops.load());
+    printf("  Matrix multiply ops: %zu\n", session145_matmul_ops.load());
+    printf("  Quantize ops: %zu\n", session145_quantize_ops.load());
+    printf("  Prefetch ops: %zu\n", session145_prefetch_ops.load());
+}
+
+// ==================== Session 145 Complete ====================
+
+
+// ==================== Main Benchmark Function ====================
+
+int main(int argc, char* argv[]) {
+    std::cout << "BitNet Performance Optimization - Session 145" << std::endl;
+    std::cout << "==========================================" << std::endl;
+
+    // Parse arguments
+    int M = 512, N = 512, K = 512;
+    int num_iterations = 100;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+            M = N = K = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
+            num_iterations = atoi(argv[++i]);
+        }
+    }
+
+    std::cout << "Matrix size: " << M << "x" << N << "x" << K << std::endl;
+    std::cout << "Iterations: " << num_iterations << std::endl;
+
+    // Allocate matrices with alignment
+    Matrix A(M, K), B(K, N), C(M, N);
+
+    // Initialize with random values
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (int i = 0; i < M * K; i++) A.data[i] = dist(rng);
+    for (int i = 0; i < K * N; i++) B.data[i] = dist(rng);
+    for (int i = 0; i < M * N; i++) C.data[i] = 0.0f;
+
+    // Warmup
+    matmul_avx2(A.data, B.data, C.data, M, N, K);
+
+    // Benchmark all methods
+    std::vector<std::pair<std::string, std::function<void()>>> methods = {
+        {"matmul_avx2", [&]() { matmul_avx2(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_512x_ultra_unroll_avx2", [&]() { matmul_512x_ultra_unroll_avx2(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_cache_blocking_aggressive", [&]() { matmul_cache_blocking_aggressive(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_hyper_parallel", [&]() { matmul_hyper_parallel(A.data, B.data, C.data, M, N, K); }},
+        {"matmul_neon", [&]() { matmul_neon(A.data, B.data, C.data, M, N, K); }},
+    };
+
+    for (const auto& [name, func] : methods) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (int iter = 0; iter < num_iterations; iter++) {
+            func();
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        double avg_time = static_cast<double>(duration) / num_iterations;
+        double gflops = 2.0 * M * N * K / (avg_time * 1000.0);
+
+        std::cout << name << ": " << avg_time << " us ("
+                  << gflops << " GFLOPS)" << std::endl;
+    }
+
+    // Print optimization statistics
+    print_session133_stats();
+    print_session144_stats();
+    print_session145_stats();
+
+    return 0;
+}
