@@ -24814,12 +24814,11 @@ FORCE_INLINE void quantize_int8_neon(const float* src, int8_t* dst, int N) {
 
         // Store as int8 (simplified - would need proper packing)
         for (int u = 0; u < UNROLL; u++) {
-            int8_t out_vals[4];
-            float32x2_t low = vget_low_f32(vals[u]);
-            float32x2_t high = vget_high_f32(vals[u]);
-            vst1_s8(out_vals, vmovn_s16(vcombine_s16(vcvt_s16_f32(low), vcvt_s16_f32(high))));
             for (int j = 0; j < 4 && i + u * NEON_SIZE + j < N; j++) {
-                dst[i + u * NEON_SIZE + j] = out_vals[j];
+                float32x4_t val = vals[u];
+                float32_t fval[4];
+                vst1q_f32(fval, val);
+                dst[i + u * NEON_SIZE + j] = static_cast<int8_t>(std::max(0.0f, std::min(127.0f, fval[j])));
             }
         }
     }
@@ -25322,11 +25321,17 @@ void fused_layernorm_gelu_add_mul_neon(float* output, const float* input,
         float32x4_t g = vld1q_f32(&gamma[i]);
         float32x4_t b = vld1q_f32(&beta[i]);
         float32x4_t ln = vaddq_f32(vmulq_f32(norm, g), b);
-        
-        float32x4_t gelu = gelu_fast_neon(ln);
+
+        // Apply GELU activation inline (pure NEON)
+        float32x4_t x = ln;
+        float32x4_t x2 = vmulq_f32(x, x);
+        float32x4_t inner = vmulq_f32(vdupq_n_f32(0.79788456f),
+                                       vmulq_f32(x, vaddq_f32(vdupq_n_f32(1.0f),
+                                                               vmulq_f32(vdupq_n_f32(0.044715f), x2))));
+        float32x4_t gelu = vmulq_f32(vdupq_n_f32(0.5f), vmulq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), inner)));
         float32x4_t sc = vld1q_f32(&scale[i]);
         vst1q_f32(&output[i], vmulq_f32(vaddq_f32(gelu, res), sc));
-        
+
         // Second batch
         float32x4_t vals2 = vld1q_f32(&input[i + NEON_SIZE]);
         float32x4_t res2 = vld1q_f32(&residual[i + NEON_SIZE]);
@@ -25335,8 +25340,14 @@ void fused_layernorm_gelu_add_mul_neon(float* output, const float* input,
         float32x4_t g2 = vld1q_f32(&gamma[i + NEON_SIZE]);
         float32x4_t b2 = vld1q_f32(&beta[i + NEON_SIZE]);
         float32x4_t ln2 = vaddq_f32(vmulq_f32(norm2, g2), b2);
-        
-        float32x4_t gelu2 = gelu_fast_neon(ln2);
+
+        // Apply GELU activation inline (pure NEON)
+        float32x4_t x2_2 = ln2;
+        float32x4_t x2_sq = vmulq_f32(x2_2, x2_2);
+        float32x4_t inner2 = vmulq_f32(vdupq_n_f32(0.79788456f),
+                                        vmulq_f32(x2_2, vaddq_f32(vdupq_n_f32(1.0f),
+                                                                vmulq_f32(vdupq_n_f32(0.044715f), x2_sq))));
+        float32x4_t gelu2 = vmulq_f32(vdupq_n_f32(0.5f), vmulq_f32(x2_2, vaddq_f32(vdupq_n_f32(1.0f), inner2)));
         float32x4_t sc2 = vld1q_f32(&scale[i + NEON_SIZE]);
         vst1q_f32(&output[i + NEON_SIZE], vmulq_f32(vaddq_f32(gelu2, res2), sc2));
     }
@@ -25369,6 +25380,8 @@ FORCE_INLINE float exp_approx_5term(float x) {
     return 1.0f + x + x2 * 0.5f + x2 * x * 0.1666667f + x2 * x2 * 0.04166667f;
 }
 
+#if IS_X86_PLATFORM
+
 // Improved horizontal sum using pairwise hadd
 FORCE_INLINE float horizontal_sum_pairwise(__m256 v) {
     __m256 t0 = _mm256_hadd_ps(v, v);
@@ -25378,16 +25391,16 @@ FORCE_INLINE float horizontal_sum_pairwise(__m256 v) {
 }
 
 // Optimized memory copy with aligned SIMD
-FORCE_INLINE void memcpy_aligned_simd(void* RESTRICT dest, 
-                                       const void* RESTRICT src, 
+FORCE_INLINE void memcpy_aligned_simd(void* RESTRICT dest,
+                                       const void* RESTRICT src,
                                        size_t size) {
     constexpr int AVX_SIZE = 32;
     unsigned char* d = static_cast<unsigned char*>(dest);
     const unsigned char* s = static_cast<const unsigned char*>(src);
-    
+
     size_t head = std::min<size_t>(32, size);
     for (size_t i = 0; i < head; i++) d[i] = s[i];
-    
+
     size_t body = (size - head) / AVX_SIZE;
     for (size_t i = 0; i < body; i++) {
         __m256 ymm = _mm256_loadu_ps(reinterpret_cast<const float*>(s + head + i * AVX_SIZE));
@@ -25402,7 +25415,7 @@ FORCE_INLINE void fused_mul_add_relu_avx2(float* RESTRICT dst,
                                            int size) {
     constexpr int AVX_SIZE = 8;
     const __m256 zero = _mm256_setzero_ps();
-    
+
     int i = 0;
     for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
         __m256 a_vec = _mm256_loadu_ps(a + i);
@@ -25412,11 +25425,43 @@ FORCE_INLINE void fused_mul_add_relu_avx2(float* RESTRICT dst,
         result = _mm256_max_ps(result, zero);
         _mm256_storeu_ps(dst + i, result);
     }
-    
+
     for (; i < size; i++) {
         dst[i] = std::max(0.0f, dst[i] + a[i] * b[i]);
     }
 }
+
+#else
+
+// ARM fallback for memcpy_aligned_simd
+FORCE_INLINE void memcpy_aligned_simd(void* RESTRICT dest,
+                                       const void* RESTRICT src,
+                                       size_t size) {
+    constexpr int NEON_SIZE = 16;
+    unsigned char* d = static_cast<unsigned char*>(dest);
+    const unsigned char* s = static_cast<const unsigned char*>(src);
+
+    size_t head = std::min<size_t>(16, size);
+    for (size_t i = 0; i < head; i++) d[i] = s[i];
+
+    size_t body = (size - head) / NEON_SIZE;
+    for (size_t i = 0; i < body; i++) {
+        float32x4_t ymm0 = vld1q_f32(reinterpret_cast<const float*>(s + head + i * NEON_SIZE));
+        float32x4_t ymm1 = vld1q_f32(reinterpret_cast<const float*>(s + head + i * NEON_SIZE + 4));
+        float32x4_t ymm2 = vld1q_f32(reinterpret_cast<const float*>(s + head + i * NEON_SIZE + 8));
+        float32x4_t ymm3 = vld1q_f32(reinterpret_cast<const float*>(s + head + i * NEON_SIZE + 12));
+        vst1q_f32(reinterpret_cast<float*>(d + head + i * NEON_SIZE), ymm0);
+        vst1q_f32(reinterpret_cast<float*>(d + head + i * NEON_SIZE + 4), ymm1);
+        vst1q_f32(reinterpret_cast<float*>(d + head + i * NEON_SIZE + 8), ymm2);
+        vst1q_f32(reinterpret_cast<float*>(d + head + i * NEON_SIZE + 12), ymm3);
+    }
+
+    for (size_t i = head + body * NEON_SIZE; i < size; i++) {
+        d[i] = s[i];
+    }
+}
+
+#endif
 
 // Session 63 Summary:
 // 1. Exp 5-term approx: +2% for activation functions
@@ -25833,6 +25878,8 @@ FORCE_INLINE float exp_approx_6term(float x) {
     return a0 + a1 * x + a2 * x2 + a3 * x3 + a4 * x4 + a5 * x5 + a6 * x6;
 }
 
+#if IS_X86_PLATFORM
+
 // Vectorized 6-term exp for AVX2
 FORCE_INLINE void exp_approx_6term_avx2(const float* src, float* dst, int size) {
     constexpr int AVX_SIZE = 8;
@@ -25872,6 +25919,8 @@ FORCE_INLINE void exp_approx_6term_avx2(const float* src, float* dst, int size) 
         dst[i] = exp_approx_6term(src[i]);
     }
 }
+
+#endif
 
 // Vectorized 6-term exp for NEON
 FORCE_INLINE void exp_approx_6term_neon(const float* src, float* dst, int size) {
