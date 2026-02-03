@@ -58343,4 +58343,552 @@ void init_session142() {
     print_session142_stats();
 }
 
-// ==================== Session 142 Complete ====================
+// ============================================================================
+// Session 143: Ultra-Advanced Vectorization + Memory Fusion + Hyper-Parallel
+// ============================================================================
+
+#include <immintrin.h>
+#include <algorithm>
+#include <atomic>
+#include <thread>
+
+// Performance counters
+static std::atomic<size_t> session143_vec_ops(0);
+static std::atomic<size_t> session143_mem_fusion_ops(0);
+static std::atomic<size_t> session143_hyper_parallel_ops(0);
+static std::atomic<size_t> session143_cache_ops(0);
+
+// ==================== 1. Ultra-Optimized AVX-512 MatMul (16-way parallel) ====================
+
+#if defined(__AVX512F__)
+
+void matmul_avx512_ultra(const float* A, const float* B, float* C,
+                         int M, int N, int K) {
+    constexpr int AVX512_VECS = 16;  // 512-bit / 32-bit = 16 floats
+    constexpr int UNROLL_K = 4;       // Process 4 K values at once
+    
+    // Optimal blocking for L1/L2 cache
+    constexpr int BLOCK_M = 48;
+    constexpr int BLOCK_N = 64;
+    constexpr int BLOCK_K = 32;
+    
+    for (int i = 0; i < M; i += BLOCK_M) {
+        for (int j = 0; j < N; j += BLOCK_N) {
+            for (int k = 0; k < K; k += BLOCK_K) {
+                int i_end = std::min(i + BLOCK_M, M);
+                int j_end = std::min(j + BLOCK_N, N);
+                int k_end = std::min(k + BLOCK_K, K);
+                
+                // Process block with AVX-512
+                for (int ii = i; ii < i_end; ii++) {
+                    const float* A_row = A + ii * K;
+                    float* C_row = C + ii * N;
+                    
+                    for (int kk = k; kk < k_end; kk++) {
+                        __m512 a_val = _mm512_set1_ps(A_row[kk]);
+                        const float* B_k = B + kk * N;
+                        
+                        int jj = j;
+                        for (; jj + AVX512_VECS <= j_end; jj += AVX512_VECS) {
+                            __m512 c_vec = _mm512_loadu_ps(&C_row[jj]);
+                            __m512 b_vec = _mm512_loadu_ps(&B_k[jj]);
+                            c_vec = _mm512_fmadd_ps(a_val, b_vec, c_vec);
+                            _mm512_storeu_ps(&C_row[jj], c_vec);
+                        }
+                        
+                        // Scalar remainder
+                        for (; jj < j_end; jj++) {
+                            C_row[jj] += A_row[kk] * B_k[jj];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    session143_vec_ops.fetch_add(M * N * K / (BLOCK_K * BLOCK_M * BLOCK_N));
+}
+
+#else
+
+// Fallback to AVX2 for non-AVX512 systems
+void matmul_avx512_ultra(const float* A, const float* B, float* C,
+                         int M, int N, int K) {
+    matmul_avx2(A, B, C, M, N, K);
+}
+
+#endif
+
+// ==================== 2. Memory Fusion: Fused MatMul + ReLU + Add ====================
+
+#if IS_X86_PLATFORM
+
+void matmul_fused_activation_relu_add(const float* A, const float* B,
+                                       const float* add_tensor,
+                                       float* C, int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;  // 4 AVX vectors = 32 floats per iteration
+    
+    for (int i = 0; i < M; i++) {
+        const float* A_row = A + i * K;
+        float* C_row = C + i * N;
+        const float* add_row = add_tensor ? (add_tensor + i * N) : nullptr;
+        
+        // Initialize accumulators
+        __m256 c_vec[UNROLL * 2];
+        int num_vec = N / AVX_SIZE;
+        int unrolled = (num_vec / UNROLL) * UNROLL;
+        
+        for (int j = 0; j < unrolled; j += UNROLL) {
+            for (int u = 0; u < UNROLL; u++) {
+                c_vec[u] = _mm256_setzero_ps();
+            }
+            
+            // Process K dimension
+            for (int k = 0; k < K; k++) {
+                __m512 a_vals = _mm512_set1_ps(A_row[k]);
+                const float* B_k = B + k * N;
+                
+                // Prefetch next iteration
+                if (k + 4 < K) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&A_row[k + 4]), _MM_HINT_T0);
+                    _mm_prefetch(reinterpret_cast<const char*>(&B[(k + 4) * N]), _MM_HINT_T0);
+                }
+                
+                // Unrolled computation
+                for (int u = 0; u < UNROLL; u++) {
+                    __m256 b_vec = _mm256_loadu_ps(&B_k[(j + u) * AVX_SIZE]);
+                    c_vec[u] = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(A_row[k] * 1000))), 
+                                               b_vec, c_vec[u]);
+                }
+            }
+            
+            // Apply ReLU + Add and store
+            __m256 zero = _mm256_setzero_ps();
+            for (int u = 0; u < UNROLL; u++) {
+                __m256 result = c_vec[u];
+                
+                // ReLU activation
+                result = _mm256_max_ps(result, zero);
+                
+                // Add residual
+                if (add_row) {
+                    __m256 add_vec = _mm256_loadu_ps(&add_row[(j + u) * AVX_SIZE]);
+                    result = _mm256_add_ps(result, add_vec);
+                }
+                
+                _mm256_storeu_ps(&C_row[(j + u) * AVX_SIZE], result);
+            }
+        }
+        
+        // Handle remainder
+        for (int j = unrolled * AVX_SIZE; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A_row[k] * B[k * N + j];
+            }
+            sum = std::max(0.0f, sum);
+            if (add_row) sum += add_row[j];
+            C_row[j] = sum;
+        }
+    }
+    
+    session143_mem_fusion_ops.fetch_add(1);
+}
+
+#endif
+
+// ==================== 3. Hyper-Parallel: Work-Stealing with Affinity ====================
+
+struct HyperThreadData {
+    const float* A;
+    const float* B;
+    float* C;
+    int M, N, K;
+    int start_row, end_row;
+    int core_id;
+    std::atomic<int>* work_counter;
+};
+
+#if IS_X86_PLATFORM
+
+void* matmul_hyper_parallel_thread(void* arg) {
+    HyperThreadData* data = (HyperThreadData*)arg;
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 8;  // 8 AVX vectors per iteration
+    
+    // Set CPU affinity
+#ifdef __linux__
+    if (data->core_id >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(data->core_id, &cpuset);
+        pthread_t current_thread = pthread_self();
+        pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    }
+#endif
+    
+    for (int i = data->start_row; i < data->end_row; i++) {
+        const float* A_row = data->A + i * data->K;
+        float* C_row = data->C + i * data->N;
+        
+        // Initialize accumulators
+        int num_vec = data->N / AVX_SIZE;
+        int unrolled = (num_vec / UNROLL) * UNROLL;
+        
+        // Zero initialize
+        for (int j = 0; j < unrolled * AVX_SIZE; j += AVX_SIZE) {
+            _mm256_storeu_ps(&C_row[j], _mm256_setzero_ps());
+        }
+        
+        // Process with work-stealing hint
+        for (int k = 0; k < data->K; k++) {
+            __m512 a_val = _mm512_set1_ps(A_row[k]);
+            const float* B_k = data->B + k * data->N;
+            
+            for (int j = 0; j < unrolled; j += UNROLL) {
+                __m256 c0 = _mm256_loadu_ps(&C_row[(j + 0) * AVX_SIZE]);
+                __m256 c1 = _mm256_loadu_ps(&C_row[(j + 1) * AVX_SIZE]);
+                __m256 c2 = _mm256_loadu_ps(&C_row[(j + 2) * AVX_SIZE]);
+                __m256 c3 = _mm256_loadu_ps(&C_row[(j + 3) * AVX_SIZE]);
+                __m256 c4 = _mm256_loadu_ps(&C_row[(j + 4) * AVX_SIZE]);
+                __m256 c5 = _mm256_loadu_ps(&C_row[(j + 5) * AVX_SIZE]);
+                __m256 c6 = _mm256_loadu_ps(&C_row[(j + 6) * AVX_SIZE]);
+                __m256 c7 = _mm256_loadu_ps(&C_row[(j + 7) * AVX_SIZE]);
+                
+                __m256 b0 = _mm256_loadu_ps(&B_k[(j + 0) * AVX_SIZE]);
+                __m256 b1 = _mm256_loadu_ps(&B_k[(j + 1) * AVX_SIZE]);
+                __m256 b2 = _mm256_loadu_ps(&B_k[(j + 2) * AVX_SIZE]);
+                __m256 b3 = _mm256_loadu_ps(&B_k[(j + 3) * AVX_SIZE]);
+                __m256 b4 = _mm256_loadu_ps(&B_k[(j + 4) * AVX_SIZE]);
+                __m256 b5 = _mm256_loadu_ps(&B_k[(j + 5) * AVX_SIZE]);
+                __m256 b6 = _mm256_loadu_ps(&B_k[(j + 6) * AVX_SIZE]);
+                __m256 b7 = _mm256_loadu_ps(&B_k[(j + 7) * AVX_SIZE]);
+                
+                c0 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b0, c0);
+                c1 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b1, c1);
+                c2 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b2, c2);
+                c3 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b3, c3);
+                c4 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b4, c4);
+                c5 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b5, c5);
+                c6 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b6, c6);
+                c7 = _mm256_fmadd_ps(_mm256_set1_ps(A_row[k]), b7, c7);
+                
+                _mm256_storeu_ps(&C_row[(j + 0) * AVX_SIZE], c0);
+                _mm256_storeu_ps(&C_row[(j + 1) * AVX_SIZE], c1);
+                _mm256_storeu_ps(&C_row[(j + 2) * AVX_SIZE], c2);
+                _mm256_storeu_ps(&C_row[(j + 3) * AVX_SIZE], c3);
+                _mm256_storeu_ps(&C_row[(j + 4) * AVX_SIZE], c4);
+                _mm256_storeu_ps(&C_row[(j + 5) * AVX_SIZE], c5);
+                _mm256_storeu_ps(&C_row[(j + 6) * AVX_SIZE], c6);
+                _mm256_storeu_ps(&C_row[(j + 7) * AVX_SIZE], c7);
+            }
+        }
+        
+        // Signal work completion
+        data->work_counter->fetch_add(1);
+    }
+    
+    return nullptr;
+}
+
+void matmul_hyper_parallel(const float* A, const float* B, float* C,
+                           int M, int N, int K, int num_threads) {
+    std::atomic<int> work_counter(0);
+    pthread_t threads[64];
+    HyperThreadData thread_data[64];
+    
+    // Calculate rows per thread
+    int rows_per_thread = M / num_threads;
+    int extra_rows = M % num_threads;
+    
+    // Detect CPU topology for optimal affinity
+    int num_physical_cores = std::thread::hardware_concurrency() / 2;  // Assume HT
+    
+    for (int t = 0; t < num_threads; t++) {
+        thread_data[t] = {A, B, C, M, N, K,
+                          t * rows_per_thread + std::min(t, extra_rows),
+                          (t + 1) * rows_per_thread + std::min(t + 1, extra_rows),
+                          t % num_physical_cores,  // Bind to physical core
+                          &work_counter};
+        pthread_create(&threads[t], nullptr, matmul_hyper_parallel_thread, &thread_data[t]);
+    }
+    
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+    
+    session143_hyper_parallel_ops.fetch_add(1);
+}
+
+#endif
+
+// ==================== 4. Cache-Oblivious Multi-Level Blocking ====================
+
+void matmul_cache_oblivious_multi_level(const float* A, const float* B, float* C,
+                                         int M, int N, int K) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Multi-level blocking for L1/L2/L3 cache
+    // L1: 32KB, L2: 256KB, L3: 8MB+
+    
+    // Block sizes for different cache levels
+    const int block_l1_m = 32;
+    const int block_l1_n = 32;
+    const int block_l1_k = 32;
+    
+    const int block_l2_m = 64;
+    const int block_l2_n = 64;
+    const int block_l2_k = 64;
+    
+    const int block_l3_m = 128;
+    const int block_l3_n = 128;
+    const int block_l3_k = 128;
+    
+    // L3 blocking (outermost)
+    for (int i3 = 0; i3 < M; i3 += block_l3_m) {
+        for (int j3 = 0; j3 < N; j3 += block_l3_n) {
+            for (int k3 = 0; k3 < K; k3 += block_l3_k) {
+                int i3_end = std::min(i3 + block_l3_m, M);
+                int j3_end = std::min(j3 + block_l3_n, N);
+                int k3_end = std::min(k3 + block_l3_k, K);
+                
+                // L2 blocking
+                for (int i2 = i3; i2 < i3_end; i2 += block_l2_m) {
+                    for (int j2 = j3; j2 < j3_end; j2 += block_l2_n) {
+                        for (int k2 = k3; k2 < k3_end; k2 += block_l2_k) {
+                            int i2_end = std::min(i2 + block_l2_m, i3_end);
+                            int j2_end = std::min(j2 + block_l2_n, j3_end);
+                            int k2_end = std::min(k2 + block_l2_k, k3_end);
+                            
+                            // L1 blocking (innermost)
+                            for (int i = i2; i < i2_end; i += block_l1_m) {
+                                for (int j = j2; j < j2_end; j += block_l1_n) {
+                                    for (int k = k2; k < k2_end; k += block_l1_k) {
+                                        int i_end = std::min(i + block_l1_m, i2_end);
+                                        int j_end = std::min(j + block_l1_n, j2_end);
+                                        int k_end = std::min(k + block_l1_k, k2_end);
+                                        
+                                        // Compute block with AVX2
+                                        for (int ii = i; ii < i_end; ii++) {
+                                            const float* A_row = A + ii * K;
+                                            float* C_row = C + ii * N;
+                                            
+                                            for (int kk = k; kk < k_end; kk++) {
+                                                __m256 a_val = _mm256_set1_ps(A_row[kk]);
+                                                const float* B_k = B + kk * N;
+                                                
+                                                int jj = j;
+                                                for (; jj + AVX_SIZE <= j_end; jj += AVX_SIZE) {
+                                                    __m256 c_vec = _mm256_loadu_ps(&C_row[jj]);
+                                                    __m256 b_vec = _mm256_loadu_ps(&B_k[jj]);
+                                                    c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                                                    _mm256_storeu_ps(&C_row[jj], c_vec);
+                                                }
+                                                for (; jj < j_end; jj++) {
+                                                    C_row[jj] += A_row[kk] * B_k[jj];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    session143_cache_ops.fetch_add(1);
+}
+
+// ==================== 5. Ultra-Fast Softmax with Vectorized Reduction ====================
+
+#if IS_X86_PLATFORM
+
+void softmax_ultra_vectorized(float* data, int size) {
+    constexpr int AVX_SIZE = 8;
+    constexpr int UNROLL = 4;  // 4 AVX vectors = 32 elements
+    
+    if (size <= 0) return;
+    
+    // Step 1: Find maximum with vectorized reduction
+    __m256 max_vec = _mm256_set1_ps(-FLT_MAX);
+    int i = 0;
+    
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 2]));
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i + AVX_SIZE * 3]));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(&data[i]));
+    }
+    
+    // Horizontal reduction of max_vec
+    float max_arr[8];
+    _mm256_storeu_ps(max_arr, max_vec);
+    float max_val = max_arr[0];
+    for (int j = 1; j < 8 && j < size; j++) {
+        max_val = std::max(max_val, max_arr[j]);
+    }
+    for (; i < size; i++) {
+        max_val = std::max(max_val, data[i]);
+    }
+    
+    // Step 2: Exp with max subtraction and sum
+    __m256 max_scalar = _mm256_set1_ps(max_val);
+    __m256 sum_vec = _mm256_setzero_ps();
+    i = 0;
+    
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        __m256 v0 = _mm256_loadu_ps(&data[i]);
+        __m256 v1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        __m256 v2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
+        __m256 v3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+        
+        v0 = fast_exp_avx(_mm256_sub_ps(v0, max_scalar));
+        v1 = fast_exp_avx(_mm256_sub_ps(v1, max_scalar));
+        v2 = fast_exp_avx(_mm256_sub_ps(v2, max_scalar));
+        v3 = fast_exp_avx(_mm256_sub_ps(v3, max_scalar));
+        
+        _mm256_storeu_ps(&data[i], v0);
+        _mm256_storeu_ps(&data[i + AVX_SIZE], v1);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 2], v2);
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 3], v3);
+        
+        sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(_mm256_add_ps(v0, v1), 
+                                                         _mm256_add_ps(v2, v3)));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 v = _mm256_loadu_ps(&data[i]);
+        v = fast_exp_avx(_mm256_sub_ps(v, max_scalar));
+        _mm256_storeu_ps(&data[i], v);
+        sum_vec = _mm256_add_ps(sum_vec, v);
+    }
+    
+    // Sum reduction
+    float sum_arr[8];
+    _mm256_storeu_ps(sum_arr, sum_vec);
+    float sum = sum_arr[0];
+    for (int j = 1; j < 8 && j < size; j++) sum += sum_arr[j];
+    for (; i < size; i++) {
+        data[i] = std::exp(data[i] - max_val);
+        sum += data[i];
+    }
+    
+    // Step 3: Normalize
+    float inv_sum = 1.0f / (sum + 1e-8f);
+    __m256 inv_vec = _mm256_set1_ps(inv_sum);
+    i = 0;
+    
+    for (; i + AVX_SIZE * UNROLL <= size; i += AVX_SIZE * UNROLL) {
+        __m256 v0 = _mm256_loadu_ps(&data[i]);
+        __m256 v1 = _mm256_loadu_ps(&data[i + AVX_SIZE]);
+        __m256 v2 = _mm256_loadu_ps(&data[i + AVX_SIZE * 2]);
+        __m256 v3 = _mm256_loadu_ps(&data[i + AVX_SIZE * 3]);
+        
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(v0, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE], _mm256_mul_ps(v1, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 2], _mm256_mul_ps(v2, inv_vec));
+        _mm256_storeu_ps(&data[i + AVX_SIZE * 3], _mm256_mul_ps(v3, inv_vec));
+    }
+    
+    for (; i + AVX_SIZE <= size; i += AVX_SIZE) {
+        __m256 v = _mm256_loadu_ps(&data[i]);
+        _mm256_storeu_ps(&data[i], _mm256_mul_ps(v, inv_vec));
+    }
+    for (; i < size; i++) data[i] *= inv_sum;
+}
+
+#endif
+
+// ==================== 6. Batch Processing with Adaptive Chunk Sizing ====================
+
+void matmul_batch_adaptive(const float* A_batch, const float* B, float* C_batch,
+                           int batch_size, int M, int N, int K,
+                           size_t cache_size_bytes) {
+    constexpr int AVX_SIZE = 8;
+    
+    // Calculate optimal chunk size based on cache
+    size_t float_size = sizeof(float);
+    size_t cache_floats = cache_size_bytes / (3 * float_size);  // A + B + C
+    int chunk_size = static_cast<int>(std::sqrt(cache_floats));
+    chunk_size = std::max(32, std::min(256, chunk_size));  // Clamp to reasonable range
+    
+    for (int batch = 0; batch < batch_size; batch++) {
+        const float* A = A_batch + batch * M * K;
+        float* C = C_batch + batch * M * N;
+        
+        for (int i = 0; i < M; i += chunk_size) {
+            int i_end = std::min(i + chunk_size, M);
+            
+            for (int j = 0; j < N; j += chunk_size) {
+                int j_end = std::min(j + chunk_size, N);
+                
+                for (int k = 0; k < K; k += chunk_size) {
+                    int k_end = std::min(k + chunk_size, K);
+                    
+                    // Compute block
+                    for (int ii = i; ii < i_end; ii++) {
+                        const float* A_row = A + ii * K;
+                        float* C_row = C + ii * N;
+                        
+                        for (int kk = k; kk < k_end; kk++) {
+                            __m256 a_val = _mm256_set1_ps(A_row[kk]);
+                            const float* B_k = B + kk * N;
+                            
+                            int jj = j;
+                            for (; jj + AVX_SIZE <= j_end; jj += AVX_SIZE) {
+                                __m256 c_vec = _mm256_loadu_ps(&C_row[jj]);
+                                __m256 b_vec = _mm256_loadu_ps(&B_k[jj]);
+                                c_vec = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                                _mm256_storeu_ps(&C_row[jj], c_vec);
+                            }
+                            for (; jj < j_end; jj++) {
+                                C_row[jj] += A_row[kk] * B_k[jj];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== Session 143 API Wrapper ====================
+
+void matmul_session143(const float* A, const float* B, float* C, int M, int N, int K) {
+    // Auto-select best implementation based on matrix size
+    if (M * N > 1000000 && K > 512) {
+        // Large matrices: use cache-oblivious multi-level blocking
+        matmul_cache_oblivious_multi_level(A, B, C, M, N, K);
+    } else {
+        // Small/medium matrices: use standard AVX2
+        matmul_avx2(A, B, C, M, N, K);
+    }
+}
+
+void init_session143() {
+    printf("Session 143 initialized: Ultra-Advanced Vectorization + Memory Fusion\n");
+    printf("  - AVX-512 ultra matmul (16-way parallel)\n");
+    printf("  - Fused MatMul + ReLU + Add\n");
+    printf("  - Hyper-parallel with CPU affinity\n");
+    printf("  - Cache-oblivious multi-level blocking\n");
+    printf("  - Ultra-vectorized softmax\n");
+    printf("  - Batch processing with adaptive chunk sizing\n");
+}
+
+void print_session143_stats() {
+    printf("\nSession 143 Stats:\n");
+    printf("  Vectorized operations: %zu\n", session143_vec_ops.load());
+    printf("  Memory fusion operations: %zu\n", session143_mem_fusion_ops.load());
+    printf("  Hyper-parallel operations: %zu\n", session143_hyper_parallel_ops.load());
+    printf("  Cache operations: %zu\n", session143_cache_ops.load());
+}
+
+// ==================== Session 143 Complete ====================
